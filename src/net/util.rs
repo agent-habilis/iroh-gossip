@@ -231,9 +231,16 @@ impl SendLoop {
             tokio::select! {
                 biased;
                 _ = &mut closed => break,
-                Some(msg) = self.send_rx.recv() => self.write_message(&msg).await?,
+                // Match on `None` instead of `Some(msg) = recv()` plus `else =>
+                // break`: that `else` runs only when every branch is disabled, and
+                // the biased `closed` branch stays enabled-and-pending, so a closed
+                // channel never broke the loop and the connection was never
+                // reclaimed.
+                msg = self.send_rx.recv() => match msg {
+                    Some(msg) => self.write_message(&msg).await?,
+                    None => break,
+                },
                 _ = self.finishing.join_next(), if !self.finishing.is_empty() => {}
-                else => break,
             }
         }
 
