@@ -36,4 +36,4 @@ hash = 3171872035
 path = "LICENSE"
 
 [sources]
-allow-git = ["https://github.com/fofoca-network/iroh", "https://github.com/fofoca-network/net-tools"]
+allow-git = ["https://github.com/agent-habilis/iroh", "https://github.com/agent-habilis/net-tools"]

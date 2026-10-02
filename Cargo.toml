@@ -47,11 +47,11 @@ derive_more = { version = "2.0.1", features = [
 hex = "0.4.3"
 indexmap = "2.0"
 iroh-metrics = { version = "1.0.1", default-features = false }
-# FORK PIN: fofoca-network/iroh, not crates.io. Naming crates.io here put a
+# FORK PIN: agent-habilis/iroh, not crates.io. Naming crates.io here put a
 # second iroh in the graph, and types crossing the gossip/endpoint boundary
 # stopped unifying (E0308). A consumer's [patch.crates-io] cannot fix that for
 # it: cargo honours one only in a workspace root, and never inherits it.
-iroh-base = { version = "=1.0.3", git = "https://github.com/fofoca-network/iroh", rev = "66003af753b5d221edb6f5407a4fda6a7a4d213c", default-features = false, features = ["key"] }
+iroh-base = { version = "=1.0.3", git = "https://github.com/agent-habilis/iroh", rev = "c814688e6c0967b2764efe7159059d1d68c4b2f4", default-features = false, features = ["key"] }
 n0-future = "0.3"
 postcard = { version = "1", default-features = false, features = [
     "alloc",
@@ -64,7 +64,7 @@ serde = { version = "1.0.164", features = ["derive"] }
 # net dependencies (optional)
 futures-concurrency = { version = "7.6.1", optional = true }
 # FORK PIN -- see the iroh-base note above.
-iroh = { version = "=1.0.3", git = "https://github.com/fofoca-network/iroh", rev = "66003af753b5d221edb6f5407a4fda6a7a4d213c", default-features = false, optional = true }
+iroh = { version = "=1.0.3", git = "https://github.com/agent-habilis/iroh", rev = "c814688e6c0967b2764efe7159059d1d68c4b2f4", default-features = false, optional = true }
 tokio = { version = "1", optional = true, features = ["io-util", "sync"] }
 tokio-util = { version = "0.7.12", optional = true, features = ["codec"] }
 tracing = "0.1"
@@ -105,7 +105,7 @@ clap = { version = "4", features = ["derive"] }
 humantime-serde = { version = "1.1.1" }
 # FORK PIN -- see the iroh-base note above. The dev-dep must match the normal
 # one, or the test binaries link a different iroh than the library.
-iroh = { version = "=1.0.3", git = "https://github.com/fofoca-network/iroh", rev = "66003af753b5d221edb6f5407a4fda6a7a4d213c", default-features = false, features = [
+iroh = { version = "=1.0.3", git = "https://github.com/agent-habilis/iroh", rev = "c814688e6c0967b2764efe7159059d1d68c4b2f4", default-features = false, features = [
     "metrics",
     "test-utils",
     "tls-ring"
