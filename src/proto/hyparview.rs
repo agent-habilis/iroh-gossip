@@ -29,6 +29,8 @@ pub enum InEvent<PI> {
     RequestJoin(PI),
     /// Update the peer data that is transmitted on join requests.
     UpdatePeerData(PeerData),
+    /// Drop the given peers from the active view, telling each that we are not coming back.
+    Leave(Vec<PI>),
     /// Quit the swarm, informing peers about us leaving.
     Quit,
 }
@@ -285,6 +287,7 @@ where
             InEvent::UpdatePeerData(data) => {
                 self.me_data = Some(data);
             }
+            InEvent::Leave(peers) => self.handle_leave(peers, io),
             InEvent::Quit => self.handle_quit(io),
         }
 
@@ -350,6 +353,22 @@ where
         } else if !self.alive_disconnect_peers.remove(&peer) {
             self.passive_view.remove(&peer);
             self.peer_data.remove(&peer);
+        }
+    }
+
+    /// Leave the given peers only. Other neighbors are kept and the active view is not refilled.
+    ///
+    /// The peers get `alive = false`, so they do not keep us in their passive view and do not
+    /// dial us back to refill their active view.
+    fn handle_leave(&mut self, peers: Vec<PI>, io: &mut impl IO<PI>) {
+        for peer in peers {
+            self.passive_view.remove(&peer);
+            self.alive_disconnect_peers.remove(&peer);
+            if self.active_view.remove(&peer).is_some() {
+                self.peer_data.remove(&peer);
+                io.push(OutEvent::EmitEvent(Event::NeighborDown(peer)));
+                self.send_disconnect(peer, false, io);
+            }
         }
     }
 

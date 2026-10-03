@@ -164,6 +164,11 @@ pub enum Command<PI> {
     Join(Vec<PI>),
     /// Broadcast a message for this topic.
     Broadcast(#[debug("<{}b>", _0.len())] Bytes, Scope),
+    /// Drop the connections to the given neighbors, without leaving the topic.
+    ///
+    /// Each named peer in the active view is told that we are leaving it for good, and
+    /// is removed from the active view. Other neighbors are not touched.
+    LeavePeers(Vec<PI>),
     /// Leave this topic and drop all state.
     Quit,
 }
@@ -273,6 +278,7 @@ impl<PI: PeerIdentity, R: Rng> State<PI, R> {
                     self.gossip
                         .handle(GossipIn::Broadcast(data, scope), now, io)
                 }
+                Command::LeavePeers(peers) => self.swarm.handle(SwarmIn::Leave(peers), io),
                 Command::Quit => self.swarm.handle(SwarmIn::Quit, io),
             },
             InEvent::RecvMessage(from, message) => {

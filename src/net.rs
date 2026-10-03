@@ -508,6 +508,7 @@ impl Actor {
                         ProtoCommand::Broadcast(message, Scope::Neighbors)
                     }
                     Command::JoinPeers(peers) => ProtoCommand::Join(peers),
+                    Command::LeavePeers(peers) => ProtoCommand::LeavePeers(peers),
                 };
                 self.handle_in_event(proto::InEvent::Command(topic, command), Instant::now())
                     .await;
@@ -2182,6 +2183,68 @@ pub(crate) mod tests {
 
         tokio::try_join!(r1.shutdown(), r2.shutdown(), r3.shutdown())
             .std_context("shutdown routers")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn leave_peers_drops_the_neighbor_and_stays_away() -> n0_error::Result<()> {
+        let rng = &mut rand::rngs::ChaCha12Rng::seed_from_u64(2);
+        let topic_id = TopicId::from([0u8; 32]);
+
+        async fn spawn(
+            rng: &mut impl CryptoRng,
+            topic_id: TopicId,
+        ) -> n0_error::Result<(EndpointId, Router, GossipSender, GossipReceiver)> {
+            let ep = Endpoint::builder(presets::Minimal)
+                .secret_key(SecretKey::from_bytes(&rng.random()))
+                .bind()
+                .await?;
+            let endpoint_id = ep.id();
+            let gossip = Gossip::builder().spawn(ep.clone());
+            let router = Router::builder(ep)
+                .accept(GOSSIP_ALPN, gossip.clone())
+                .spawn();
+            let topic = gossip.subscribe(topic_id, vec![]).await?;
+            let (sender, receiver) = topic.split();
+            Ok((endpoint_id, router, sender, receiver))
+        }
+
+        let (n1, r1, tx1, mut rx1) = spawn(rng, topic_id).await?;
+        let (n2, r2, tx2, mut rx2) = spawn(rng, topic_id).await?;
+        let lookup = MemoryLookup::new();
+        lookup.add_endpoint_info(r1.endpoint().addr());
+        r2.endpoint().address_lookup()?.add(lookup);
+        tx2.join_peers(vec![n1]).await?;
+        timeout(Duration::from_secs(3), rx1.joined())
+            .await
+            .std_context("wait rx1 join")??;
+        timeout(Duration::from_secs(3), rx2.joined())
+            .await
+            .std_context("wait rx2 join")??;
+
+        // Let the join handshake finish: a Neighbor message still in flight would add the peer back.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        tx1.leave_peers(vec![n2]).await?;
+
+        let ev = timeout(Duration::from_secs(3), rx1.next())
+            .await
+            .std_context("wait rx1 down")?;
+        assert!(matches!(ev, Some(Ok(Event::NeighborDown(n))) if n == n2));
+        let ev = timeout(Duration::from_secs(3), rx2.next())
+            .await
+            .std_context("wait rx2 down")?;
+        assert!(matches!(ev, Some(Ok(Event::NeighborDown(n))) if n == n1));
+
+        // No event, so no reconnect, within a bounded wait.
+        let e1 = timeout(Duration::from_secs(2), rx1.next()).await;
+        assert!(e1.is_err(), "rx1 got {e1:?}");
+        let e2 = timeout(Duration::from_secs(2), rx2.next()).await;
+        assert!(e2.is_err(), "rx2 got {e2:?}");
+        assert!(rx1.neighbors().next().is_none());
+        assert!(rx2.neighbors().next().is_none());
+
+        tokio::try_join!(r1.shutdown(), r2.shutdown()).std_context("shutdown routers")?;
         Ok(())
     }
 

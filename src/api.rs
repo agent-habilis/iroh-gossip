@@ -194,6 +194,15 @@ impl GossipSender {
         Ok(())
     }
 
+    /// Drops the connections to a set of neighbors, without leaving the topic.
+    ///
+    /// Each named peer that is a neighbor learns that we are gone for good, so it does not dial
+    /// us back to refill its neighbors. Other neighbors are not touched.
+    pub async fn leave_peers(&self, peers: Vec<EndpointId>) -> Result<(), ApiError> {
+        self.send(Command::LeavePeers(peers)).await?;
+        Ok(())
+    }
+
     async fn send(&self, command: Command) -> Result<(), irpc::channel::SendError> {
         self.0.send(command).await?;
         Ok(())
@@ -380,6 +389,8 @@ pub enum Command {
     BroadcastNeighbors(#[debug("Bytes({})", _0.len())] Bytes),
     /// Connects to a set of peers.
     JoinPeers(Vec<EndpointId>),
+    /// Drops the connections to a set of neighbors, without leaving the topic.
+    LeavePeers(Vec<EndpointId>),
 }
 
 /// Options for joining a gossip topic.

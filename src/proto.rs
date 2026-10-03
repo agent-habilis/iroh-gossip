@@ -214,6 +214,48 @@ mod test {
 
     #[test]
     #[traced_test]
+    fn leave_peers_is_not_undone_by_refill() {
+        let rng = ChaCha12Rng::seed_from_u64(read_var("SEED", 0));
+        let mut network = Network::new(Config::default().into(), rng);
+        for i in 0..4 {
+            network.insert(i);
+        }
+        let t: TopicId = [0u8; 32].into();
+
+        network.command(0, t, Command::Join(vec![]));
+        (1..4).for_each(|i| network.command(i, t, Command::Join(vec![0])));
+        network.run_trips(4);
+        let _ = network.events();
+        assert!(network.neighbors(&0, &t).unwrap().contains(&1));
+        assert!(network.neighbors(&1, &t).unwrap().contains(&0));
+
+        network.command(0, t, Command::LeavePeers(vec![1]));
+        network.run_trips(4);
+
+        let events = network.events_sorted();
+        assert!(events.contains(&(0, t, Event::NeighborDown(1))));
+        assert!(events.contains(&(1, t, Event::NeighborDown(0))));
+        assert!(!events
+            .iter()
+            .any(|(_, _, e)| matches!(e, Event::NeighborUp(_))));
+
+        // 1 must not take 0 back into its passive view, and 0 must not touch other neighbours.
+        let swarm = |peer: u64| &network.peer(&peer).unwrap().state(&t).unwrap().swarm;
+        assert!(!swarm(1).passive_view.contains(&0));
+        assert!(!swarm(0).passive_view.contains(&1));
+        assert!(network.neighbors(&0, &t).unwrap().contains(&2));
+        assert!(network.neighbors(&0, &t).unwrap().contains(&3));
+
+        // The link must not come back by a refill. A later shuffle round can still bring it back
+        // when both sides are under capacity, so stop before the first shuffle (60s by default).
+        network.run_duration(std::time::Duration::from_secs(30));
+        assert!(!network.neighbors(&0, &t).unwrap().contains(&1));
+        assert!(!network.neighbors(&1, &t).unwrap().contains(&0));
+        assert!(network.check_synchronicity());
+    }
+
+    #[test]
+    #[traced_test]
     fn plumtree_smoke() {
         let rng = ChaCha12Rng::seed_from_u64(read_var("SEED", 0));
         let network_config = NetworkConfig {
