@@ -346,13 +346,14 @@ where
     fn on_disconnect(&mut self, peer: PI, details: Disconnect, io: &mut impl IO<PI>) {
         self.pending_neighbor_requests.remove(&peer);
         let is_alive = details.alive && !details.left;
-        if details.left {
-            self.add_tombstone(peer);
-        }
         if self.active_view.contains(&peer) {
             self.remove_active(&peer, RemovalReason::DisconnectReceived { is_alive }, io);
         } else if is_alive && self.passive_view.contains(&peer) {
             self.alive_disconnect_peers.insert(peer);
+        }
+        // After `remove_active`, so that the tombstone also drops the peer data of a neighbor.
+        if details.left {
+            self.add_tombstone(peer);
         }
     }
 
@@ -379,6 +380,8 @@ where
             }
             if self.active_view.remove(&peer).is_some() {
                 io.push(OutEvent::EmitEvent(Event::NeighborDown(peer)));
+                // `send_disconnect` sends a `ShuffleReply` first, so the far side learns some of
+                // our other peers. Look here first if links to the leaver still come back.
                 self.send_disconnect(peer, false, true, io);
             }
             self.add_tombstone(peer);
@@ -389,6 +392,10 @@ where
     ///
     /// The set is bounded and the oldest tombstone goes first. It has no deadline: a leave on
     /// purpose ends when either side sends a `Join`, not after a time.
+    ///
+    /// Limit: a peer can only tombstone itself, but one that leaves under more than `capacity`
+    /// identities pushes older tombstones out. Then the first dial from a forgotten peer is
+    /// accepted again.
     fn add_tombstone(&mut self, peer: PI) {
         self.passive_view.remove(&peer);
         self.alive_disconnect_peers.remove(&peer);
@@ -398,8 +405,9 @@ where
         }
         self.left.shift_remove(&peer);
         self.left.insert(peer);
-        let capacity = LEFT_CAPACITY_FACTOR * self.config.passive_view_capacity;
+        let capacity = (LEFT_CAPACITY_FACTOR * self.config.passive_view_capacity).max(1);
         while self.left.len() > capacity {
+            // O(n) on an `IndexSet`, but n is at most `capacity` and this runs once per leave.
             self.left.shift_remove_index(0);
         }
     }
@@ -453,17 +461,21 @@ where
     fn on_forward_join(&mut self, sender: PI, message: ForwardJoin<PI>, io: &mut impl IO<PI>) {
         let peer_id = message.peer.id;
         // The leave is between the joiner and us. Do not adopt it, but the walk is for the swarm,
-        // so pass it on if we can.
+        // so pass it on while its ttl lasts. At ttl 0 we drop it: a node without the tombstone
+        // adopts at ttl 0, and if every node of a group holds the tombstone, a walk that is
+        // forwarded at ttl 0 would go round the group for ever.
         if self.left.contains(&peer_id) {
-            if let Some(next) = self
-                .active_view
-                .pick_random_without(&[&sender], &mut self.rng)
-            {
-                let message = Message::ForwardJoin(ForwardJoin {
-                    peer: message.peer,
-                    ttl: message.ttl.next(),
-                });
-                io.push(OutEvent::SendMessage(*next, message));
+            if !message.ttl.expired() {
+                if let Some(next) = self
+                    .active_view
+                    .pick_random_without(&[&sender], &mut self.rng)
+                {
+                    let message = Message::ForwardJoin(ForwardJoin {
+                        peer: message.peer,
+                        ttl: message.ttl.next(),
+                    });
+                    io.push(OutEvent::SendMessage(*next, message));
+                }
             }
             return;
         }
@@ -950,11 +962,31 @@ mod tests {
     fn received_left_disconnect_tombstones_and_forgets_the_peer() {
         let mut b = with_active(1, &[0, 2]);
         b.passive_view.insert(3);
+        b.peer_data.insert(0, PeerData::new(vec![1]));
         let mut io = Io::new();
         recv(&mut b, 0, disconnect(false, true), &mut io);
         assert!(b.left.contains(&0));
         assert!(!b.active_view.contains(&0));
         assert!(!b.passive_view.contains(&0));
+        assert!(!b.peer_data.contains_key(&0));
+    }
+
+    #[test]
+    fn refused_high_priority_neighbor_is_healed_by_a_join_in_one_flow() {
+        let mut a = with_active(0, &[1]);
+        let mut io = Io::new();
+        a.handle(InEvent::Leave(vec![1]), &mut io);
+        io.clear();
+
+        // The peer asks for a link with high priority, as an isolated node does.
+        recv(&mut a, 1, neighbor(Priority::High), &mut io);
+        assert!(a.active_view.is_empty());
+        assert!(sent(&io).contains(&(1, disconnect(false, true))));
+
+        // The same peer sends a Join. The link comes back and a Neighbor works again.
+        recv(&mut a, 1, Message::Join(None), &mut io);
+        assert!(a.active_view.contains(&1));
+        assert!(a.left.is_empty());
     }
 
     #[test]
@@ -989,22 +1021,45 @@ mod tests {
     }
 
     #[test]
-    fn forward_join_for_a_left_joiner_is_passed_on_not_adopted() {
-        for ttl in [0, 3] {
-            let mut b = with_active(1, &[2, 3]);
+    fn forward_join_for_a_left_joiner_is_passed_on_while_the_ttl_lasts() {
+        let mut b = with_active(1, &[2, 3]);
+        let mut io = Io::new();
+        recv(&mut b, 0, disconnect(false, true), &mut io);
+        io.clear();
+        recv(&mut b, 2, forward_join(0, 3), &mut io);
+        // No Neighbor to the joiner, and the walk goes on to the other neighbor.
+        assert_eq!(sent(&io), vec![(3, forward_join(0, 2))]);
+
+        // At ttl 0 the walk ends here.
+        io.clear();
+        recv(&mut b, 2, forward_join(0, 0), &mut io);
+        assert!(sent(&io).is_empty());
+        assert!(!b.pending_neighbor_requests.contains(&0));
+    }
+
+    /// Three nodes, each with the other two active, all holding the tombstone of the joiner.
+    #[test]
+    fn forward_join_walk_ends_when_every_node_holds_the_tombstone() {
+        let mut nodes: Vec<TestState> = (1..=3)
+            .map(|me| {
+                let others: Vec<u64> = (1..=3).filter(|p| *p != me).collect();
+                let mut node = with_active(me, &others);
+                node.left.insert(9);
+                node
+            })
+            .collect();
+        let mut in_flight = vec![(1u64, 2u64, forward_join(9, 6))];
+        let mut sends = 0;
+        while let Some((from, to, message)) = in_flight.pop() {
+            sends += 1;
+            assert!(sends <= 20, "the walk does not end");
             let mut io = Io::new();
-            recv(&mut b, 0, disconnect(false, true), &mut io);
-            io.clear();
-            recv(&mut b, 2, forward_join(0, ttl), &mut io);
-            let out = sent(&io);
-            let to_joiner = out.iter().filter(|(to, _)| *to == 0).count();
-            assert_eq!(to_joiner, 0, "ttl {ttl}: no Neighbor to the joiner");
-            assert_eq!(
-                out,
-                vec![(3, forward_join(0, ttl.saturating_sub(1)))],
-                "ttl {ttl}: the walk goes on to the other neighbor"
-            );
+            recv(&mut nodes[to as usize - 1], from, message, &mut io);
+            for (next, message) in sent(&io) {
+                in_flight.push((to, next, message));
+            }
         }
+        assert!(sends <= 7, "one send per ttl step at most, got {sends}");
     }
 
     #[test]
