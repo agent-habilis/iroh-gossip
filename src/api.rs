@@ -196,8 +196,12 @@ impl GossipSender {
 
     /// Drops the connections to a set of neighbors, without leaving the topic.
     ///
-    /// Each named peer that is a neighbor learns that we are gone for good, so it does not dial
+    /// Each named peer that is a neighbor learns that we left on purpose, so it does not dial
     /// us back to refill its neighbors. Other neighbors are not touched.
+    ///
+    /// After a leave, only [`join_peers`](Self::join_peers) from either side links the pair
+    /// again. Do not close the connection yourself: gossip closes it after the peer got the
+    /// notice, and an early close makes the peer see a lost connection instead.
     pub async fn leave_peers(&self, peers: Vec<EndpointId>) -> Result<(), ApiError> {
         self.send(Command::LeavePeers(peers)).await?;
         Ok(())

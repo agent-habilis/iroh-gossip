@@ -128,7 +128,7 @@ impl<PI> From<(PI, Option<PeerData>)> for PeerInfo<PI> {
 
 #[cfg(test)]
 mod test {
-    use std::{collections::HashSet, env, fmt, str::FromStr};
+    use std::{collections::HashSet, env, fmt, str::FromStr, time::Duration};
 
     use n0_tracing_test::traced_test;
     use rand::{rngs::ChaCha12Rng, SeedableRng};
@@ -246,12 +246,65 @@ mod test {
         assert!(network.neighbors(&0, &t).unwrap().contains(&2));
         assert!(network.neighbors(&0, &t).unwrap().contains(&3));
 
-        // The link must not come back by a refill. A later shuffle round can still bring it back
-        // when both sides are under capacity, so stop before the first shuffle (60s by default).
+        // The link must not come back by a refill.
         network.run_duration(std::time::Duration::from_secs(30));
         assert!(!network.neighbors(&0, &t).unwrap().contains(&1));
         assert!(!network.neighbors(&1, &t).unwrap().contains(&0));
         assert!(network.check_synchronicity());
+    }
+
+    #[test]
+    #[traced_test]
+    fn leave_peers_stays_away_across_shuffles() {
+        let rng = ChaCha12Rng::seed_from_u64(read_var("SEED", 0));
+        let mut network = Network::new(Config::default().into(), rng);
+        for i in 0..4 {
+            network.insert(i);
+        }
+        let t: TopicId = [0u8; 32].into();
+        network.command(0, t, Command::Join(vec![]));
+        (1..4).for_each(|i| network.command(i, t, Command::Join(vec![0])));
+        network.run_trips(4);
+        let _ = network.events();
+
+        network.command(0, t, Command::LeavePeers(vec![1]));
+        // Five shuffle rounds with the default 60 s interval.
+        network.run_duration(Duration::from_secs(300));
+
+        let relinked = network.events().any(|(peer, _, event)| {
+            matches!(
+                (peer, event),
+                (0, Event::NeighborUp(1)) | (1, Event::NeighborUp(0))
+            )
+        });
+        assert!(!relinked);
+        assert!(!network.neighbors(&0, &t).unwrap().contains(&1));
+        assert!(!network.neighbors(&1, &t).unwrap().contains(&0));
+        assert!(network.check_synchronicity());
+    }
+
+    #[test]
+    #[traced_test]
+    fn join_links_a_pair_again_after_a_leave_from_either_side() {
+        for joiner in [0u64, 1] {
+            let rng = ChaCha12Rng::seed_from_u64(read_var("SEED", 0));
+            let mut network = Network::new(Config::default().into(), rng);
+            network.insert(0);
+            network.insert(1);
+            let t: TopicId = [0u8; 32].into();
+            network.command(0, t, Command::Join(vec![]));
+            network.command(1, t, Command::Join(vec![0]));
+            network.run_trips(4);
+            network.command(0, t, Command::LeavePeers(vec![1]));
+            network.run_duration(Duration::from_secs(120));
+            assert!(network.neighbors(&0, &t).unwrap().is_empty());
+            assert!(network.neighbors(&1, &t).unwrap().is_empty());
+
+            network.command(joiner, t, Command::Join(vec![1 - joiner]));
+            network.run_trips(4);
+            assert_eq!(network.neighbors(&0, &t).unwrap(), vec![1]);
+            assert_eq!(network.neighbors(&1, &t).unwrap(), vec![0]);
+        }
     }
 
     #[test]

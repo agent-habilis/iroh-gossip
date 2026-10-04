@@ -166,8 +166,11 @@ pub struct Disconnect {
     /// Whether we are actually shutting down or closing the connection only because our limits are
     /// reached.
     alive: bool,
-    /// Obsolete field (kept in the struct to maintain wire compatibility).
-    _respond: bool,
+    /// Whether the sender left on purpose and wants to stay unlinked until a [`Message::Join`].
+    ///
+    /// This reuses the obsolete `respond` field, so the wire format is unchanged. No peer of
+    /// this fork ever sent `true` there.
+    left: bool,
 }
 
 /// Configuration for the swarm membership layer
@@ -227,6 +230,9 @@ pub struct Stats {
     total_connections: usize,
 }
 
+/// A node remembers at most this many times `passive_view_capacity` peers that left on purpose.
+const LEFT_CAPACITY_FACTOR: usize = 8;
+
 /// The state of the HyParView protocol
 #[derive(Debug)]
 pub struct State<PI, RG = ThreadRng> {
@@ -252,6 +258,11 @@ pub struct State<PI, RG = ThreadRng> {
     peer_data: HashMap<PI, PeerData>,
     /// List of peers that are disconnecting, but which we want to keep in the passive set once the connection closes
     alive_disconnect_peers: HashSet<PI>,
+    /// Peers that left us, or that we left, on purpose. Oldest first.
+    ///
+    /// A peer in this set is not added to the passive view and not adopted from a `ForwardJoin`.
+    /// Its `Neighbor` request is refused. Only a `Join` from either side clears it.
+    left: indexmap::IndexSet<PI>,
 }
 
 impl<PI, RG> State<PI, RG>
@@ -272,6 +283,7 @@ where
             pending_neighbor_requests: Default::default(),
             peer_data: Default::default(),
             alive_disconnect_peers: Default::default(),
+            left: Default::default(),
         }
     }
 
@@ -323,6 +335,7 @@ where
     }
 
     fn handle_join(&mut self, peer: PI, io: &mut impl IO<PI>) {
+        self.left.shift_remove(&peer);
         io.push(OutEvent::SendMessage(
             peer,
             Message::Join(self.me_data.clone()),
@@ -332,15 +345,13 @@ where
     /// We received a disconnect message.
     fn on_disconnect(&mut self, peer: PI, details: Disconnect, io: &mut impl IO<PI>) {
         self.pending_neighbor_requests.remove(&peer);
+        let is_alive = details.alive && !details.left;
+        if details.left {
+            self.add_tombstone(peer);
+        }
         if self.active_view.contains(&peer) {
-            self.remove_active(
-                &peer,
-                RemovalReason::DisconnectReceived {
-                    is_alive: details.alive,
-                },
-                io,
-            );
-        } else if details.alive && self.passive_view.contains(&peer) {
+            self.remove_active(&peer, RemovalReason::DisconnectReceived { is_alive }, io);
+        } else if is_alive && self.passive_view.contains(&peer) {
             self.alive_disconnect_peers.insert(peer);
         }
     }
@@ -358,28 +369,49 @@ where
 
     /// Leave the given peers only. Other neighbors are kept and the active view is not refilled.
     ///
-    /// The peers get `alive = false`, so they do not keep us in their passive view and do not
-    /// dial us back to refill their active view.
+    /// Each peer in the active view gets a `Disconnect` with `alive = false` and `left = true`.
+    /// We tombstone every named peer, also when it is only in the passive view: after a leave,
+    /// only a `Join` from either side links the pair again.
     fn handle_leave(&mut self, peers: Vec<PI>, io: &mut impl IO<PI>) {
         for peer in peers {
-            self.passive_view.remove(&peer);
-            self.alive_disconnect_peers.remove(&peer);
-            if self.active_view.remove(&peer).is_some() {
-                self.peer_data.remove(&peer);
-                io.push(OutEvent::EmitEvent(Event::NeighborDown(peer)));
-                self.send_disconnect(peer, false, io);
+            if peer == self.me {
+                continue;
             }
+            if self.active_view.remove(&peer).is_some() {
+                io.push(OutEvent::EmitEvent(Event::NeighborDown(peer)));
+                self.send_disconnect(peer, false, true, io);
+            }
+            self.add_tombstone(peer);
+        }
+    }
+
+    /// Remember that `peer` left on purpose and forget everything else we know about it.
+    ///
+    /// The set is bounded and the oldest tombstone goes first. It has no deadline: a leave on
+    /// purpose ends when either side sends a `Join`, not after a time.
+    fn add_tombstone(&mut self, peer: PI) {
+        self.passive_view.remove(&peer);
+        self.alive_disconnect_peers.remove(&peer);
+        self.pending_neighbor_requests.remove(&peer);
+        if !self.active_view.contains(&peer) {
+            self.peer_data.remove(&peer);
+        }
+        self.left.shift_remove(&peer);
+        self.left.insert(peer);
+        let capacity = LEFT_CAPACITY_FACTOR * self.config.passive_view_capacity;
+        while self.left.len() > capacity {
+            self.left.shift_remove_index(0);
         }
     }
 
     fn handle_quit(&mut self, io: &mut impl IO<PI>) {
         for peer in self.active_view.clone().into_iter() {
             self.active_view.remove(&peer);
-            self.send_disconnect(peer, false, io);
+            self.send_disconnect(peer, false, false, io);
         }
     }
 
-    fn send_disconnect(&mut self, peer: PI, alive: bool, io: &mut impl IO<PI>) {
+    fn send_disconnect(&mut self, peer: PI, alive: bool, left: bool, io: &mut impl IO<PI>) {
         // Before disconnecting, send a `ShuffleReply` with some of our nodes to
         // prevent the other node from running out of connections. This is especially
         // relevant if the other node just joined the swarm.
@@ -388,15 +420,14 @@ where
             self.config.shuffle_active_view_count + self.config.shuffle_passive_view_count,
             io,
         );
-        let message = Message::Disconnect(Disconnect {
-            alive,
-            _respond: false,
-        });
+        let message = Message::Disconnect(Disconnect { alive, left });
         io.push(OutEvent::SendMessage(peer, message));
         io.push(OutEvent::DisconnectPeer(peer));
     }
 
     fn on_join(&mut self, peer: PI, data: Option<PeerData>, io: &mut impl IO<PI>) {
+        // A `Join` is the application of the peer asking for the link, so it ends a leave.
+        self.left.shift_remove(&peer);
         // "A node that receives a join request will start by adding the new
         // node to its active view, even if it has to drop a random node from it. (6)"
         self.add_active(peer, data.clone(), Priority::High, true, io);
@@ -421,6 +452,21 @@ where
 
     fn on_forward_join(&mut self, sender: PI, message: ForwardJoin<PI>, io: &mut impl IO<PI>) {
         let peer_id = message.peer.id;
+        // The leave is between the joiner and us. Do not adopt it, but the walk is for the swarm,
+        // so pass it on if we can.
+        if self.left.contains(&peer_id) {
+            if let Some(next) = self
+                .active_view
+                .pick_random_without(&[&sender], &mut self.rng)
+            {
+                let message = Message::ForwardJoin(ForwardJoin {
+                    peer: message.peer,
+                    ttl: message.ttl.next(),
+                });
+                io.push(OutEvent::SendMessage(*next, message));
+            }
+            return;
+        }
         // If the peer is already in our active view, we renew our neighbor relationship.
         if self.active_view.contains(&peer_id) {
             self.insert_peer_info(message.peer, io);
@@ -468,13 +514,20 @@ where
 
     fn on_neighbor(&mut self, from: PI, details: Neighbor, io: &mut impl IO<PI>) {
         let is_reply = self.pending_neighbor_requests.remove(&from);
+        // This refuses a `High` priority request on purpose, against the HyParView paper: after a
+        // leave, only a `Join` links the pair again. The refusal tells the far side to tombstone
+        // us too, which ends a joint dial.
+        if self.left.contains(&from) {
+            self.send_disconnect(from, false, true, io);
+            return;
+        }
         let do_reply = !is_reply;
         // "A node q that receives a high priority neighbor request will always accept the request, even
         // if it has to drop a random member from its active view (again, the member that is dropped will
         // receive a Disconnect notification). If a node q receives a low priority Neighbor request, it will
         // only accept the request if it has a free slot in its active view, otherwise it will refuse the request."
         if !self.add_active(from, details.data, details.priority, do_reply, io) {
-            self.send_disconnect(from, true, io);
+            self.send_disconnect(from, true, false, io);
         }
     }
 
@@ -591,8 +644,12 @@ where
     /// Add a peer to the passive view.
     ///
     /// If the passive view is full, it will first remove a random peer and then insert the new peer.
-    /// If a peer is currently in the active view it will not be added.
+    /// If a peer is currently in the active view, or left on purpose, it will not be added.
     fn add_passive(&mut self, peer: PI, data: Option<PeerData>, io: &mut impl IO<PI>) {
+        // Check before `insert_peer_info`: a peer in no view must not keep peer data.
+        if self.left.contains(&peer) {
+            return;
+        }
         self.insert_peer_info((peer, data).into(), io);
         if self.active_view.contains(&peer) || self.passive_view.contains(&peer) || peer == self.me
         {
@@ -666,7 +723,7 @@ where
 
             match reason {
                 // send a disconnect message, then close connection.
-                RemovalReason::Random => self.send_disconnect(peer, true, io),
+                RemovalReason::Random => self.send_disconnect(peer, true, false, io),
                 // close connection without sending anything further.
                 RemovalReason::DisconnectReceived { is_alive: _ } => {
                     io.push(OutEvent::DisconnectPeer(peer))
@@ -780,4 +837,255 @@ enum RemovalReason {
     DisconnectReceived { is_alive: bool },
     /// A peer is removed after random selection to make room for a newly joined peer.
     Random,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+
+    use rand::{rngs::ChaCha12Rng, SeedableRng};
+
+    use super::*;
+    use crate::proto::{topic, Event as TopicEvent};
+
+    type Io = VecDeque<topic::OutEvent<u64>>;
+    type TestState = State<u64, ChaCha12Rng>;
+
+    fn state(me: u64) -> TestState {
+        State::new(me, None, Config::default(), ChaCha12Rng::seed_from_u64(me))
+    }
+
+    fn with_active(me: u64, peers: &[u64]) -> TestState {
+        let mut state = state(me);
+        for peer in peers {
+            state.active_view.insert(*peer);
+        }
+        state
+    }
+
+    fn recv(state: &mut TestState, from: u64, message: Message<u64>, io: &mut Io) {
+        state.handle(InEvent::RecvMessage(from, message), io);
+    }
+
+    fn sent(io: &Io) -> Vec<(u64, Message<u64>)> {
+        io.iter()
+            .filter_map(|event| match event {
+                topic::OutEvent::SendMessage(to, topic::Message::Swarm(message)) => {
+                    Some((*to, message.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn neighbor_ups(io: &Io) -> usize {
+        io.iter()
+            .filter(|e| matches!(e, topic::OutEvent::EmitEvent(TopicEvent::NeighborUp(_))))
+            .count()
+    }
+
+    fn disconnect(alive: bool, left: bool) -> Message<u64> {
+        Message::Disconnect(Disconnect { alive, left })
+    }
+
+    fn neighbor(priority: Priority) -> Message<u64> {
+        Message::Neighbor(Neighbor {
+            priority,
+            data: None,
+        })
+    }
+
+    fn forward_join(joiner: u64, ttl: u16) -> Message<u64> {
+        Message::ForwardJoin(ForwardJoin {
+            peer: PeerInfo {
+                id: joiner,
+                data: None,
+            },
+            ttl: Ttl(ttl),
+        })
+    }
+
+    #[test]
+    fn disconnect_wire_format_is_unchanged() {
+        let bytes = |alive, left| postcard::to_stdvec(&Disconnect { alive, left }).unwrap();
+        assert_eq!(bytes(true, false), [1, 0]);
+        assert_eq!(bytes(false, true), [0, 1]);
+    }
+
+    #[test]
+    fn leave_tombstones_a_peer_that_is_only_in_the_passive_view() {
+        let mut a = state(0);
+        a.passive_view.insert(1);
+        let mut io = Io::new();
+        a.handle(InEvent::Leave(vec![1]), &mut io);
+        assert!(a.left.contains(&1));
+        assert!(!a.passive_view.contains(&1));
+        assert!(sent(&io).is_empty());
+    }
+
+    #[test]
+    fn leave_sends_a_left_disconnect_and_keeps_other_neighbors() {
+        let mut a = with_active(0, &[1, 2]);
+        let mut io = Io::new();
+        a.handle(InEvent::Leave(vec![1]), &mut io);
+        assert!(sent(&io).contains(&(1, disconnect(false, true))));
+        assert!(a.active_view.contains(&2));
+        assert!(!a.active_view.contains(&1));
+    }
+
+    #[test]
+    fn neighbor_request_from_a_left_peer_is_refused_even_with_high_priority() {
+        let mut a = state(0);
+        a.passive_view.insert(1);
+        let mut io = Io::new();
+        a.handle(InEvent::Leave(vec![1]), &mut io);
+        io.clear();
+        recv(&mut a, 1, neighbor(Priority::High), &mut io);
+        assert!(!a.active_view.contains(&1));
+        assert!(sent(&io).contains(&(1, disconnect(false, true))));
+        assert_eq!(neighbor_ups(&io), 0);
+    }
+
+    #[test]
+    fn received_left_disconnect_tombstones_and_forgets_the_peer() {
+        let mut b = with_active(1, &[0, 2]);
+        b.passive_view.insert(3);
+        let mut io = Io::new();
+        recv(&mut b, 0, disconnect(false, true), &mut io);
+        assert!(b.left.contains(&0));
+        assert!(!b.active_view.contains(&0));
+        assert!(!b.passive_view.contains(&0));
+    }
+
+    #[test]
+    fn plain_disconnect_does_not_tombstone() {
+        let mut b = with_active(1, &[0]);
+        let mut io = Io::new();
+        recv(&mut b, 0, disconnect(false, false), &mut io);
+        assert!(b.left.is_empty());
+        recv(&mut b, 0, neighbor(Priority::High), &mut io);
+        assert!(b.active_view.contains(&0));
+    }
+
+    #[test]
+    fn shuffle_reply_naming_a_left_peer_adds_neither_view_nor_peer_data() {
+        let mut b = with_active(1, &[2]);
+        let mut io = Io::new();
+        recv(&mut b, 2, disconnect(false, true), &mut io);
+        recv(&mut b, 3, disconnect(false, true), &mut io);
+        let reply = Message::ShuffleReply(ShuffleReply {
+            nodes: vec![
+                PeerInfo {
+                    id: 2,
+                    data: Some(PeerData::new(vec![1, 2, 3])),
+                },
+                PeerInfo { id: 4, data: None },
+            ],
+        });
+        recv(&mut b, 5, reply, &mut io);
+        assert!(!b.passive_view.contains(&2));
+        assert!(!b.peer_data.contains_key(&2));
+        assert!(b.passive_view.contains(&4));
+    }
+
+    #[test]
+    fn forward_join_for_a_left_joiner_is_passed_on_not_adopted() {
+        for ttl in [0, 3] {
+            let mut b = with_active(1, &[2, 3]);
+            let mut io = Io::new();
+            recv(&mut b, 0, disconnect(false, true), &mut io);
+            io.clear();
+            recv(&mut b, 2, forward_join(0, ttl), &mut io);
+            let out = sent(&io);
+            let to_joiner = out.iter().filter(|(to, _)| *to == 0).count();
+            assert_eq!(to_joiner, 0, "ttl {ttl}: no Neighbor to the joiner");
+            assert_eq!(
+                out,
+                vec![(3, forward_join(0, ttl.saturating_sub(1)))],
+                "ttl {ttl}: the walk goes on to the other neighbor"
+            );
+        }
+    }
+
+    #[test]
+    fn forward_join_for_a_left_joiner_is_dropped_without_another_neighbor() {
+        let mut b = with_active(1, &[2]);
+        let mut io = Io::new();
+        recv(&mut b, 0, disconnect(false, true), &mut io);
+        io.clear();
+        recv(&mut b, 2, forward_join(0, 0), &mut io);
+        assert!(sent(&io).is_empty());
+        assert!(!b.pending_neighbor_requests.contains(&0));
+    }
+
+    #[test]
+    fn join_from_either_side_clears_the_tombstone() {
+        // The leaver rejoins.
+        let mut b = with_active(1, &[0]);
+        let mut io = Io::new();
+        recv(&mut b, 0, disconnect(false, true), &mut io);
+        assert!(b.left.contains(&0));
+        recv(&mut b, 0, Message::Join(None), &mut io);
+        assert!(b.left.is_empty());
+        assert!(b.active_view.contains(&0));
+
+        // The side that left asks for the link again.
+        let mut a = with_active(0, &[1]);
+        a.handle(InEvent::Leave(vec![1]), &mut io);
+        assert!(a.left.contains(&1));
+        io.clear();
+        a.handle(InEvent::RequestJoin(1), &mut io);
+        assert!(a.left.is_empty());
+        assert!(sent(&io)
+            .iter()
+            .any(|(to, m)| *to == 1 && matches!(m, Message::Join(_))));
+    }
+
+    #[test]
+    fn tombstones_are_bounded_and_the_oldest_goes_first() {
+        let config = Config {
+            passive_view_capacity: 2,
+            ..Default::default()
+        };
+        let mut a = State::new(0u64, None, config, ChaCha12Rng::seed_from_u64(0));
+        let mut io = Io::new();
+        a.handle(InEvent::Leave((1..=20).collect()), &mut io);
+        assert_eq!(a.left.len(), 16);
+        assert!(!a.left.contains(&1));
+        assert!(a.left.contains(&20));
+    }
+
+    /// A `Neighbor` from B is already on its way when A leaves B.
+    #[test]
+    fn crossing_neighbor_and_leave_end_with_tombstones_on_both_sides() {
+        let mut a = with_active(0, &[1]);
+        let mut b = state(1);
+        b.passive_view.insert(0);
+        let (mut a_io, mut b_io) = (Io::new(), Io::new());
+
+        b.refill_active_from_passive(&[], &mut b_io);
+        let b_to_a = sent(&b_io);
+        assert!(matches!(b_to_a.as_slice(), [(0, Message::Neighbor(_))]));
+        b_io.clear();
+
+        a.handle(InEvent::Leave(vec![1]), &mut a_io);
+        let a_to_b_leave = sent(&a_io);
+        a_io.clear();
+
+        for (_, message) in b_to_a {
+            recv(&mut a, 1, message, &mut a_io);
+        }
+        let a_to_b_refusal = sent(&a_io);
+
+        for (_, message) in a_to_b_leave.into_iter().chain(a_to_b_refusal) {
+            recv(&mut b, 0, message, &mut b_io);
+        }
+
+        assert!(a.left.contains(&1) && b.left.contains(&0));
+        assert!(a.active_view.is_empty() && b.active_view.is_empty());
+        assert_eq!(neighbor_ups(&a_io) + neighbor_ups(&b_io), 0);
+        assert!(sent(&b_io)
+            .iter()
+            .all(|(_, m)| !matches!(m, Message::Neighbor(_))));
+    }
 }

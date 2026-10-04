@@ -166,8 +166,14 @@ pub enum Command<PI> {
     Broadcast(#[debug("<{}b>", _0.len())] Bytes, Scope),
     /// Drop the connections to the given neighbors, without leaving the topic.
     ///
-    /// Each named peer in the active view is told that we are leaving it for good, and
-    /// is removed from the active view. Other neighbors are not touched.
+    /// Each named peer in the active view is told that we left it on purpose, and is removed
+    /// from the active view. Other neighbors are not touched.
+    ///
+    /// Both sides then keep the other in a bounded set of left peers: they do not add it to the
+    /// passive view and do not adopt it from a `ForwardJoin`, and they refuse its `Neighbor`
+    /// requests, also with high priority. After a leave, only a [`Command::Join`] from either
+    /// side links the pair again. A node whose only known peers left it stays unlinked until
+    /// the application joins a peer.
     LeavePeers(Vec<PI>),
     /// Leave this topic and drop all state.
     Quit,

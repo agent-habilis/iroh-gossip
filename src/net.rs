@@ -2223,8 +2223,7 @@ pub(crate) mod tests {
             .await
             .std_context("wait rx2 join")??;
 
-        // Let the join handshake finish: a Neighbor message still in flight would add the peer back.
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // No wait here on purpose: a Neighbor message of the join handshake can still be in flight.
         tx1.leave_peers(vec![n2]).await?;
 
         let ev = timeout(Duration::from_secs(3), rx1.next())
@@ -2245,6 +2244,96 @@ pub(crate) mod tests {
         assert!(rx2.neighbors().next().is_none());
 
         tokio::try_join!(r1.shutdown(), r2.shutdown()).std_context("shutdown routers")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn leave_peers_is_not_undone_by_shuffles_of_a_third_peer() -> n0_error::Result<()> {
+        let rng = &mut rand::rngs::ChaCha12Rng::seed_from_u64(3);
+        let topic_id = TopicId::from([0u8; 32]);
+
+        async fn spawn(
+            rng: &mut impl CryptoRng,
+            topic_id: TopicId,
+        ) -> n0_error::Result<(EndpointId, Router, GossipSender, GossipReceiver)> {
+            let ep = Endpoint::builder(presets::Minimal)
+                .secret_key(SecretKey::from_bytes(&rng.random()))
+                .bind()
+                .await?;
+            let endpoint_id = ep.id();
+            let membership = proto::HyparviewConfig {
+                shuffle_interval: Duration::from_millis(100),
+                ..Default::default()
+            };
+            let gossip = Gossip::builder()
+                .membership_config(membership)
+                .spawn(ep.clone());
+            let router = Router::builder(ep)
+                .accept(GOSSIP_ALPN, gossip.clone())
+                .spawn();
+            let topic = gossip.subscribe(topic_id, vec![]).await?;
+            let (sender, receiver) = topic.split();
+            Ok((endpoint_id, router, sender, receiver))
+        }
+
+        let (n1, r1, tx1, mut rx1) = spawn(rng, topic_id).await?;
+        let (n2, r2, tx2, mut rx2) = spawn(rng, topic_id).await?;
+        let (_n3, r3, tx3, mut rx3) = spawn(rng, topic_id).await?;
+        let lookup = MemoryLookup::new();
+        lookup.add_endpoint_info(r1.endpoint().addr());
+        r2.endpoint().address_lookup()?.add(lookup.clone());
+        r3.endpoint().address_lookup()?.add(lookup);
+        tx2.join_peers(vec![n1]).await?;
+        tx3.join_peers(vec![n1]).await?;
+        // n1 is linked with n2 and n3, and n2 is linked with n3.
+        // `neighbors()` only changes while the receiver is polled, so drain the events.
+        async fn drain(rx: &mut GossipReceiver, duration: Duration) {
+            timeout(duration, async { while rx.next().await.is_some() {} })
+                .await
+                .ok();
+        }
+        for _ in 0..100 {
+            drain(&mut rx1, Duration::from_millis(30)).await;
+            drain(&mut rx2, Duration::from_millis(30)).await;
+            drain(&mut rx3, Duration::from_millis(30)).await;
+            if rx1.neighbors().count() == 2 && rx2.neighbors().count() == 2 {
+                break;
+            }
+        }
+        assert_eq!(rx1.neighbors().count(), 2, "n1 needs both neighbors");
+        assert_eq!(rx2.neighbors().count(), 2, "n2 needs both neighbors");
+
+        tx1.leave_peers(vec![n2]).await?;
+
+        // 30 shuffle intervals. n3 keeps naming n1 to n2, and n2 to n1.
+        for _ in 0..30 {
+            drain(&mut rx1, Duration::from_millis(33)).await;
+            drain(&mut rx2, Duration::from_millis(33)).await;
+            drain(&mut rx3, Duration::from_millis(33)).await;
+        }
+        assert!(!rx1.neighbors().any(|n| n == n2), "n1 linked n2 again");
+        assert!(!rx2.neighbors().any(|n| n == n1), "n2 linked n1 again");
+        assert!(
+            rx1.neighbors().any(|n| n != n2),
+            "n1 lost its other neighbor"
+        );
+
+        // A Join links the pair again.
+        tx1.join_peers(vec![n2]).await?;
+        for _ in 0..100 {
+            drain(&mut rx1, Duration::from_millis(30)).await;
+            drain(&mut rx2, Duration::from_millis(30)).await;
+            if rx1.neighbors().any(|n| n == n2) && rx2.neighbors().any(|n| n == n1) {
+                break;
+            }
+        }
+        assert!(rx1.neighbors().any(|n| n == n2), "n1 did not link n2");
+        assert!(rx2.neighbors().any(|n| n == n1), "n2 did not link n1");
+
+        drop((tx1, tx2, tx3, rx3));
+        tokio::try_join!(r1.shutdown(), r2.shutdown(), r3.shutdown())
+            .std_context("shutdown routers")?;
         Ok(())
     }
 
