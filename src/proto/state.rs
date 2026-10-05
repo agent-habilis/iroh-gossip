@@ -43,6 +43,15 @@ impl<PI> Message<PI> {
     pub fn kind(&self) -> MessageKind {
         self.message.kind()
     }
+
+    /// A `Join` request for `topic`, for tests outside the `proto` module tree.
+    #[cfg(test)]
+    pub(crate) fn join_for_test(topic: TopicId) -> Self {
+        Self {
+            topic,
+            message: topic::Message::Swarm(super::hyparview::Message::Join(None)),
+        }
+    }
 }
 
 impl<PI: Serialize> Message<PI> {

@@ -672,6 +672,9 @@ impl Actor {
         }
     }
 
+    // Stays `async`: it must never wait on a peer, and the test
+    // `a_peer_with_a_full_send_queue_does_not_stall_the_actor` fails it with a timeout if it does.
+    #[allow(clippy::unused_async)]
     async fn handle_in_event_inner(&mut self, event: InEvent, now: Instant) {
         if matches!(event, InEvent::TimerExpired(_)) {
             trace!(?event, "handle in_event");
@@ -690,13 +693,31 @@ impl Actor {
                     let state = self.peers.entry(peer_id).or_default();
                     match state {
                         PeerState::Active { active_send_tx, .. } => {
-                            if let Err(_err) = active_send_tx.send(message).await {
-                                // Removing the peer is handled by the in_event PeerDisconnected sent
-                                // in [`Self::handle_connection_task_finished`].
-                                warn!(
-                                    peer = %peer_id.fmt_short(),
-                                    "failed to send: connection task send loop terminated",
-                                );
+                            // Never wait here: the actor is one task, and a connection that does
+                            // not drain its queue would stop it from serving every other peer.
+                            // Gossip tolerates a lost message, so the message is dropped.
+                            match active_send_tx.try_send(message) {
+                                Ok(()) => {}
+                                Err(mpsc::error::TrySendError::Full(_message)) => {
+                                    self.metrics.msgs_dropped_send_queue_full.inc();
+                                    let dropped = self.metrics.msgs_dropped_send_queue_full.get();
+                                    // Log the first drop and then each power of two, not each one.
+                                    if dropped.is_power_of_two() {
+                                        warn!(
+                                            peer = %peer_id.fmt_short(),
+                                            dropped,
+                                            "dropped a message: the send queue of the connection is full",
+                                        );
+                                    }
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_message)) => {
+                                    // Removing the peer is handled by the in_event PeerDisconnected sent
+                                    // in [`Self::handle_connection_task_finished`].
+                                    warn!(
+                                        peer = %peer_id.fmt_short(),
+                                        "failed to send: connection task send loop terminated",
+                                    );
+                                }
                             }
                         }
                         PeerState::Pending { queue } => {
@@ -2334,6 +2355,80 @@ pub(crate) mod tests {
         drop((tx1, tx2, tx3, rx3));
         tokio::try_join!(r1.shutdown(), r2.shutdown(), r3.shutdown())
             .std_context("shutdown routers")?;
+        Ok(())
+    }
+
+    /// The actor is one task. A peer whose send queue is full and never drained must not stop it
+    /// from serving the other peers.
+    #[tokio::test]
+    #[traced_test]
+    async fn a_peer_with_a_full_send_queue_does_not_stall_the_actor() -> Result {
+        let rng = &mut rand::rngs::ChaCha12Rng::seed_from_u64(7);
+        let ct = CancellationToken::new();
+        let (relay_map, _relay_url, _guard) = iroh::test_utils::run_relay_server().await.unwrap();
+        let (_gossip, mut actor, endpoint_task) =
+            Gossip::t_new_with_actor(rng, Default::default(), relay_map, &ct).await?;
+
+        let topic: TopicId = blake3::hash(b"full_send_queue").into();
+        let slow = SecretKey::from_bytes(&rng.random()).public();
+        let fast = SecretKey::from_bytes(&rng.random()).public();
+        let (slow_tx, mut slow_rx) = mpsc::channel(SEND_QUEUE_CAP);
+        let (fast_tx, mut fast_rx) = mpsc::channel(SEND_QUEUE_CAP);
+        for (peer, tx, conn_id) in [(slow, slow_tx.clone(), 1), (fast, fast_tx, 2)] {
+            actor.peers.insert(
+                peer,
+                PeerState::Active {
+                    active_send_tx: tx,
+                    active_conn_id: conn_id,
+                    other_conns: Vec::new(),
+                },
+            );
+        }
+
+        // Both peers become neighbors.
+        let now = Instant::now();
+        actor
+            .handle_in_event(
+                proto::InEvent::Command(topic, ProtoCommand::Join(Vec::new())),
+                now,
+            )
+            .await;
+        for peer in [slow, fast] {
+            actor
+                .handle_in_event(
+                    proto::InEvent::RecvMessage(peer, ProtoMessage::join_for_test(topic)),
+                    now,
+                )
+                .await;
+        }
+
+        // Fill the queue of the slow peer, and keep its receiver so that it is never closed.
+        let sample = slow_rx.try_recv().expect("the slow peer got a message");
+        while slow_tx.try_send(sample.clone()).is_ok() {}
+        while fast_rx.try_recv().is_ok() {}
+
+        let broadcast = proto::InEvent::Command(
+            topic,
+            ProtoCommand::Broadcast(Bytes::from_static(b"hello"), Scope::Swarm),
+        );
+        timeout(
+            Duration::from_secs(1),
+            actor.handle_in_event(broadcast, now),
+        )
+        .await
+        .std_context("the actor stalled on the full send queue of one peer")?;
+        assert!(
+            fast_rx.try_recv().is_ok(),
+            "the other peer did not get the broadcast"
+        );
+        assert_eq!(
+            actor.metrics.msgs_dropped_send_queue_full.get(),
+            1,
+            "the message for the slow peer is dropped and counted"
+        );
+
+        ct.cancel();
+        drop((slow_rx, endpoint_task));
         Ok(())
     }
 
