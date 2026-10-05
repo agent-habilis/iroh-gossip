@@ -19,7 +19,7 @@ use irpc::WithChannels;
 use n0_error::{e, stack_error};
 use n0_future::{
     task::{self, AbortOnDropHandle, JoinSet},
-    time::Instant,
+    time::{Duration, Instant},
     Stream, StreamExt as _,
 };
 use rand::{rngs::StdRng, SeedableRng};
@@ -44,8 +44,20 @@ mod util;
 /// ALPN protocol name
 pub const GOSSIP_ALPN: &[u8] = b"/iroh-gossip/1";
 
-/// Channel capacity for the send queue (one per connection)
-const SEND_QUEUE_CAP: usize = 64;
+/// Channel capacity for the send queue (one per connection).
+///
+/// The actor never waits for this queue, see [`Actor::handle_in_event_inner`]. It holds a burst:
+/// one anti-entropy answer of a large mesh is 64 broadcasts, and each goes to every eager peer.
+const SEND_QUEUE_CAP: usize = 2048;
+/// Cap of the queue of messages for a peer that we dial and are not connected to yet.
+const PENDING_QUEUE_CAP: usize = SEND_QUEUE_CAP;
+/// How long the send queue of a peer may refuse messages, with no message accepted in between,
+/// before we disconnect the peer.
+///
+/// Longer than the pauses of a healthy link, such as the switch of a connection between a relay
+/// and a direct path (a few seconds), and much shorter than the idle timeout of the connection,
+/// after which a stuck peer is closed anyway (more than 100 s).
+const SEND_REFUSED_DEADLINE: Duration = Duration::from_secs(10);
 /// Channel capacity for the ToActor message queue (single)
 const TO_ACTOR_CAP: usize = 64;
 /// Channel capacity for the InEvent message queue (single)
@@ -302,6 +314,11 @@ struct Actor {
     metrics: Arc<Metrics>,
     topic_event_forwarders: JoinSet<TopicId>,
     address_lookup: GossipAddressLookup,
+    /// Peers to disconnect after the current event: their send queue refused a message that
+    /// must not be dropped, or refused messages for longer than `send_refused_deadline`.
+    overflow_disconnects: VecDeque<EndpointId>,
+    /// See [`SEND_REFUSED_DEADLINE`]. A field so that a test can shorten it.
+    send_refused_deadline: Duration,
 }
 
 impl Actor {
@@ -346,6 +363,8 @@ impl Actor {
             local_rx,
             topic_event_forwarders: Default::default(),
             address_lookup,
+            overflow_disconnects: Default::default(),
+            send_refused_deadline: SEND_REFUSED_DEADLINE,
         };
 
         (actor, rpc_tx, local_tx)
@@ -528,12 +547,14 @@ impl Actor {
         let conn_id = conn.stable_id();
 
         let queue = match self.peers.entry(peer_id) {
-            Entry::Occupied(mut entry) => entry.get_mut().accept_conn(send_tx, conn_id),
+            Entry::Occupied(mut entry) => entry.get_mut().accept_conn(send_tx, conn.clone()),
             Entry::Vacant(entry) => {
                 entry.insert(PeerState::Active {
                     active_send_tx: send_tx,
                     active_conn_id: conn_id,
                     other_conns: Vec::new(),
+                    active_conn: Some(conn.clone()),
+                    refused_since: None,
                 });
                 Vec::new()
             }
@@ -656,7 +677,37 @@ impl Actor {
 
     async fn handle_in_event(&mut self, event: InEvent, now: Instant) {
         self.handle_in_event_inner(event, now).await;
+        self.process_overflow_disconnects().await;
         self.process_quit_queue().await;
+    }
+
+    /// Disconnect the peers whose send queue refused a message that must not be dropped, or
+    /// refused messages for longer than the deadline.
+    ///
+    /// This takes the path of a lost connection (`handle_connection_task_finished`): the peer
+    /// entry goes, the connection is closed, and the protocol is told `PeerDisconnected`, so
+    /// that both sides see `NeighborDown` and `HyParView` refills the view.
+    async fn process_overflow_disconnects(&mut self) {
+        while let Some(peer_id) = self.overflow_disconnects.pop_front() {
+            self.metrics.send_overflow_disconnects.inc();
+            let disconnects = self.metrics.send_overflow_disconnects.get();
+            if disconnects.is_power_of_two() {
+                warn!(
+                    peer = %peer_id.fmt_short(),
+                    disconnects,
+                    "disconnect: the send queue of the peer refused a message for too long, or one that must not be dropped",
+                );
+            }
+            if let Some(PeerState::Active {
+                active_conn: Some(conn),
+                ..
+            }) = self.peers.remove(&peer_id)
+            {
+                conn.close(0u32.into(), b"send queue refused");
+            }
+            self.handle_in_event_inner(InEvent::PeerDisconnected(peer_id), Instant::now())
+                .await;
+        }
     }
 
     async fn process_quit_queue(&mut self) {
@@ -690,36 +741,47 @@ impl Actor {
             };
             match event {
                 OutEvent::SendMessage(peer_id, message) => {
+                    // The actor never waits for a peer: it is one task, and a peer that does
+                    // not drain its queue would stop it from serving every other peer.
+                    // A data message that does not fit is dropped (the protocol repairs it).
+                    // A message that must not be lost leads to a disconnect, so that both sides
+                    // see the same state. See `ProtoMessage::is_droppable`.
                     let state = self.peers.entry(peer_id).or_default();
                     match state {
-                        PeerState::Active { active_send_tx, .. } => {
-                            // Never wait here: the actor is one task, and a connection that does
-                            // not drain its queue would stop it from serving every other peer.
-                            // Gossip tolerates a lost message, so the message is dropped.
-                            match active_send_tx.try_send(message) {
-                                Ok(()) => {}
-                                Err(mpsc::error::TrySendError::Full(_message)) => {
+                        PeerState::Active {
+                            active_send_tx,
+                            refused_since,
+                            ..
+                        } => match active_send_tx.try_send(message) {
+                            Ok(()) => *refused_since = None,
+                            Err(mpsc::error::TrySendError::Full(message)) => {
+                                let since = *refused_since.get_or_insert_with(Instant::now);
+                                if message.is_droppable()
+                                    && since.elapsed() < self.send_refused_deadline
+                                {
                                     self.metrics.msgs_dropped_send_queue_full.inc();
                                     let dropped = self.metrics.msgs_dropped_send_queue_full.get();
-                                    // Log the first drop and then each power of two, not each one.
+                                    // Log the first drop and then each power of two.
                                     if dropped.is_power_of_two() {
                                         warn!(
                                             peer = %peer_id.fmt_short(),
                                             dropped,
-                                            "dropped a message: the send queue of the connection is full",
+                                            "dropped a data message: the send queue of the connection is full",
                                         );
                                     }
-                                }
-                                Err(mpsc::error::TrySendError::Closed(_message)) => {
-                                    // Removing the peer is handled by the in_event PeerDisconnected sent
-                                    // in [`Self::handle_connection_task_finished`].
-                                    warn!(
-                                        peer = %peer_id.fmt_short(),
-                                        "failed to send: connection task send loop terminated",
-                                    );
+                                } else if !self.overflow_disconnects.contains(&peer_id) {
+                                    self.overflow_disconnects.push_back(peer_id);
                                 }
                             }
-                        }
+                            Err(mpsc::error::TrySendError::Closed(_message)) => {
+                                // Removing the peer is handled by the in_event PeerDisconnected sent
+                                // in [`Self::handle_connection_task_finished`].
+                                warn!(
+                                    peer = %peer_id.fmt_short(),
+                                    "failed to send: connection task send loop terminated",
+                                );
+                            }
+                        },
                         PeerState::Pending { queue } => {
                             // Dial on every send, not only on an empty queue: a failed
                             // dial leaves the queue non-empty, which used to stop every
@@ -730,7 +792,13 @@ impl Actor {
                                 debug!(peer = %peer_id.fmt_short(), "start to dial");
                             }
                             self.dialer.queue_dial(peer_id, self.alpn.clone());
-                            queue.push(message);
+                            if queue.len() < PENDING_QUEUE_CAP {
+                                queue.push(message);
+                            } else if message.is_droppable() {
+                                self.metrics.msgs_dropped_send_queue_full.inc();
+                            } else if !self.overflow_disconnects.contains(&peer_id) {
+                                self.overflow_disconnects.push_back(peer_id);
+                            }
                         }
                     }
                 }
@@ -798,6 +866,11 @@ enum PeerState {
         active_send_tx: mpsc::Sender<ProtoMessage>,
         active_conn_id: ConnId,
         other_conns: Vec<ConnId>,
+        /// The active connection, to close it when we disconnect a peer whose queue is stuck.
+        /// `None` only in tests that have no connection.
+        active_conn: Option<Connection>,
+        /// Since when the send queue refuses messages, with none accepted in between.
+        refused_since: Option<Instant>,
     },
 }
 
@@ -805,8 +878,9 @@ impl PeerState {
     fn accept_conn(
         &mut self,
         send_tx: mpsc::Sender<ProtoMessage>,
-        conn_id: ConnId,
+        conn: Connection,
     ) -> Vec<ProtoMessage> {
+        let conn_id = conn.stable_id();
         match self {
             PeerState::Pending { queue } => {
                 let queue = std::mem::take(queue);
@@ -814,6 +888,8 @@ impl PeerState {
                     active_send_tx: send_tx,
                     active_conn_id: conn_id,
                     other_conns: Vec::new(),
+                    active_conn: Some(conn),
+                    refused_since: None,
                 };
                 queue
             }
@@ -821,6 +897,8 @@ impl PeerState {
                 active_send_tx,
                 active_conn_id,
                 other_conns,
+                active_conn,
+                refused_since,
             } => {
                 // We already have an active connection. We keep the old connection intact,
                 // but only use the new connection for sending from now on.
@@ -830,6 +908,8 @@ impl PeerState {
                 other_conns.push(*active_conn_id);
                 *active_send_tx = send_tx;
                 *active_conn_id = conn_id;
+                *active_conn = Some(conn);
+                *refused_since = None;
                 Vec::new()
             }
         }
@@ -2358,77 +2438,218 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// A manual actor with fake peers: each has a send queue that the test reads or not.
+    struct Rig {
+        actor: Actor,
+        topic: TopicId,
+        peers: Vec<FakePeer>,
+        events: broadcast::Receiver<ProtoEvent>,
+        _endpoint_task: EndpointHandle,
+        _relay: Box<dyn std::any::Any>,
+    }
+
+    struct FakePeer {
+        id: EndpointId,
+        tx: mpsc::Sender<ProtoMessage>,
+        rx: mpsc::Receiver<ProtoMessage>,
+    }
+
+    impl Rig {
+        /// Joins `n` fake peers: the actor has each as an active neighbor.
+        async fn new(seed: u64, n: usize) -> Result<Self> {
+            let rng = &mut rand::rngs::ChaCha12Rng::seed_from_u64(seed);
+            let ct = CancellationToken::new();
+            let (relay_map, _relay_url, relay) =
+                iroh::test_utils::run_relay_server().await.unwrap();
+            let (_gossip, mut actor, endpoint_task) =
+                Gossip::t_new_with_actor(rng, Default::default(), relay_map, &ct).await?;
+            let topic: TopicId = blake3::hash(b"actor_queue_rig").into();
+            actor.topics.insert(topic, TopicState::default());
+            let events = actor.topics[&topic].event_sender.subscribe();
+
+            let mut peers = Vec::new();
+            for conn_id in 0..n {
+                let id = SecretKey::from_bytes(&rng.random()).public();
+                let (tx, rx) = mpsc::channel(SEND_QUEUE_CAP);
+                actor.peers.insert(
+                    id,
+                    PeerState::Active {
+                        active_send_tx: tx.clone(),
+                        active_conn_id: conn_id,
+                        other_conns: Vec::new(),
+                        active_conn: None,
+                        refused_since: None,
+                    },
+                );
+                peers.push(FakePeer { id, tx, rx });
+            }
+            let now = Instant::now();
+            actor
+                .handle_in_event(
+                    proto::InEvent::Command(topic, ProtoCommand::Join(Vec::new())),
+                    now,
+                )
+                .await;
+            for peer in &mut peers {
+                actor
+                    .handle_in_event(
+                        proto::InEvent::RecvMessage(peer.id, ProtoMessage::join_for_test(topic)),
+                        now,
+                    )
+                    .await;
+                while peer.rx.try_recv().is_ok() {}
+            }
+            Ok(Self {
+                actor,
+                topic,
+                peers,
+                events,
+                _endpoint_task: endpoint_task,
+                _relay: Box::new(relay),
+            })
+        }
+
+        async fn broadcast(&mut self, payload: impl Into<Bytes>) {
+            let command = proto::InEvent::Command(
+                self.topic,
+                ProtoCommand::Broadcast(payload.into(), Scope::Swarm),
+            );
+            self.actor.handle_in_event(command, Instant::now()).await;
+        }
+
+        /// Fills the send queue of a peer and keeps its receiver, so that it is never closed.
+        fn stick(&mut self, peer: usize) {
+            // Any message will do.
+            let sample = ProtoMessage::join_for_test(self.topic);
+            while self.peers[peer].tx.try_send(sample.clone()).is_ok() {}
+        }
+
+        fn drain_data(&mut self, peer: usize) -> usize {
+            let mut count = 0;
+            while let Ok(message) = self.peers[peer].rx.try_recv() {
+                count += usize::from(message.is_droppable());
+            }
+            count
+        }
+
+        fn neighbor_downs(&mut self) -> Vec<EndpointId> {
+            let mut out = Vec::new();
+            while let Ok(event) = self.events.try_recv() {
+                if let ProtoEvent::NeighborDown(peer) = event {
+                    out.push(peer);
+                }
+            }
+            out
+        }
+    }
+
     /// The actor is one task. A peer whose send queue is full and never drained must not stop it
     /// from serving the other peers.
     #[tokio::test]
     #[traced_test]
     async fn a_peer_with_a_full_send_queue_does_not_stall_the_actor() -> Result {
-        let rng = &mut rand::rngs::ChaCha12Rng::seed_from_u64(7);
-        let ct = CancellationToken::new();
-        let (relay_map, _relay_url, _guard) = iroh::test_utils::run_relay_server().await.unwrap();
-        let (_gossip, mut actor, endpoint_task) =
-            Gossip::t_new_with_actor(rng, Default::default(), relay_map, &ct).await?;
-
-        let topic: TopicId = blake3::hash(b"full_send_queue").into();
-        let slow = SecretKey::from_bytes(&rng.random()).public();
-        let fast = SecretKey::from_bytes(&rng.random()).public();
-        let (slow_tx, mut slow_rx) = mpsc::channel(SEND_QUEUE_CAP);
-        let (fast_tx, mut fast_rx) = mpsc::channel(SEND_QUEUE_CAP);
-        for (peer, tx, conn_id) in [(slow, slow_tx.clone(), 1), (fast, fast_tx, 2)] {
-            actor.peers.insert(
-                peer,
-                PeerState::Active {
-                    active_send_tx: tx,
-                    active_conn_id: conn_id,
-                    other_conns: Vec::new(),
-                },
-            );
-        }
-
-        // Both peers become neighbors.
+        let mut rig = Rig::new(7, 2).await?;
+        rig.stick(0);
         let now = Instant::now();
-        actor
-            .handle_in_event(
-                proto::InEvent::Command(topic, ProtoCommand::Join(Vec::new())),
-                now,
-            )
-            .await;
-        for peer in [slow, fast] {
-            actor
-                .handle_in_event(
-                    proto::InEvent::RecvMessage(peer, ProtoMessage::join_for_test(topic)),
-                    now,
-                )
-                .await;
-        }
-
-        // Fill the queue of the slow peer, and keep its receiver so that it is never closed.
-        let sample = slow_rx.try_recv().expect("the slow peer got a message");
-        while slow_tx.try_send(sample.clone()).is_ok() {}
-        while fast_rx.try_recv().is_ok() {}
-
         let broadcast = proto::InEvent::Command(
-            topic,
+            rig.topic,
             ProtoCommand::Broadcast(Bytes::from_static(b"hello"), Scope::Swarm),
         );
         timeout(
             Duration::from_secs(1),
-            actor.handle_in_event(broadcast, now),
+            rig.actor.handle_in_event(broadcast, now),
         )
         .await
         .std_context("the actor stalled on the full send queue of one peer")?;
-        assert!(
-            fast_rx.try_recv().is_ok(),
-            "the other peer did not get the broadcast"
-        );
+        assert_eq!(rig.drain_data(1), 1, "the other peer got the broadcast");
         assert_eq!(
-            actor.metrics.msgs_dropped_send_queue_full.get(),
+            rig.actor.metrics.msgs_dropped_send_queue_full.get(),
             1,
-            "the message for the slow peer is dropped and counted"
+            "the data message for the stuck peer is dropped and counted"
         );
+        assert!(rig.actor.peers.contains_key(&rig.peers[0].id));
+        assert!(
+            rig.neighbor_downs().is_empty(),
+            "a first refusal is not a disconnect"
+        );
+        Ok(())
+    }
 
-        ct.cancel();
-        drop((slow_rx, endpoint_task));
+    /// A burst, such as the answer to an anti-entropy digest, is not an overflow.
+    #[tokio::test]
+    #[traced_test]
+    async fn a_burst_to_a_healthy_peer_is_delivered_in_full() -> Result {
+        let mut rig = Rig::new(8, 1).await?;
+        for i in 0..500 {
+            rig.broadcast(format!("message {i}")).await;
+        }
+        assert_eq!(rig.drain_data(0), 500);
+        assert_eq!(rig.actor.metrics.msgs_dropped_send_queue_full.get(), 0);
+        assert_eq!(rig.actor.metrics.send_overflow_disconnects.get(), 0);
+        assert!(rig.neighbor_downs().is_empty());
+        Ok(())
+    }
+
+    /// A peer that refuses messages for longer than the deadline is disconnected, and a third
+    /// peer keeps receiving.
+    #[tokio::test]
+    #[traced_test]
+    async fn a_stuck_peer_is_disconnected_after_the_deadline() -> Result {
+        let mut rig = Rig::new(9, 2).await?;
+        rig.actor.send_refused_deadline = Duration::from_millis(300);
+        rig.stick(0);
+
+        rig.broadcast("before the deadline").await;
+        assert!(rig.actor.peers.contains_key(&rig.peers[0].id));
+        assert_eq!(rig.actor.metrics.send_overflow_disconnects.get(), 0);
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        rig.broadcast("after the deadline").await;
+
+        let stuck = rig.peers[0].id;
+        assert!(
+            !rig.actor.peers.contains_key(&stuck),
+            "the stuck peer is gone"
+        );
+        assert_eq!(rig.actor.metrics.send_overflow_disconnects.get(), 1);
+        assert_eq!(rig.neighbor_downs(), vec![stuck]);
+        assert_eq!(rig.drain_data(1), 2, "the third peer got both broadcasts");
+        Ok(())
+    }
+
+    /// A message that must not be dropped is never dropped: the peer is disconnected instead.
+    #[tokio::test]
+    #[traced_test]
+    async fn a_control_message_for_a_full_queue_disconnects_the_peer() -> Result {
+        let mut rig = Rig::new(10, 2).await?;
+        rig.stick(0);
+        let stuck = rig.peers[0].id;
+        // Leaving a peer sends it a `Disconnect`, which is a control message.
+        let leave = proto::InEvent::Command(rig.topic, ProtoCommand::LeavePeers(vec![stuck]));
+        rig.actor.handle_in_event(leave, Instant::now()).await;
+
+        assert_eq!(rig.actor.metrics.msgs_dropped_send_queue_full.get(), 0);
+        assert_eq!(rig.actor.metrics.send_overflow_disconnects.get(), 1);
+        assert!(!rig.actor.peers.contains_key(&stuck));
+        Ok(())
+    }
+
+    /// The queue of a peer that we dial and are not connected to has the same cap.
+    #[tokio::test]
+    #[traced_test]
+    async fn the_queue_for_a_pending_dial_is_capped() -> Result {
+        let mut rig = Rig::new(11, 1).await?;
+        let ghost = rig.peers[0].id;
+        // The peer is a neighbor, but there is no connection: its messages wait for a dial.
+        rig.actor.peers.insert(ghost, PeerState::default());
+        for i in 0..(PENDING_QUEUE_CAP + 100) {
+            rig.broadcast(format!("message {i}")).await;
+        }
+        let Some(PeerState::Pending { queue }) = rig.actor.peers.get(&ghost) else {
+            panic!("the peer must still be pending");
+        };
+        assert_eq!(queue.len(), PENDING_QUEUE_CAP);
+        assert_eq!(rig.actor.metrics.msgs_dropped_send_queue_full.get(), 100);
         Ok(())
     }
 

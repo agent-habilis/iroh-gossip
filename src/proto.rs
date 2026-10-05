@@ -307,6 +307,59 @@ mod test {
         }
     }
 
+    /// A sender that cannot queue a data message drops it. The views must stay symmetric, and
+    /// the peer must get the messages that come after the refusal ends.
+    #[test]
+    #[traced_test]
+    fn refused_data_messages_keep_the_views_symmetric() {
+        let rng = ChaCha12Rng::seed_from_u64(read_var("SEED", 0));
+        let mut network = Network::new(Config::default().into(), rng);
+        for i in 0..6 {
+            network.insert(i);
+        }
+        let t: TopicId = [0u8; 32].into();
+        network.command(0, t, Command::Join(vec![]));
+        (1..6).for_each(|i| network.command(i, t, Command::Join(vec![0])));
+        network.run_trips(6);
+        let _ = network.events();
+        assert!(network.check_synchronicity());
+
+        network.refuse_data_to(3, true);
+        for round in 0..5 {
+            network.command(
+                round % 3,
+                t,
+                Command::Broadcast(format!("refused {round}").into_bytes().into(), Scope::Swarm),
+            );
+            network.run_trips(4);
+        }
+        network.run_duration(Duration::from_secs(120));
+        assert!(network.check_synchronicity());
+        let membership_changed = network
+            .events()
+            .any(|(_, _, e)| matches!(e, Event::NeighborDown(_) | Event::NeighborUp(_)));
+        assert!(
+            !membership_changed,
+            "refused data must not change the membership"
+        );
+
+        network.refuse_data_to(3, false);
+        network.command(
+            0,
+            t,
+            Command::Broadcast(b"after".to_vec().into(), Scope::Swarm),
+        );
+        network.run_duration(Duration::from_secs(30));
+        let got_after = network.events().any(|(peer, _, e)| {
+            peer == 3 && matches!(e, Event::Received(m) if m.content.as_ref() == b"after")
+        });
+        assert!(
+            got_after,
+            "node 3 must get the message sent after the refusal"
+        );
+        assert!(network.check_synchronicity());
+    }
+
     #[test]
     #[traced_test]
     fn plumtree_smoke() {

@@ -42,6 +42,9 @@ pub struct Metrics {
     pub actor_tick_in_event_rx: Counter,
     /// Number of times the actor ticked for a timer event
     pub actor_tick_timers: Counter,
-    /// Number of messages dropped because the send queue of a connection was full
+    /// Number of data messages dropped because the send queue of a connection was full
     pub msgs_dropped_send_queue_full: Counter,
+    /// Number of peers disconnected because their send queue refused a message for too long, or
+    /// refused a message that must not be dropped
+    pub send_overflow_disconnects: Counter,
 }

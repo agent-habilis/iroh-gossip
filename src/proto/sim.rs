@@ -117,6 +117,8 @@ pub struct Network<PI, R> {
     rng: R,
     config: NetworkConfig,
     queue: TimedEventQueue<PI>,
+    /// Peers to which droppable data messages are not delivered, see [`Network::refuse_data_to`].
+    refuse_data_to: BTreeSet<PI>,
 }
 
 impl<PI, R> Network<PI, R> {
@@ -134,6 +136,7 @@ impl<PI, R> Network<PI, R> {
             events: Default::default(),
             latencies: BTreeMap::new(),
             rng,
+            refuse_data_to: BTreeSet::new(),
         }
     }
 }
@@ -183,6 +186,17 @@ impl<PI: PeerIdentity + fmt::Display, R: Rng + SeedableRng> Network<PI, R> {
     /// Returns all active connections.
     pub fn conns(&self) -> Vec<(PI, PI)> {
         sort(self.conns.iter().cloned().map(Into::into).collect())
+    }
+
+    /// Makes the transport refuse the data messages (plumtree `Gossip` and `IHave`) that are
+    /// sent to `peer`, or accept them again. Control messages are never refused: a real sender
+    /// disconnects the peer instead of dropping one.
+    pub fn refuse_data_to(&mut self, peer: PI, refuse: bool) {
+        if refuse {
+            self.refuse_data_to.insert(peer);
+        } else {
+            self.refuse_data_to.remove(&peer);
+        }
     }
 
     /// Queues and performs a command.
@@ -319,6 +333,10 @@ impl<PI: PeerIdentity + fmt::Display, R: Rng + SeedableRng> Network<PI, R> {
         for event in out {
             match event {
                 OutEvent::SendMessage(to, message) => {
+                    if message.is_droppable() && self.refuse_data_to.contains(&to) {
+                        debug!(peer = ?peer, other = ?to, "data message refused");
+                        continue;
+                    }
                     let latency = latency_between(
                         &self.config.latency,
                         &mut self.latencies,
