@@ -227,8 +227,10 @@ mod test {
     #[test]
     #[traced_test]
     fn neighbor_peers_to_a_full_view_is_refused_and_evicts_nobody() {
-        // Node 3 has a neighbor (4), so it is not isolated. An isolated node asks with high
-        // priority by the rule of HyParView, which is how a node gets into a full mesh.
+        // Node 3 has a neighbor (4), so it is not isolated. The refill that follows a refusal
+        // asks with high priority when the active view is empty (hyparview.rs, in
+        // `refill_active_from_passive`): the exception of HyParView for an isolated node,
+        // which is how a node gets into a full mesh.
         let (mut network, t) = small_view_network(5, 2);
         network.command(0, t, Command::Join(vec![]));
         network.command(1, t, Command::Join(vec![0]));
