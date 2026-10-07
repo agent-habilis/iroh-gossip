@@ -27,6 +27,8 @@ pub enum InEvent<PI> {
     PeerDisconnected(PI),
     /// Send a join request to a peer.
     RequestJoin(PI),
+    /// Ask the given peers for a link with low priority, while the active view has a free slot.
+    RequestNeighbors(Vec<PI>),
     /// Update the peer data that is transmitted on join requests.
     UpdatePeerData(PeerData),
     /// Drop the given peers from the active view, telling each that we are not coming back.
@@ -296,6 +298,7 @@ where
             },
             InEvent::PeerDisconnected(peer) => self.handle_connection_closed(peer, io),
             InEvent::RequestJoin(peer) => self.handle_join(peer, io),
+            InEvent::RequestNeighbors(peers) => self.handle_request_neighbors(peers, io),
             InEvent::UpdatePeerData(data) => {
                 self.me_data = Some(data);
             }
@@ -340,6 +343,30 @@ where
             peer,
             Message::Join(self.me_data.clone()),
         ));
+    }
+
+    /// Ask peers for a link with low priority, for as many free slots as the active view has.
+    ///
+    /// A peer with a full active view refuses a low priority request and keeps its neighbors,
+    /// where a `Join` always gets in and evicts one. No `ForwardJoin` goes out. There is no
+    /// timer: a dial that fails clears the pending request through `PeerDisconnected`, and the
+    /// application decides when to ask again.
+    fn handle_request_neighbors(&mut self, peers: Vec<PI>, io: &mut impl IO<PI>) {
+        for peer in peers {
+            if self.active_view.len() + self.pending_neighbor_requests.len()
+                >= self.config.active_view_capacity
+            {
+                break;
+            }
+            if peer == self.me
+                || self.left.contains(&peer)
+                || self.active_view.contains(&peer)
+                || self.pending_neighbor_requests.contains(&peer)
+            {
+                continue;
+            }
+            self.send_neighbor(peer, Priority::Low, io);
+        }
     }
 
     /// We received a disconnect message.
@@ -958,6 +985,101 @@ mod tests {
             "b: {:?}",
             b.pending_neighbor_requests
         );
+    }
+
+    fn low_neighbor_requests(io: &Io) -> Vec<u64> {
+        sent(io)
+            .into_iter()
+            .filter(|(_, message)| {
+                matches!(
+                    message,
+                    Message::Neighbor(Neighbor {
+                        priority: Priority::Low,
+                        ..
+                    })
+                )
+            })
+            .map(|(to, _)| to)
+            .collect()
+    }
+
+    #[test]
+    fn request_neighbors_asks_with_low_priority_up_to_the_free_slots() {
+        // Capacity 5, three neighbors: two free slots, so two requests of ten ids.
+        let mut a = with_active(0, &[1, 2, 3]);
+        let mut io = Io::new();
+        a.handle(InEvent::RequestNeighbors((10..20).collect()), &mut io);
+
+        assert_eq!(low_neighbor_requests(&io), vec![10, 11]);
+        assert_eq!(sent(&io).len(), 2, "no Join and no other message");
+        assert!(
+            a.active_view.len() == 3,
+            "a request does not add a neighbor"
+        );
+    }
+
+    #[test]
+    fn request_neighbors_skips_neighbors_pending_requests_and_left_peers() {
+        let mut a = with_active(0, &[1]);
+        a.left.insert(2);
+        let mut io = Io::new();
+        a.handle(InEvent::RequestNeighbors(vec![1, 2, 3]), &mut io);
+        assert_eq!(low_neighbor_requests(&io), vec![3]);
+
+        // 3 is pending now: a second call does not ask again, and asks 4 within the budget.
+        io.clear();
+        a.handle(InEvent::RequestNeighbors(vec![3, 4]), &mut io);
+        assert_eq!(low_neighbor_requests(&io), vec![4]);
+    }
+
+    #[test]
+    fn request_neighbors_sends_nothing_when_the_active_view_is_full() {
+        let mut a = with_active(0, &[1, 2, 3, 4, 5]);
+        let mut io = Io::new();
+        a.handle(InEvent::RequestNeighbors(vec![10, 11]), &mut io);
+        assert!(sent(&io).is_empty());
+    }
+
+    #[test]
+    fn request_neighbors_sets_no_timer() {
+        // A failed dial clears the pending request through `PeerDisconnected`, and the
+        // application asks again later. A timer here would also refill from the passive view.
+        let mut a = state(0);
+        let mut io = Io::new();
+        a.handle(InEvent::RequestNeighbors(vec![10]), &mut io);
+        assert!(!io.iter().any(|event| matches!(
+            event,
+            topic::OutEvent::ScheduleTimer(
+                _,
+                topic::Timer::Swarm(Timer::PendingNeighborRequest(_))
+            )
+        )));
+        a.handle(InEvent::PeerDisconnected(10), &mut io);
+        assert!(a.pending_neighbor_requests.is_empty());
+    }
+
+    #[test]
+    fn a_late_answer_to_a_request_still_links_the_pair() {
+        let mut a = state(0);
+        let mut io = Io::new();
+        a.handle(InEvent::RequestNeighbors(vec![10]), &mut io);
+        io.clear();
+        recv(&mut a, 10, neighbor(Priority::Low), &mut io);
+        assert!(a.active_view.contains(&10));
+        assert_eq!(neighbor_ups(&io), 1);
+        assert!(a.pending_neighbor_requests.is_empty());
+    }
+
+    #[test]
+    fn a_refused_request_keeps_the_peer_in_the_passive_view() {
+        let mut a = state(0);
+        a.passive_view.insert(10);
+        let mut io = Io::new();
+        a.handle(InEvent::RequestNeighbors(vec![10]), &mut io);
+        recv(&mut a, 10, disconnect(true, false), &mut io);
+        assert!(a.active_view.is_empty());
+        assert!(a.pending_neighbor_requests.is_empty());
+        assert!(a.passive_view.contains(&10));
     }
 
     #[test]

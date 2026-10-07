@@ -207,6 +207,18 @@ impl GossipSender {
         Ok(())
     }
 
+    /// Asks a set of peers for a link, without taking a slot from a peer that has none.
+    ///
+    /// [`join_peers`](Self::join_peers) is always accepted, and a peer with a full active view
+    /// drops a random neighbor to make room. This request has low priority: a peer with a full
+    /// active view refuses it and keeps its neighbors. At most as many requests go out as this
+    /// node has free slots in its active view. Use it to fill the view; use
+    /// [`join_peers`](Self::join_peers) to enter a swarm or to link a peer on purpose.
+    pub async fn neighbor_peers(&self, peers: Vec<EndpointId>) -> Result<(), ApiError> {
+        self.send(Command::NeighborPeers(peers)).await?;
+        Ok(())
+    }
+
     async fn send(&self, command: Command) -> Result<(), irpc::channel::SendError> {
         self.0.send(command).await?;
         Ok(())
@@ -395,6 +407,8 @@ pub enum Command {
     JoinPeers(Vec<EndpointId>),
     /// Drops the connections to a set of neighbors, without leaving the topic.
     LeavePeers(Vec<EndpointId>),
+    /// Asks a set of peers for a link with low priority.
+    NeighborPeers(Vec<EndpointId>),
 }
 
 /// Options for joining a gossip topic.

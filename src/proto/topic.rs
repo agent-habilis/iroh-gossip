@@ -175,6 +175,13 @@ pub enum Command<PI> {
     /// side links the pair again. A node whose only known peers left it stays unlinked until
     /// the application joins a peer.
     LeavePeers(Vec<PI>),
+    /// Ask peers for a link with low priority.
+    ///
+    /// Unlike [`Command::Join`], a peer with a full active view refuses the request and keeps
+    /// its neighbors. A [`Command::Join`] is always accepted and evicts a random neighbor.
+    /// At most as many requests go out as the active view has free slots. On a topic
+    /// that was not joined, the command is dropped.
+    NeighborPeers(Vec<PI>),
     /// Leave this topic and drop all state.
     Quit,
 }
@@ -285,6 +292,9 @@ impl<PI: PeerIdentity, R: Rng> State<PI, R> {
                         .handle(GossipIn::Broadcast(data, scope), now, io)
                 }
                 Command::LeavePeers(peers) => self.swarm.handle(SwarmIn::Leave(peers), io),
+                Command::NeighborPeers(peers) => {
+                    self.swarm.handle(SwarmIn::RequestNeighbors(peers), io)
+                }
                 Command::Quit => self.swarm.handle(SwarmIn::Quit, io),
             },
             InEvent::RecvMessage(from, message) => {

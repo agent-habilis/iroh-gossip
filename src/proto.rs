@@ -212,6 +212,88 @@ mod test {
         assert!(network.check_synchronicity());
     }
 
+    /// A network of `count` peers with an active view of at most `capacity`.
+    fn small_view_network(count: u64, capacity: usize) -> (Network<u64, ChaCha12Rng>, TopicId) {
+        let rng = ChaCha12Rng::seed_from_u64(read_var("SEED", 0));
+        let mut config = Config::default();
+        config.membership.active_view_capacity = capacity;
+        let mut network = Network::new(config.clone().into(), rng);
+        for i in 0..count {
+            network.insert_with_config(i, config.clone());
+        }
+        (network, [0u8; 32].into())
+    }
+
+    #[test]
+    #[traced_test]
+    fn neighbor_peers_to_a_full_view_is_refused_and_evicts_nobody() {
+        // Node 3 has a neighbor (4), so it is not isolated. An isolated node asks with high
+        // priority by the rule of HyParView, which is how a node gets into a full mesh.
+        let (mut network, t) = small_view_network(5, 2);
+        network.command(0, t, Command::Join(vec![]));
+        network.command(1, t, Command::Join(vec![0]));
+        network.command(2, t, Command::Join(vec![0]));
+        network.command(4, t, Command::Join(vec![]));
+        network.command(3, t, Command::Join(vec![4]));
+        network.run_trips(4);
+        let _ = network.events();
+        let mut before = network.neighbors(&0, &t).unwrap();
+        before.sort();
+        assert_eq!(before, vec![1, 2]);
+
+        network.command(3, t, Command::NeighborPeers(vec![0]));
+        network.run_trips(4);
+
+        let mut after = network.neighbors(&0, &t).unwrap();
+        after.sort();
+        assert_eq!(after, before, "the full view of 0 is unchanged");
+        assert_eq!(network.neighbors(&3, &t).unwrap(), vec![4]);
+        assert!(!network
+            .events()
+            .any(|(_, _, event)| matches!(event, Event::NeighborDown(_))));
+        assert!(network.check_synchronicity());
+    }
+
+    #[test]
+    #[traced_test]
+    fn join_to_a_full_view_evicts_a_neighbor() {
+        // The rule that `NeighborPeers` does not have: a Join is always accepted.
+        let (mut network, t) = small_view_network(4, 2);
+        network.command(0, t, Command::Join(vec![]));
+        network.command(1, t, Command::Join(vec![0]));
+        network.command(2, t, Command::Join(vec![0]));
+        network.run_trips(4);
+        let _ = network.events();
+
+        network.command(3, t, Command::Join(vec![0]));
+        network.run_trips(4);
+
+        let after = network.neighbors(&0, &t).unwrap();
+        assert!(after.contains(&3));
+        assert_eq!(after.len(), 2);
+        assert!(network
+            .events()
+            .any(|(_, _, event)| matches!(event, Event::NeighborDown(_))));
+    }
+
+    #[test]
+    #[traced_test]
+    fn neighbor_peers_to_a_free_slot_links_the_pair() {
+        let (mut network, t) = small_view_network(3, 3);
+        network.command(0, t, Command::Join(vec![]));
+        network.command(1, t, Command::Join(vec![0]));
+        network.command(2, t, Command::Join(vec![]));
+        network.run_trips(4);
+        let _ = network.events();
+
+        network.command(2, t, Command::NeighborPeers(vec![0]));
+        network.run_trips(4);
+
+        assert!(network.neighbors(&0, &t).unwrap().contains(&2));
+        assert!(network.neighbors(&2, &t).unwrap().contains(&0));
+        assert!(network.check_synchronicity());
+    }
+
     #[test]
     #[traced_test]
     fn leave_peers_is_not_undone_by_refill() {
