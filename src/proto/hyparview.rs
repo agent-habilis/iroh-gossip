@@ -541,6 +541,11 @@ where
         if !self.add_active(from, details.data, details.priority, do_reply, io) {
             self.send_disconnect(from, true, false, io);
         }
+        // When `do_reply` is set, the Neighbor message that `add_active` just sent answers the
+        // request we received. Nobody answers an answer, so it must not wait in the pending set.
+        if do_reply {
+            self.pending_neighbor_requests.remove(&from);
+        }
     }
 
     /// Get the peer [`PeerInfo`] for a peer.
@@ -915,6 +920,44 @@ mod tests {
             },
             ttl: Ttl(ttl),
         })
+    }
+
+    // The answer to a Neighbor request is a Neighbor message too, but nobody answers it. If it
+    // is recorded as a pending request, the entry stays for the life of the link, and
+    // the refill rule that counts pending requests stops short of the active view capacity.
+    #[test]
+    fn a_join_handshake_leaves_no_pending_neighbor_request() {
+        let mut a = state(0);
+        let mut b = state(1);
+        let mut io = Io::new();
+        let neighbor_to = |io: &Io, peer: u64| {
+            sent(io)
+                .into_iter()
+                .find(|(to, message)| *to == peer && matches!(message, Message::Neighbor(_)))
+                .map(|(_, message)| message)
+                .expect("a Neighbor message")
+        };
+
+        // b joins a. a asks b for the link, and b answers.
+        recv(&mut a, 1, Message::Join(None), &mut io);
+        let request = neighbor_to(&io, 1);
+        io.clear();
+        recv(&mut b, 0, request, &mut io);
+        let answer = neighbor_to(&io, 0);
+        io.clear();
+        recv(&mut a, 1, answer, &mut io);
+
+        assert!(a.active_view.contains(&1) && b.active_view.contains(&0));
+        assert!(
+            a.pending_neighbor_requests.is_empty(),
+            "a: {:?}",
+            a.pending_neighbor_requests
+        );
+        assert!(
+            b.pending_neighbor_requests.is_empty(),
+            "b: {:?}",
+            b.pending_neighbor_requests
+        );
     }
 
     #[test]
