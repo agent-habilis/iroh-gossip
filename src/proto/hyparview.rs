@@ -354,9 +354,11 @@ where
     /// Ask peers for a link with low priority, for as many free slots as the active view has.
     ///
     /// A peer with a full active view refuses a low priority request and keeps its neighbors,
-    /// where a `Join` always gets in and evicts one. No `ForwardJoin` goes out. There is no
+    /// where a `Join` always gets in and evicts one. No `ForwardJoin` goes out. There is no refill
     /// timer: a dial that fails clears the pending request through `PeerDisconnected`, and the
-    /// application decides when to ask again.
+    /// application decides when to ask again. A request that nobody answers stops being pending
+    /// after [`NEIGHBOR_REQUEST_EXPIRY`] (`Timer::NeighborRequestExpired`), which only clears the
+    /// pending entry.
     fn handle_request_neighbors(&mut self, peers: Vec<PI>, io: &mut impl IO<PI>) {
         for peer in peers {
             if self.active_view.len() + self.pending_neighbor_requests.len()

@@ -628,8 +628,22 @@ impl Actor {
                 self.handle_in_event(InEvent::PeerDisconnected(peer_id), Instant::now())
                     .await;
             } else {
-                other_conns.retain(|x| *x != conn.stable_id());
-                debug!("remaining {} other connections", other_conns.len() + 1);
+                let conn_id = conn.stable_id();
+                let was_replaced = other_conns.contains(&conn_id);
+                other_conns.retain(|x| *x != conn_id);
+                if was_replaced {
+                    debug!(
+                        conn_id,
+                        "replaced connection closed, {} others left",
+                        other_conns.len() + 1
+                    );
+                } else {
+                    // Never active: it lost a crossing, was read for `DRAIN`, and is closed now.
+                    debug!(
+                        conn_id,
+                        "connection that lost a crossing closed after its drain"
+                    );
+                }
             }
         } else {
             debug!("peer already marked as disconnected");
@@ -897,10 +911,21 @@ enum PeerState {
 /// connection that is older is no crossing, it is a re-dial after a break that this side has not
 /// seen yet (the peer restarted). Applying the rule there would turn the dials of the restarted
 /// peer away until the keep-alive drops the dead connection.
+///
+/// The window bounds that case, it does not remove it: a peer that restarts and dials again within
+/// this time of a connection becoming active is still read as a crossing, and its dial is only
+/// read, not kept, until the dead connection is dropped.
 const CROSSING_WINDOW: Duration = Duration::from_secs(5);
 
 /// How long a connection whose send queue closed cleanly keeps reading before it is closed: what
 /// the peer sent on it before it learned that the connection was replaced still reaches us.
+///
+/// The queue also closes when the peer is dropped on purpose: `OutEvent::DisconnectPeer` only
+/// drops the senders. That connection then lingers for up to this long too, besides the time the
+/// send loop waits for the peer to take what is queued, before its task closes it. The protocol
+/// has forgotten the peer by then, so nothing waits on the connection. Passing the reason to
+/// `drains` would end the linger, but a replaced connection and a dropped one look the same to
+/// the task, so it is left as it is.
 const DRAIN: Duration = Duration::from_secs(2);
 
 /// Whether a connection keeps reading after its send loop ended. A write error ends the
@@ -2879,6 +2904,18 @@ pub(crate) mod tests {
         NeighborPeers,
     }
 
+    /// Waits until both peers have reported a neighbor up, so that the settling time that follows
+    /// starts after the link, whichever way it was made.
+    async fn wait_for_neighbor_up(go1: &Gossip, go2: &Gossip) {
+        timeout(Duration::from_secs(10), async {
+            while go1.metrics().neighbor_up.get() == 0 || go2.metrics().neighbor_up.get() == 0 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("both peers link");
+    }
+
     /// Two real peers connect to each other at once, so each dials the other. Returns the
     /// `neighbor_up` and `neighbor_down` counts of the two peers after the dust has settled.
     async fn crossing_round(
@@ -2909,15 +2946,17 @@ pub(crate) mod tests {
 
         // Kept alive until the end of the round: a dropped topic leaves it.
         let _keep: Box<dyn std::any::Any> = match by {
-            JoinBy::Join => Box::new(
-                [
+            JoinBy::Join => {
+                let topics = [
                     go1.subscribe_and_join(topic, vec![ep2.id()]),
                     go2.subscribe_and_join(topic, vec![ep1.id()]),
                 ]
                 .try_join()
                 .await
-                .unwrap(),
-            ),
+                .unwrap();
+                wait_for_neighbor_up(&go1, &go2).await;
+                Box::new(topics)
+            }
             JoinBy::NeighborPeers => {
                 let [topic1, topic2] = [go1.subscribe(topic, vec![]), go2.subscribe(topic, vec![])]
                     .try_join()
@@ -2931,15 +2970,7 @@ pub(crate) mod tests {
                 );
                 first.unwrap();
                 second.unwrap();
-                timeout(Duration::from_secs(10), async {
-                    while go1.metrics().neighbor_up.get() == 0
-                        || go2.metrics().neighbor_up.get() == 0
-                    {
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                    }
-                })
-                .await
-                .expect("both peers link");
+                wait_for_neighbor_up(&go1, &go2).await;
                 Box::new((sender1, receiver1, sender2, receiver2))
             }
         };
