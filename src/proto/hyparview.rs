@@ -1059,6 +1059,34 @@ mod tests {
     }
 
     #[test]
+    fn crossing_requests_link_both_sides_with_no_third_message() {
+        // a and b ask each other for a link at the same time. Each takes the request of the
+        // other as the answer to its own, so both link, and nobody sends a third message.
+        let mut a = state(0);
+        let mut b = state(1);
+        let (mut io_a, mut io_b) = (Io::new(), Io::new());
+        a.handle(InEvent::RequestNeighbors(vec![1]), &mut io_a);
+        b.handle(InEvent::RequestNeighbors(vec![0]), &mut io_b);
+        let to_b = low_neighbor_requests(&io_a);
+        let to_a = low_neighbor_requests(&io_b);
+        assert_eq!((to_b, to_a), (vec![1], vec![0]));
+        let (request_of_a, request_of_b) = (sent(&io_a).remove(0).1, sent(&io_b).remove(0).1);
+        io_a.clear();
+        io_b.clear();
+
+        recv(&mut b, 0, request_of_a, &mut io_b);
+        recv(&mut a, 1, request_of_b, &mut io_a);
+
+        assert!(a.active_view.contains(&1) && b.active_view.contains(&0));
+        assert!(
+            sent(&io_a).is_empty() && sent(&io_b).is_empty(),
+            "no third message"
+        );
+        assert!(a.pending_neighbor_requests.is_empty());
+        assert!(b.pending_neighbor_requests.is_empty());
+    }
+
+    #[test]
     fn a_late_answer_to_a_request_still_links_the_pair() {
         let mut a = state(0);
         let mut io = Io::new();
