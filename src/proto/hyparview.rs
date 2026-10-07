@@ -66,7 +66,12 @@ pub enum Event<PI> {
 pub enum Timer<PI> {
     DoShuffle,
     PendingNeighborRequest(PI),
+    /// A request made with [`InEvent::RequestNeighbors`] got no answer: forget that it is pending.
+    NeighborRequestExpired(PI),
 }
+
+/// How long a request made with [`InEvent::RequestNeighbors`] stays pending without an answer.
+const NEIGHBOR_REQUEST_EXPIRY: Duration = Duration::from_secs(20);
 
 /// Messages that we can send and receive from peers within the topic.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -295,6 +300,7 @@ where
             InEvent::TimerExpired(timer) => match timer {
                 Timer::DoShuffle => self.handle_shuffle_timer(io),
                 Timer::PendingNeighborRequest(peer) => self.handle_pending_neighbor_timer(peer, io),
+                Timer::NeighborRequestExpired(peer) => self.handle_neighbor_request_expired(peer),
             },
             InEvent::PeerDisconnected(peer) => self.handle_connection_closed(peer, io),
             InEvent::RequestJoin(peer) => self.handle_join(peer, io),
@@ -366,7 +372,18 @@ where
                 continue;
             }
             self.send_neighbor(peer, Priority::Low, io);
+            io.push(OutEvent::ScheduleTimer(
+                NEIGHBOR_REQUEST_EXPIRY,
+                Timer::NeighborRequestExpired(peer),
+            ));
         }
+    }
+
+    /// A request that nobody answered stops being pending, so that the application can ask again.
+    /// Unlike [`Self::handle_pending_neighbor_timer`], it does not touch the passive view and
+    /// does not refill the active view.
+    fn handle_neighbor_request_expired(&mut self, peer: PI) {
+        self.pending_neighbor_requests.remove(&peer);
     }
 
     /// We received a disconnect message.
@@ -1041,9 +1058,10 @@ mod tests {
     }
 
     #[test]
-    fn request_neighbors_sets_no_timer() {
+    fn request_neighbors_sets_no_refill_timer() {
         // A failed dial clears the pending request through `PeerDisconnected`, and the
-        // application asks again later. A timer here would also refill from the passive view.
+        // application asks again later. A refill timer here would also take a peer from the
+        // passive view. The only timer is the expiry of the pending entry.
         let mut a = state(0);
         let mut io = Io::new();
         a.handle(InEvent::RequestNeighbors(vec![10]), &mut io);
@@ -1054,8 +1072,44 @@ mod tests {
                 topic::Timer::Swarm(Timer::PendingNeighborRequest(_))
             )
         )));
+        let expiries: Vec<_> = io
+            .iter()
+            .filter_map(|event| match event {
+                topic::OutEvent::ScheduleTimer(
+                    after,
+                    topic::Timer::Swarm(Timer::NeighborRequestExpired(peer)),
+                ) => Some((*after, *peer)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(expiries, vec![(NEIGHBOR_REQUEST_EXPIRY, 10)]);
         a.handle(InEvent::PeerDisconnected(10), &mut io);
         assert!(a.pending_neighbor_requests.is_empty());
+    }
+
+    #[test]
+    fn an_expired_request_stops_being_pending_and_changes_nothing_else() {
+        let mut a = with_active(0, &[1]);
+        a.passive_view.insert(20);
+        let mut io = Io::new();
+        a.handle(InEvent::RequestNeighbors(vec![10]), &mut io);
+        assert!(a.pending_neighbor_requests.contains(&10));
+        io.clear();
+
+        a.handle(
+            InEvent::TimerExpired(Timer::NeighborRequestExpired(10)),
+            &mut io,
+        );
+
+        assert!(a.pending_neighbor_requests.is_empty());
+        assert!(
+            a.passive_view.contains(&20),
+            "the passive view is untouched"
+        );
+        assert!(sent(&io).is_empty(), "no refill: nothing is sent");
+        // The application can ask again.
+        a.handle(InEvent::RequestNeighbors(vec![10]), &mut io);
+        assert_eq!(low_neighbor_requests(&io), vec![10]);
     }
 
     #[test]
@@ -1084,6 +1138,111 @@ mod tests {
         );
         assert!(a.pending_neighbor_requests.is_empty());
         assert!(b.pending_neighbor_requests.is_empty());
+    }
+
+    /// Delivers what the states 0 (`a`) and 1 (`b`) send to each other, until nothing is left.
+    /// Returns the number of messages delivered, or `None` if more than `limit` rounds were needed.
+    fn settle(
+        a: &mut TestState,
+        b: &mut TestState,
+        io_a: &mut Io,
+        io_b: &mut Io,
+        limit: usize,
+    ) -> Option<usize> {
+        let mut delivered = 0;
+        for _ in 0..limit {
+            let to_b: Vec<_> = sent(io_a)
+                .into_iter()
+                .filter(|(to, _)| *to == 1)
+                .map(|(_, message)| message)
+                .collect();
+            let to_a: Vec<_> = sent(io_b)
+                .into_iter()
+                .filter(|(to, _)| *to == 0)
+                .map(|(_, message)| message)
+                .collect();
+            io_a.clear();
+            io_b.clear();
+            if to_a.is_empty() && to_b.is_empty() {
+                return Some(delivered);
+            }
+            for message in to_b {
+                delivered += 1;
+                recv(b, 0, message, io_b);
+            }
+            for message in to_a {
+                delivered += 1;
+                recv(a, 1, message, io_a);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn one_request_costs_two_messages() {
+        let mut a = state(0);
+        let mut b = state(1);
+        let (mut io_a, mut io_b) = (Io::new(), Io::new());
+        a.handle(InEvent::RequestNeighbors(vec![1]), &mut io_a);
+
+        let delivered = settle(&mut a, &mut b, &mut io_a, &mut io_b, 20);
+
+        assert_eq!(delivered, Some(2), "the request and its answer");
+        assert!(a.active_view.contains(&1) && b.active_view.contains(&0));
+    }
+
+    #[test]
+    fn crossing_requests_settle_with_at_most_one_extra_message() {
+        let mut a = state(0);
+        let mut b = state(1);
+        let (mut io_a, mut io_b) = (Io::new(), Io::new());
+        a.handle(InEvent::RequestNeighbors(vec![1]), &mut io_a);
+        b.handle(InEvent::RequestNeighbors(vec![0]), &mut io_b);
+
+        let delivered = settle(&mut a, &mut b, &mut io_a, &mut io_b, 20);
+
+        assert!(a.active_view.contains(&1) && b.active_view.contains(&0));
+        let delivered = delivered.expect("the exchange ends");
+        assert!(
+            delivered <= 3,
+            "two requests and at most one extra message: {delivered}"
+        );
+    }
+
+    #[test]
+    fn a_crossing_request_that_is_lost_still_links_both_sides() {
+        // a and b ask each other at once. The request of a never arrives (its connection was
+        // the loser of a crossing, and was closed unread). b's request does arrive, and a
+        // reads it as the answer to its own.
+        let mut a = state(0);
+        let mut b = state(1);
+        let (mut io_a, mut io_b) = (Io::new(), Io::new());
+        a.handle(InEvent::RequestNeighbors(vec![1]), &mut io_a);
+        b.handle(InEvent::RequestNeighbors(vec![0]), &mut io_b);
+        io_a.clear();
+        let request_of_b = sent(&io_b).remove(0).1;
+        io_b.clear();
+
+        recv(&mut a, 1, request_of_b, &mut io_a);
+        let delivered = settle(&mut a, &mut b, &mut io_a, &mut io_b, 20);
+        assert!(delivered.is_some(), "the exchange ends");
+        // b still waits for an answer that will not come. Its request expires, and the
+        // application asks again: a holds b and answers, and b reads that as the answer.
+        assert!(b.pending_neighbor_requests.contains(&0));
+        b.handle(
+            InEvent::TimerExpired(Timer::NeighborRequestExpired(0)),
+            &mut io_b,
+        );
+        b.handle(InEvent::RequestNeighbors(vec![0]), &mut io_b);
+        let delivered = settle(&mut a, &mut b, &mut io_a, &mut io_b, 20);
+
+        assert!(delivered.is_some(), "the exchange ends");
+        assert!(
+            a.active_view.contains(&1) && b.active_view.contains(&0),
+            "a holds b: {}, b holds a: {}",
+            a.active_view.contains(&1),
+            b.active_view.contains(&0)
+        );
     }
 
     #[test]
