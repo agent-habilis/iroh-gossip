@@ -547,8 +547,16 @@ impl Actor {
         let (send_tx, send_rx) = mpsc::channel(SEND_QUEUE_CAP);
         let conn_id = conn.stable_id();
 
+        let local_id = self.endpoint.id();
         let queue = match self.peers.entry(peer_id) {
-            Entry::Occupied(mut entry) => entry.get_mut().accept_conn(send_tx, conn.clone()),
+            Entry::Occupied(mut entry) => {
+                if entry.get().loses_crossing(local_id, peer_id, &conn) {
+                    debug!("crossing: the other connection was dialed by the lower endpoint id, closing this one");
+                    conn.close(0u32.into(), b"crossing");
+                    return;
+                }
+                entry.get_mut().accept_conn(send_tx, conn.clone())
+            }
             Entry::Vacant(entry) => {
                 entry.insert(PeerState::Active {
                     active_send_tx: send_tx,
@@ -875,7 +883,33 @@ enum PeerState {
     },
 }
 
+/// Whether the endpoint with the lower id dialed a connection: `local_dialed` says whether this
+/// side did. Both sides of a pair give the same answer, which is what lets them keep the same
+/// connection when both dial at once.
+fn dialed_by_lower_id(local: EndpointId, peer: EndpointId, local_dialed: bool) -> bool {
+    (local < peer) == local_dialed
+}
+
 impl PeerState {
+    /// Whether `new` is the loser of a crossing with the active connection, and is to be closed.
+    ///
+    /// A crossing is both sides dialing at once: each side then holds the connection it dialed and
+    /// the one it accepted. If each side kept its newest, each would keep the one that the other
+    /// closes, and the peer would be lost on both sides. The connection that the lower endpoint
+    /// id dialed wins, on both sides. A first connection is always kept, and so is a second
+    /// one of the same kind (a re-dial after a connection that broke).
+    fn loses_crossing(&self, local: EndpointId, peer: EndpointId, new: &Connection) -> bool {
+        let PeerState::Active {
+            active_conn: Some(active),
+            ..
+        } = self
+        else {
+            return false;
+        };
+        dialed_by_lower_id(local, peer, active.side().is_client())
+            && !dialed_by_lower_id(local, peer, new.side().is_client())
+    }
+
     fn accept_conn(
         &mut self,
         send_tx: mpsc::Sender<ProtoMessage>,
@@ -901,11 +935,16 @@ impl PeerState {
                 active_conn,
                 refused_since,
             } => {
-                // We already have an active connection. We keep the old connection intact,
-                // but only use the new connection for sending from now on.
-                // By dropping the `send_tx` of the old connection, the send loop part of
-                // the `connection_loop` of the old connection will terminate, which will also
-                // notify the peer that the old connection may be dropped.
+                // We already have an active connection, and `loses_crossing` did not close the
+                // new one. We keep the old connection intact, but only use the new connection for
+                // sending from now on. By dropping the `send_tx` of the old connection, the send
+                // loop part of the `connection_loop` of the old connection will terminate, which
+                // will also notify the peer that the old connection may be dropped.
+                //
+                // This is right for a re-dial, where the new connection replaces one that is
+                // going away. It is wrong for a crossing, where both sides dial at once and each
+                // would keep the connection that the other closes: that case is decided before
+                // this point.
                 other_conns.push(*active_conn_id);
                 *active_send_tx = send_tx;
                 *active_conn_id = conn_id;
@@ -2725,5 +2764,78 @@ pub(crate) mod tests {
         router1.shutdown().await.std_context("shutdown router1")?;
         router2.shutdown().await.std_context("shutdown router2")?;
         Ok(())
+    }
+
+    #[test]
+    fn the_connection_the_lower_id_dialed_wins_on_both_sides() {
+        let mut rng = rand::rngs::ChaCha12Rng::seed_from_u64(7);
+        let first = SecretKey::from_bytes(&rng.random()).public();
+        let second = SecretKey::from_bytes(&rng.random()).public();
+        let (low, high) = if first < second {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        // The connection that the lower id dialed: the lower side dialed it, the higher accepted it.
+        assert!(dialed_by_lower_id(low, high, true));
+        assert!(dialed_by_lower_id(high, low, false));
+        // The connection that the higher id dialed loses on both sides.
+        assert!(!dialed_by_lower_id(high, low, true));
+        assert!(!dialed_by_lower_id(low, high, false));
+    }
+
+    /// Both peers join each other at once, so each dials the other. Each side holds the connection
+    /// it dialed and the one it accepted. Both must keep the same one: if each keeps its newest,
+    /// each keeps the one that the other closes, and both report the neighbor down.
+    #[tokio::test]
+    #[traced_test]
+    async fn two_peers_that_dial_each_other_at_once_keep_one_connection() {
+        let mut rng = rand::rngs::ChaCha12Rng::seed_from_u64(1);
+        let (relay_map, relay_url, _guard) = iroh::test_utils::run_relay_server().await.unwrap();
+
+        for round in 0..6 {
+            let memory_lookup = MemoryLookup::new();
+            let ep1 = create_endpoint(&mut rng, relay_map.clone(), Some(memory_lookup.clone()))
+                .await
+                .unwrap();
+            let ep2 = create_endpoint(&mut rng, relay_map.clone(), Some(memory_lookup.clone()))
+                .await
+                .unwrap();
+            let go1 = Gossip::builder().spawn(ep1.clone());
+            let go2 = Gossip::builder().spawn(ep2.clone());
+            let cancel = CancellationToken::new();
+            let tasks = [
+                spawn(endpoint_loop(ep1.clone(), go1.clone(), cancel.clone())),
+                spawn(endpoint_loop(ep2.clone(), go2.clone(), cancel.clone())),
+            ];
+            memory_lookup
+                .add_endpoint_info(EndpointAddr::new(ep1.id()).with_relay_url(relay_url.clone()));
+            memory_lookup
+                .add_endpoint_info(EndpointAddr::new(ep2.id()).with_relay_url(relay_url.clone()));
+            let topic: TopicId = blake3::hash(format!("crossing {round}").as_bytes()).into();
+
+            let [_sub1, _sub2] = [
+                go1.subscribe_and_join(topic, vec![ep2.id()]),
+                go2.subscribe_and_join(topic, vec![ep1.id()]),
+            ]
+            .try_join()
+            .await
+            .unwrap();
+            tokio::time::sleep(Duration::from_secs(2)).await;
+
+            let down = (
+                go1.metrics().neighbor_down.get(),
+                go2.metrics().neighbor_down.get(),
+            );
+            cancel.cancel();
+            for task in tasks {
+                task.await.unwrap().unwrap();
+            }
+            assert_eq!(
+                down,
+                (0, 0),
+                "round {round}: a neighbor went down after the crossing"
+            );
+        }
     }
 }
