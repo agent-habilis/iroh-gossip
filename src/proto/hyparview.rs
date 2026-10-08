@@ -1006,6 +1006,107 @@ mod tests {
         );
     }
 
+    // A failed dial clears the pending request, and the next ForwardJoin asks again, so the peer
+    // gets two Neighbor requests and answers both. The first answer ends the request of the
+    // asking side; the second one finds no entry. Nobody answers an answer, so the exchange must
+    // end. When a node forgets its own answer at once, no node holds an entry that tells it that
+    // the next Neighbor is an answer, and each side answers the answer of the other for ever.
+    #[test]
+    fn two_requests_after_a_failed_dial_do_not_start_a_ping_pong() {
+        let mut carol = state(0);
+        let mut bob = state(1);
+        let rendezvous = 2;
+        let (mut carol_io, mut bob_io) = (Io::new(), Io::new());
+
+        recv(&mut bob, rendezvous, forward_join(0, 0), &mut bob_io);
+        bob.handle(InEvent::PeerDisconnected(0), &mut bob_io);
+        recv(&mut bob, rendezvous, forward_join(0, 0), &mut bob_io);
+        let requests: Vec<_> = sent(&bob_io)
+            .into_iter()
+            .filter(|(to, message)| *to == 0 && matches!(message, Message::Neighbor(_)))
+            .collect();
+        assert_eq!(requests.len(), 2, "bob asked carol twice");
+        bob_io.clear();
+
+        for (_, message) in requests {
+            recv(&mut carol, 1, message, &mut carol_io);
+        }
+        let mut crossed = 0;
+        let mut to_bob = sent(&carol_io);
+        carol_io.clear();
+        for _ in 0..200 {
+            crossed += to_bob.len();
+            for (_, message) in to_bob {
+                recv(&mut bob, 0, message, &mut bob_io);
+            }
+            let to_carol = sent(&bob_io);
+            bob_io.clear();
+            crossed += to_carol.len();
+            for (_, message) in to_carol {
+                recv(&mut carol, 1, message, &mut carol_io);
+            }
+            to_bob = sent(&carol_io);
+            carol_io.clear();
+            if to_bob.is_empty() {
+                break;
+            }
+        }
+        assert!(
+            crossed <= 4,
+            "the exchange did not stop: {crossed} Neighbor messages crossed"
+        );
+    }
+
+    // A second copy of a Neighbor request reaches a node after the link is up. Nobody answers
+    // an answer, so the exchange must end.
+    #[test]
+    fn a_late_copy_of_a_neighbor_request_does_not_start_a_ping_pong() {
+        let mut a = state(0);
+        let mut b = state(1);
+        let mut io = Io::new();
+        let neighbor_to = |io: &Io, peer: u64| {
+            sent(io)
+                .into_iter()
+                .find(|(to, message)| *to == peer && matches!(message, Message::Neighbor(_)))
+                .map(|(_, message)| message)
+                .expect("a Neighbor message")
+        };
+
+        recv(&mut a, 1, Message::Join(None), &mut io);
+        let request = neighbor_to(&io, 1);
+        io.clear();
+        recv(&mut b, 0, request.clone(), &mut io);
+        let answer = neighbor_to(&io, 0);
+        io.clear();
+        recv(&mut a, 1, answer, &mut io);
+
+        recv(&mut b, 0, request, &mut io);
+        let mut crossed = 0;
+        let mut to_a = sent(&io);
+        io.clear();
+        for _ in 0..200 {
+            crossed += to_a.len();
+            for (_, message) in to_a {
+                recv(&mut a, 1, message, &mut io);
+            }
+            let to_b = sent(&io);
+            io.clear();
+            crossed += to_b.len();
+            for (_, message) in to_b {
+                recv(&mut b, 0, message, &mut io);
+            }
+            to_a = sent(&io);
+            io.clear();
+            if to_a.is_empty() {
+                break;
+            }
+        }
+        assert!(
+            crossed <= 4,
+            "the exchange did not stop: {crossed} Neighbor messages crossed"
+        );
+    }
+
     fn low_neighbor_requests(io: &Io) -> Vec<u64> {
         sent(io)
             .into_iter()
