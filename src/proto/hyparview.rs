@@ -240,6 +240,10 @@ pub struct Stats {
 /// A node remembers at most this many times `passive_view_capacity` peers that left on purpose.
 const LEFT_CAPACITY_FACTOR: usize = 8;
 
+/// A node remembers the peers it answered with a `Neighbor`, at most this many in all: the active
+/// and the passive view together, `1` at least. See [`State::answered_neighbors`].
+const ANSWERED_CAPACITY_MIN: usize = 1;
+
 /// The state of the HyParView protocol
 #[derive(Debug)]
 pub struct State<PI, RG = ThreadRng> {
@@ -261,6 +265,17 @@ pub struct State<PI, RG = ThreadRng> {
     pub(crate) stats: Stats,
     /// The set of neighbor requests we sent out but did not yet receive a reply for
     pending_neighbor_requests: HashSet<PI>,
+    /// The peers we answered with a `Neighbor` and that did not send us anything since. Oldest first.
+    ///
+    /// A `Neighbor` message does not say whether it is a request or an answer: a node reads it as an
+    /// answer only when it holds an entry for the sender, either in `pending_neighbor_requests`
+    /// (we asked) or here (we answered). Without the second, a node that forgot its own answer reads
+    /// a late or doubled `Neighbor` as a new request and answers it, and two such nodes answer each
+    /// other for ever. The entry is spent by the next `Neighbor` from that peer and dropped with the
+    /// link, the request or the peer. It is a separate set so that an answered peer does not look like
+    /// a request in flight (`handle_request_neighbors` skips pending peers and counts them against
+    /// the free slots of the active view).
+    answered_neighbors: indexmap::IndexSet<PI>,
     /// The opaque user peer data we received for other peers
     peer_data: HashMap<PI, PeerData>,
     /// List of peers that are disconnecting, but which we want to keep in the passive set once the connection closes
@@ -288,6 +303,7 @@ where
             rng,
             stats: Stats::default(),
             pending_neighbor_requests: Default::default(),
+            answered_neighbors: Default::default(),
             peer_data: Default::default(),
             alive_disconnect_peers: Default::default(),
             left: Default::default(),
@@ -386,11 +402,13 @@ where
     /// does not refill the active view.
     fn handle_neighbor_request_expired(&mut self, peer: PI) {
         self.pending_neighbor_requests.remove(&peer);
+        self.answered_neighbors.shift_remove(&peer);
     }
 
     /// We received a disconnect message.
     fn on_disconnect(&mut self, peer: PI, details: Disconnect, io: &mut impl IO<PI>) {
         self.pending_neighbor_requests.remove(&peer);
+        self.answered_neighbors.shift_remove(&peer);
         let is_alive = details.alive && !details.left;
         if self.active_view.contains(&peer) {
             self.remove_active(&peer, RemovalReason::DisconnectReceived { is_alive }, io);
@@ -406,6 +424,7 @@ where
     /// A connection was closed by the peer.
     fn handle_connection_closed(&mut self, peer: PI, io: &mut impl IO<PI>) {
         self.pending_neighbor_requests.remove(&peer);
+        self.answered_neighbors.shift_remove(&peer);
         if self.active_view.contains(&peer) {
             self.remove_active(&peer, RemovalReason::ConnectionClosed, io);
         } else if !self.alive_disconnect_peers.remove(&peer) {
@@ -446,6 +465,7 @@ where
         self.passive_view.remove(&peer);
         self.alive_disconnect_peers.remove(&peer);
         self.pending_neighbor_requests.remove(&peer);
+        self.answered_neighbors.shift_remove(&peer);
         if !self.active_view.contains(&peer) {
             self.peer_data.remove(&peer);
         }
@@ -528,7 +548,16 @@ where
         // If the peer is already in our active view, we renew our neighbor relationship.
         if self.active_view.contains(&peer_id) {
             self.insert_peer_info(message.peer, io);
-            self.send_neighbor(peer_id, Priority::High, io);
+            // A renew is not tracked: the peer is already in the active view, so a pending entry
+            // for it would count the same peer twice in `handle_request_neighbors`. A peer that
+            // answered us before reads the renew as an answer, and nothing comes back.
+            io.push(OutEvent::SendMessage(
+                peer_id,
+                Message::Neighbor(Neighbor {
+                    priority: Priority::High,
+                    data: self.me_data.clone(),
+                }),
+            ));
         }
         // "i) If the time to live is equal to zero or if the number of nodes in p’s active view is equal to one,
         // it will add the new node to its active view (7)"
@@ -571,7 +600,11 @@ where
     }
 
     fn on_neighbor(&mut self, from: PI, details: Neighbor, io: &mut impl IO<PI>) {
-        let is_reply = self.pending_neighbor_requests.remove(&from);
+        // Both entries are spent by this message, so that a doubled `Neighbor` is read as an
+        // answer once and not answered, whichever of the two the first one found.
+        let was_asked = self.pending_neighbor_requests.remove(&from);
+        let was_answered = self.answered_neighbors.shift_remove(&from);
+        let is_reply = was_asked || was_answered;
         // This refuses a `High` priority request on purpose, against the HyParView paper: after a
         // leave, only a `Join` links the pair again. The refusal tells the far side to tombstone
         // us too, which ends a joint dial.
@@ -588,9 +621,24 @@ where
             self.send_disconnect(from, true, false, io);
         }
         // When `do_reply` is set, the Neighbor message that `add_active` just sent answers the
-        // request we received. Nobody answers an answer, so it must not wait in the pending set.
+        // request we received. It is not a request in flight, so it must not wait in the pending
+        // set; the answer is remembered in its own set, so that the next `Neighbor` from this peer
+        // is read as an answer (and not answered again).
         if do_reply {
             self.pending_neighbor_requests.remove(&from);
+            self.remember_answer(from);
+        }
+    }
+
+    /// Remember that we answered a `Neighbor` request of `peer` (see [`State::answered_neighbors`]).
+    fn remember_answer(&mut self, peer: PI) {
+        self.answered_neighbors.shift_remove(&peer);
+        self.answered_neighbors.insert(peer);
+        let capacity = (self.config.active_view_capacity + self.config.passive_view_capacity)
+            .max(ANSWERED_CAPACITY_MIN);
+        while self.answered_neighbors.len() > capacity {
+            // O(n) on an `IndexSet`, but n is at most `capacity` and this runs once per answer.
+            self.answered_neighbors.shift_remove_index(0);
         }
     }
 
@@ -1104,6 +1152,49 @@ mod tests {
         assert!(
             crossed <= 4,
             "the exchange did not stop: {crossed} Neighbor messages crossed"
+        );
+    }
+
+    // A renew (a ForwardJoin for a peer that is already in the active view) sends a Neighbor
+    // that no entry tracks, so the active peer is not counted a second time as a request in
+    // flight. A peer that answered us before reads the renew as an answer and sends nothing back.
+    #[test]
+    fn a_renew_of_an_active_peer_holds_no_pending_entry_and_gets_no_answer() {
+        let mut a = state(0);
+        let mut b = state(1);
+        let rendezvous = 2;
+        let mut io = Io::new();
+        let neighbor_to = |io: &Io, peer: u64| {
+            sent(io)
+                .into_iter()
+                .find(|(to, message)| *to == peer && matches!(message, Message::Neighbor(_)))
+                .map(|(_, message)| message)
+                .expect("a Neighbor message")
+        };
+
+        a.handle(InEvent::RequestNeighbors(vec![1]), &mut io);
+        let request = neighbor_to(&io, 1);
+        io.clear();
+        recv(&mut b, 0, request, &mut io);
+        let answer = neighbor_to(&io, 0);
+        io.clear();
+        recv(&mut a, 1, answer, &mut io);
+        io.clear();
+        assert!(a.active_view.contains(&1), "a holds b after the answer");
+        assert!(a.pending_neighbor_requests.is_empty());
+
+        recv(&mut a, rendezvous, forward_join(1, 0), &mut io);
+        let renew = neighbor_to(&io, 1);
+        io.clear();
+        assert!(
+            a.pending_neighbor_requests.is_empty(),
+            "a renew must not wait in the pending set"
+        );
+        recv(&mut b, 0, renew, &mut io);
+        assert!(
+            sent(&io).is_empty(),
+            "b answered the renew: {:?}",
+            sent(&io)
         );
     }
 
