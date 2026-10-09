@@ -1214,6 +1214,48 @@ mod tests {
         );
     }
 
+    // The entry that an answer left outlives the link it belongs to when our connection to the peer
+    // stays up with no Disconnect and no close, for example after the peer shed its side. Nothing
+    // else drops it then, and a genuine request of the peer would be read as an answer: it would
+    // get no Neighbor back, and the pair would be a half link.
+    #[test]
+    fn a_stale_answer_does_not_absorb_a_genuine_request_after_its_expiry() {
+        let mut a = state(0);
+        let mut io = Io::new();
+        let answered_to_one = |io: &Io| {
+            sent(io)
+                .iter()
+                .any(|(to, message)| *to == 1 && matches!(message, Message::Neighbor(_)))
+        };
+
+        recv(&mut a, 1, neighbor(Priority::High), &mut io);
+        assert!(answered_to_one(&io), "a answers the first request");
+        let expiries: Vec<_> = io
+            .iter()
+            .filter_map(|event| match event {
+                topic::OutEvent::ScheduleTimer(after, topic::Timer::Swarm(timer))
+                    if *after == NEIGHBOR_REQUEST_EXPIRY =>
+                {
+                    Some(timer.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(!expiries.is_empty(), "the answer schedules no expiry");
+        io.clear();
+
+        for timer in expiries {
+            a.handle(InEvent::TimerExpired(timer), &mut io);
+        }
+        io.clear();
+        recv(&mut a, 1, neighbor(Priority::High), &mut io);
+        assert!(
+            answered_to_one(&io),
+            "the genuine request after the expiry got no answer: {:?}",
+            sent(&io)
+        );
+    }
+
     // Three nodes are linked to each other, and a fourth one joins through the first. Its Join
     // starts a ForwardJoin walk, and the walk must end in a Neighbor request to the joiner from
     // a node that is not the one it joined through. No network: every message is delivered.
