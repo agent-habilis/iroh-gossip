@@ -68,6 +68,9 @@ pub enum Timer<PI> {
     PendingNeighborRequest(PI),
     /// A request made with [`InEvent::RequestNeighbors`] got no answer: forget that it is pending.
     NeighborRequestExpired(PI),
+    /// We answered a `Neighbor` request of the peer a while ago: forget that we did, so that its
+    /// next `Neighbor` is read as a request.
+    AnsweredNeighborExpired(PI),
 }
 
 /// How long a request made with [`InEvent::RequestNeighbors`] stays pending without an answer.
@@ -272,9 +275,14 @@ pub struct State<PI, RG = ThreadRng> {
     /// (we asked) or here (we answered). Without the second, a node that forgot its own answer reads
     /// a late or doubled `Neighbor` as a new request and answers it, and two such nodes answer each
     /// other for ever. The entry is spent by the next `Neighbor` from that peer and dropped with the
-    /// link, the request or the peer. It is a separate set so that an answered peer does not look like
-    /// a request in flight (`handle_request_neighbors` skips pending peers and counts them against
-    /// the free slots of the active view).
+    /// link, the request or the peer, or after [`NEIGHBOR_REQUEST_EXPIRY`]: the entry outlives the
+    /// link it belongs to when our connection to the peer stays up with no `Disconnect` and no
+    /// close, for example after the peer shed its side, and a genuine request of the peer would
+    /// then read as an answer. Each answer schedules its own expiry and does not carry a
+    /// generation, so a second answer to the same peer inside the period can be dropped by the
+    /// first timer. It is a separate set so that an answered peer does not look like a request in
+    /// flight (`handle_request_neighbors` skips pending peers and counts them against the free
+    /// slots of the active view).
     answered_neighbors: indexmap::IndexSet<PI>,
     /// The opaque user peer data we received for other peers
     peer_data: HashMap<PI, PeerData>,
@@ -317,6 +325,9 @@ where
                 Timer::DoShuffle => self.handle_shuffle_timer(io),
                 Timer::PendingNeighborRequest(peer) => self.handle_pending_neighbor_timer(peer, io),
                 Timer::NeighborRequestExpired(peer) => self.handle_neighbor_request_expired(peer),
+                Timer::AnsweredNeighborExpired(peer) => {
+                    self.answered_neighbors.shift_remove(&peer);
+                }
             },
             InEvent::PeerDisconnected(peer) => self.handle_connection_closed(peer, io),
             InEvent::RequestJoin(peer) => self.handle_join(peer, io),
@@ -642,14 +653,22 @@ where
         // is read as an answer (and not answered again).
         if do_reply {
             self.pending_neighbor_requests.remove(&from);
-            self.remember_answer(from);
+            self.remember_answer(from, io);
         }
     }
 
     /// Remember that we answered a `Neighbor` request of `peer` (see [`State::answered_neighbors`]).
-    fn remember_answer(&mut self, peer: PI) {
+    fn remember_answer(&mut self, peer: PI, io: &mut impl IO<PI>) {
         self.answered_neighbors.shift_remove(&peer);
         self.answered_neighbors.insert(peer);
+        // The entry lives as long as a request. It outlives the link it belongs to when our
+        // connection to the peer stays up with no `Disconnect` and no close (for example after the
+        // peer shed its side); nothing else drops it then, and a genuine request of the peer would
+        // read as an answer.
+        io.push(OutEvent::ScheduleTimer(
+            NEIGHBOR_REQUEST_EXPIRY,
+            Timer::AnsweredNeighborExpired(peer),
+        ));
         let capacity = (self.config.active_view_capacity + self.config.passive_view_capacity)
             .max(ANSWERED_CAPACITY_MIN);
         while self.answered_neighbors.len() > capacity {
