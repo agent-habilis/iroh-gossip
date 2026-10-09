@@ -1198,6 +1198,54 @@ mod tests {
         );
     }
 
+    // Three nodes are linked to each other, and a fourth one joins through the first. Its Join
+    // starts a ForwardJoin walk, and the walk must end in a Neighbor request to the joiner from
+    // a node that is not the one it joined through. No network: every message is delivered.
+    #[test]
+    fn a_joiner_gets_a_link_to_a_peer_that_it_did_not_join_through() {
+        let (rendezvous, creator, a, joiner) = (0u64, 1u64, 2u64, 3u64);
+        let mut nodes = vec![
+            with_active(rendezvous, &[creator, a]),
+            with_active(creator, &[rendezvous, a]),
+            with_active(a, &[rendezvous, creator]),
+            state(joiner),
+        ];
+        let mut io = Io::new();
+        let mut queue: VecDeque<(u64, u64, Message<u64>)> = VecDeque::new();
+
+        nodes[joiner as usize].handle(InEvent::RequestJoin(rendezvous), &mut io);
+        queue.extend(
+            sent(&io)
+                .into_iter()
+                .map(|(to, message)| (joiner, to, message)),
+        );
+        io.clear();
+        for _ in 0..200 {
+            let Some((from, to, message)) = queue.pop_front() else {
+                break;
+            };
+            recv(&mut nodes[to as usize], from, message, &mut io);
+            queue.extend(
+                sent(&io)
+                    .into_iter()
+                    .map(|(next, message)| (to, next, message)),
+            );
+            io.clear();
+        }
+
+        assert!(
+            queue.is_empty(),
+            "the exchange did not end: {} messages left",
+            queue.len()
+        );
+        let joiner_view = &nodes[joiner as usize].active_view;
+        assert!(
+            joiner_view.contains(&creator) || joiner_view.contains(&a),
+            "the joiner is linked to {:?} only",
+            joiner_view.iter().collect::<Vec<_>>()
+        );
+    }
+
     fn low_neighbor_requests(io: &Io) -> Vec<u64> {
         sent(io)
             .into_iter()
