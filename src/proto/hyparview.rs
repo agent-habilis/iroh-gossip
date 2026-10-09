@@ -1204,7 +1204,7 @@ mod tests {
     #[test]
     fn a_joiner_gets_a_link_to_a_peer_that_it_did_not_join_through() {
         let (rendezvous, creator, a, joiner) = (0u64, 1u64, 2u64, 3u64);
-        let mut nodes = vec![
+        let mut nodes = [
             with_active(rendezvous, &[creator, a]),
             with_active(creator, &[rendezvous, a]),
             with_active(a, &[rendezvous, creator]),
@@ -1237,22 +1237,27 @@ mod tests {
             io.clear();
         }
 
-        assert!(
-            queue.is_empty(),
-            "the exchange did not end: {} messages left",
-            queue.len()
-        );
-        // The Join handshake costs 2 Neighbor messages, and each renew at most 2 more: the contact
-        // node renews at ttl 4 and at ttl 1 on each of the two walks.
-        assert!(
-            joiner_neighbors <= 10,
-            "{joiner_neighbors} Neighbor messages named the joiner"
-        );
         let joiner_view = &nodes[joiner as usize].active_view;
         assert!(
             joiner_view.contains(&creator) || joiner_view.contains(&a),
             "the joiner is linked to {:?} only, after {joiner_neighbors} Neighbor messages",
             joiner_view.iter().collect::<Vec<_>>()
+        );
+        assert!(
+            queue.is_empty(),
+            "the exchange did not end: {} messages left",
+            queue.len()
+        );
+        // A guard against a storm. The bound is the handshake (2) + the 4 renews of the contact node
+        // that the joiner answers (4 x 2) + the 2 ends of the walks (2 x 2) = 14. The run has 13:
+        // the handshake 2 (request, answer); 4 renews, of which 2 are absorbed by an entry of
+        // answered_neighbors and 2 are answered (the answers are 2 more); the contact node answers
+        // one of those answers (it holds nothing, because a renew is untracked on its sender);
+        // the 2 walk ends send a Neighbor request to the joiner and get its answer (4).
+        // 2 + 4 + 2 + 1 + 4 = 13.
+        assert!(
+            joiner_neighbors <= 14,
+            "{joiner_neighbors} Neighbor messages named the joiner"
         );
     }
 
