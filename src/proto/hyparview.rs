@@ -547,7 +547,7 @@ where
         }
         // If the peer is already in our active view, we renew our neighbor relationship.
         if self.active_view.contains(&peer_id) {
-            self.insert_peer_info(message.peer, io);
+            self.insert_peer_info(message.peer.clone(), io);
             // A renew is not tracked: the peer is already in the active view, so a pending entry
             // for it would count the same peer twice in `handle_request_neighbors`. A peer that
             // answered us before reads the renew as an answer, and nothing comes back.
@@ -558,6 +558,22 @@ where
                     data: self.me_data.clone(),
                 }),
             ));
+            // The walk goes on while its ttl lasts. The contact node of a Join holds the joiner
+            // already, so a walk that stopped here would stop at the contact node as soon as the
+            // other nodes are linked to each other, and the joiner would get no link to a real
+            // peer. The joiner is never the next hop.
+            if !message.ttl.expired() {
+                if let Some(next) = self
+                    .active_view
+                    .pick_random_without(&[&sender, &peer_id], &mut self.rng)
+                {
+                    let message = Message::ForwardJoin(ForwardJoin {
+                        peer: message.peer,
+                        ttl: message.ttl.next(),
+                    });
+                    io.push(OutEvent::SendMessage(*next, message));
+                }
+            }
         }
         // "i) If the time to live is equal to zero or if the number of nodes in p’s active view is equal to one,
         // it will add the new node to its active view (7)"
