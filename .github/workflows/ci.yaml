@@ -159,6 +159,8 @@ jobs:
   
         - name: Install stable toolchain
           uses: dtolnay/rust-toolchain@stable
+          with:
+            components: clippy
   
         - name: Add wasm target
           run: rustup target add wasm32-unknown-unknown
@@ -168,6 +170,10 @@ jobs:
   
         - name: wasm32 build
           run: cargo build --target wasm32-unknown-unknown
+
+        # The Tokio timers and spawns panic in a browser. clippy.toml lists them.
+        - name: wasm32 clippy (no Tokio calls that panic in a browser)
+          run: cargo clippy --target wasm32-unknown-unknown --lib -- -D clippy::disallowed_methods
   
         # If the Wasm file contains any 'import "env"' declarations, then
         # some non-Wasm-compatible code made it into the final code.

@@ -30,6 +30,9 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(iroh_docsrs)"] }
 
 [lints.clippy]
 unused-async = "warn"
+# `clippy.toml` lists the Tokio calls that panic in a browser. On a native target `n0_future`
+# re-exports them, so the wasm32 clippy row turns it on with `-D clippy::disallowed_methods`.
+disallowed_methods = "allow"
 
 [dependencies]
 blake3 = "1.8"
