@@ -1248,15 +1248,21 @@ mod tests {
             "the exchange did not end: {} messages left",
             queue.len()
         );
-        // A guard against a storm. The bound is the handshake (2) + the 4 renews of the contact node
-        // that the joiner answers (4 x 2) + the 2 ends of the walks (2 x 2) = 14. The run has 13:
-        // the handshake 2 (request, answer); 4 renews, of which 2 are absorbed by an entry of
-        // answered_neighbors and 2 are answered (the answers are 2 more); the contact node answers
-        // one of those answers (it holds nothing, because a renew is untracked on its sender);
-        // the 2 walk ends send a Neighbor request to the joiner and get its answer (4).
-        // 2 + 4 + 2 + 1 + 4 = 13.
-        assert!(
-            joiner_neighbors <= 14,
+        // A guard against a storm, and a count that is exact on purpose. The exchange has 13 Neighbor
+        // messages that name the joiner, in this order (the walk is forced in a clique of three):
+        //  1-2   the handshake: the request of the contact node and the answer of the joiner;
+        //  3-4   two renews of the contact node (ttl 4): #3 is absorbed by the answered_neighbors
+        //        entry that #2 left, #4 is answered by the joiner (5);
+        //  5-6   the joiner's answer and the answer of the contact node to that answer (6);
+        //  7-8   two renews (ttl 1): #7 is answered by the joiner (9), #8 is absorbed;
+        //  9     the joiner's answer to #7, absorbed by the entry that #6 left at the contact node;
+        //  10-11 the Neighbor requests of the two walk ends (ttl 0) to the joiner;
+        //  12-13 the answers of the joiner.
+        // #6 is the price of the untracked renew of 709b650: a renew is not in the pending set of
+        // its sender, so the answer to it reads as a request. A change of that cost shows here as
+        // 12 or 14, and the table must be updated with it.
+        assert_eq!(
+            joiner_neighbors, 13,
             "{joiner_neighbors} Neighbor messages named the joiner"
         );
     }
