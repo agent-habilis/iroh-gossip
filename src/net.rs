@@ -1137,7 +1137,9 @@ async fn connection_loop(
         send_res = send_fut => {
             send_res?;
             if drains(true, observed.close_reason().is_some()) {
-                let _ = tokio::time::timeout(DRAIN, &mut recv_fut).await;
+                // Not `tokio::time::timeout`: in a browser there is no tokio timer and the call
+                // panics. The timeout of `n0_future` runs on both targets.
+                let _ = n0_future::time::timeout(DRAIN, &mut recv_fut).await;
             }
         }
         recv_res = &mut recv_fut => recv_res?,
