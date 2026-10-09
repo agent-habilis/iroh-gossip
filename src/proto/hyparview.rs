@@ -1220,10 +1220,14 @@ mod tests {
                 .map(|(to, message)| (joiner, to, message)),
         );
         io.clear();
+        let mut joiner_neighbors = 0;
         for _ in 0..200 {
             let Some((from, to, message)) = queue.pop_front() else {
                 break;
             };
+            if matches!(message, Message::Neighbor(_)) && (from == joiner || to == joiner) {
+                joiner_neighbors += 1;
+            }
             recv(&mut nodes[to as usize], from, message, &mut io);
             queue.extend(
                 sent(&io)
@@ -1238,10 +1242,16 @@ mod tests {
             "the exchange did not end: {} messages left",
             queue.len()
         );
+        // The Join handshake costs 2 Neighbor messages, and each renew at most 2 more: the contact
+        // node renews at ttl 4 and at ttl 1 on each of the two walks.
+        assert!(
+            joiner_neighbors <= 10,
+            "{joiner_neighbors} Neighbor messages named the joiner"
+        );
         let joiner_view = &nodes[joiner as usize].active_view;
         assert!(
             joiner_view.contains(&creator) || joiner_view.contains(&a),
-            "the joiner is linked to {:?} only",
+            "the joiner is linked to {:?} only, after {joiner_neighbors} Neighbor messages",
             joiner_view.iter().collect::<Vec<_>>()
         );
     }
