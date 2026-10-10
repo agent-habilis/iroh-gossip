@@ -4,7 +4,7 @@ use std::{
     collections::{hash_map::Entry, BTreeSet, HashMap, HashSet, VecDeque},
     net::SocketAddr,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex},
     task::{Context, Poll},
 };
 
@@ -548,6 +548,7 @@ impl Actor {
         let conn_id = conn.stable_id();
 
         let local_id = self.endpoint.id();
+        let rx_clock = RxClock::new();
         let queue = match self.peers.entry(peer_id) {
             Entry::Occupied(mut entry) => {
                 if entry.get().loses_crossing(local_id, peer_id, &conn) {
@@ -560,7 +561,9 @@ impl Actor {
                     drop(send_tx);
                     Vec::new()
                 } else {
-                    entry.get_mut().accept_conn(send_tx, conn.clone())
+                    entry
+                        .get_mut()
+                        .accept_conn(send_tx, conn.clone(), rx_clock.clone())
                 }
             }
             Entry::Vacant(entry) => {
@@ -570,7 +573,7 @@ impl Actor {
                     other_conns: Vec::new(),
                     active_conn: Some(conn.clone()),
                     refused_since: None,
-                    active_since: Instant::now(),
+                    active_rx: rx_clock.clone(),
                 });
                 Vec::new()
             }
@@ -582,16 +585,19 @@ impl Actor {
         // Spawn a task for this connection
         self.connection_tasks.spawn(
             async move {
-                let res = connection_loop(
-                    peer_id,
-                    conn.clone(),
-                    origin,
-                    send_rx,
-                    in_event_tx,
-                    max_message_size,
-                    queue,
-                )
-                .await;
+                // The sampler never ends, so it stops when the loop does.
+                let res = tokio::select! {
+                    res = connection_loop(
+                        peer_id,
+                        conn.clone(),
+                        origin,
+                        send_rx,
+                        in_event_tx,
+                        max_message_size,
+                        queue,
+                    ) => res,
+                    never = sample_rx(conn.clone(), rx_clock) => match never {},
+                };
                 (peer_id, conn, res)
             }
             .instrument(error_span!("conn", peer = %peer_id.fmt_short())),
@@ -901,21 +907,63 @@ enum PeerState {
         active_conn: Option<Connection>,
         /// Since when the send queue refuses messages, with none accepted in between.
         refused_since: Option<Instant>,
-        /// When the active connection became active.
-        active_since: Instant,
+        /// When the active connection last received a datagram, as far as its task sampled.
+        active_rx: RxClock,
     },
 }
 
-/// How long after a connection became active a second one can still be the other half of a
-/// crossing. Two dials that cross complete within a round trip of each other; an active
-/// connection that is older is no crossing, it is a re-dial after a break that this side has not
-/// seen yet (the peer restarted). Applying the rule there would turn the dials of the restarted
-/// peer away until the keep-alive drops the dead connection.
+/// How long the active connection can receive nothing and still be taken as alive, when a second
+/// connection arrives. An alive active connection means the second one is the other half of a
+/// crossing: the peer dialed at the same time, and a gate on either side can hold a dial for
+/// longer than any fixed time since the connection became active. An active connection that
+/// received nothing for this long is dead: it is a re-dial after a break that this side has not
+/// seen yet (the peer restarted), and the rule must keep the new connection.
 ///
-/// The window bounds that case, it does not remove it: a peer that restarts and dials again within
-/// this time of a connection becoming active is still read as a crossing, and its dial is only
+/// The value is two keep-alive intervals of iroh (5 s each): a live path of an idle connection
+/// receives one ping per interval, so a live connection always changes its count within it. The
+/// bound cannot be read from iroh, which keeps its interval private (`HEARTBEAT_INTERVAL` in
+/// `iroh/src/socket.rs`): read that constant again when iroh moves.
+///
+/// The bound limits the restart case, it does not remove it: a peer that restarts and dials again
+/// less than this time after its last datagram is still read as a crossing, and its dial is only
 /// read, not kept, until the dead connection is dropped.
-const CROSSING_WINDOW: Duration = Duration::from_secs(5);
+const LIVENESS_BOUND: Duration = Duration::from_secs(10);
+
+/// How often the task of a connection reads the count of datagrams it received.
+const RX_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// When the count of datagrams that a connection received last changed. The task of the connection
+/// writes it, and the actor reads it when a second connection arrives.
+#[derive(Debug, Clone)]
+struct RxClock(Arc<Mutex<Instant>>);
+
+impl RxClock {
+    /// A new connection just completed its handshake, so it counts as alive now.
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new(Instant::now())))
+    }
+
+    fn touch(&self) {
+        *self.0.lock().expect("lock is not poisoned") = Instant::now();
+    }
+
+    fn age(&self) -> Duration {
+        self.0.lock().expect("lock is not poisoned").elapsed()
+    }
+}
+
+/// Reads the datagram count of `conn` every [`RX_SAMPLE_INTERVAL`] and notes each change in `clock`.
+async fn sample_rx(conn: Connection, clock: RxClock) -> std::convert::Infallible {
+    let mut seen = conn.stats().udp_rx.datagrams;
+    loop {
+        n0_future::time::sleep(RX_SAMPLE_INTERVAL).await;
+        let now = conn.stats().udp_rx.datagrams;
+        if now != seen {
+            seen = now;
+            clock.touch();
+        }
+    }
+}
 
 /// How long a connection whose send queue closed cleanly keeps reading before it is closed: what
 /// the peer sent on it before it learned that the connection was replaced still reaches us.
@@ -935,13 +983,15 @@ fn drains(send_ended_cleanly: bool, conn_closed: bool) -> bool {
 }
 
 /// Whether a new connection loses against the active one: they cross, and the lower id dialed the
-/// active one.
+/// active one. The answer depends on facts that both sides of a pair share (who dialed which
+/// connection) and on whether the active connection is alive, which does not depend on when the
+/// gate of this side let the new connection through.
 fn crossing_loser(
     active_dialed_by_lower: bool,
     new_dialed_by_lower: bool,
-    active_age: Duration,
+    active_rx_age: Duration,
 ) -> bool {
-    active_age < CROSSING_WINDOW && active_dialed_by_lower && !new_dialed_by_lower
+    active_rx_age < LIVENESS_BOUND && active_dialed_by_lower && !new_dialed_by_lower
 }
 
 /// Whether the endpoint with the lower id dialed a connection: `local_dialed` says whether this
@@ -959,11 +1009,11 @@ impl PeerState {
     /// closes, and the peer would be lost on both sides. The connection that the lower endpoint
     /// id dialed wins, on both sides. A first connection is always kept, and so is a second
     /// one of the same kind (a re-dial after a connection that broke), and so is any new
-    /// connection when the active one is older than [`CROSSING_WINDOW`].
+    /// connection when the active one received nothing for [`LIVENESS_BOUND`].
     fn loses_crossing(&self, local: EndpointId, peer: EndpointId, new: &Connection) -> bool {
         let PeerState::Active {
             active_conn: Some(active),
-            active_since,
+            active_rx,
             ..
         } = self
         else {
@@ -972,7 +1022,7 @@ impl PeerState {
         crossing_loser(
             dialed_by_lower_id(local, peer, active.side().is_client()),
             dialed_by_lower_id(local, peer, new.side().is_client()),
-            active_since.elapsed(),
+            active_rx.age(),
         )
     }
 
@@ -987,6 +1037,7 @@ impl PeerState {
         &mut self,
         send_tx: mpsc::Sender<ProtoMessage>,
         conn: Connection,
+        rx_clock: RxClock,
     ) -> Vec<ProtoMessage> {
         let conn_id = conn.stable_id();
         match self {
@@ -998,7 +1049,7 @@ impl PeerState {
                     other_conns: Vec::new(),
                     active_conn: Some(conn),
                     refused_since: None,
-                    active_since: Instant::now(),
+                    active_rx: rx_clock,
                 };
                 queue
             }
@@ -1008,7 +1059,7 @@ impl PeerState {
                 other_conns,
                 active_conn,
                 refused_since,
-                active_since,
+                active_rx,
             } => {
                 // We already have an active connection, and `loses_crossing` did not close the
                 // new one. We keep the old connection intact, but only use the new connection for
@@ -1025,7 +1076,7 @@ impl PeerState {
                 *active_conn_id = conn_id;
                 *active_conn = Some(conn);
                 *refused_since = None;
-                *active_since = Instant::now();
+                *active_rx = rx_clock;
                 Vec::new()
             }
         }
@@ -2607,7 +2658,7 @@ pub(crate) mod tests {
                         other_conns: Vec::new(),
                         active_conn: None,
                         refused_since: None,
-                        active_since: Instant::now(),
+                        active_rx: RxClock::new(),
                     },
                 );
                 peers.push(FakePeer { id, tx, rx });
@@ -2874,16 +2925,25 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_new_connection_loses_only_to_a_young_active_one_that_the_lower_id_dialed() {
+    fn a_new_connection_loses_only_to_a_live_active_one_that_the_lower_id_dialed() {
         let young = Duration::from_millis(200);
         assert!(crossing_loser(true, false, young));
         // The new one was dialed by the lower id, or both were: no loser.
         assert!(!crossing_loser(true, true, young));
         assert!(!crossing_loser(false, false, young));
         assert!(!crossing_loser(false, true, young));
-        // An active connection as old as the window, or older, is no crossing: the peer
-        // restarted, and its new dial must be kept.
-        assert!(!crossing_loser(true, false, CROSSING_WINDOW));
+        // An active connection that received nothing for the bound, or longer, is no crossing: the
+        // peer restarted, and its new dial must be kept.
+        assert!(!crossing_loser(true, false, LIVENESS_BOUND));
+        assert!(!crossing_loser(true, false, Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn the_rule_reads_the_life_of_the_active_connection_not_its_age() {
+        // The active connection received a datagram 8 s ago: the peer is there, and a new
+        // connection from it is the other half of a crossing, however late the gate let it through.
+        assert!(crossing_loser(true, false, Duration::from_secs(8)));
+        // It received nothing for a minute: the peer restarted, and its new dial is kept.
         assert!(!crossing_loser(true, false, Duration::from_secs(60)));
     }
 
@@ -3018,6 +3078,257 @@ pub(crate) mod tests {
                 "round {round}: (neighbor_up, neighbor_down) of both peers"
             );
         }
+    }
+
+    /// Like `endpoint_loop`, but a connection is handed to gossip only after `hold`, as the accept
+    /// gate of a transport does while it waits for a direct path.
+    async fn gated_endpoint_loop(
+        endpoint: Endpoint,
+        gossip: Gossip,
+        hold: Duration,
+        cancel: CancellationToken,
+    ) {
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break,
+                incoming = endpoint.accept() => {
+                    let Some(incoming) = incoming else { break };
+                    let Ok(connecting) = incoming.accept() else { continue };
+                    let Ok(connection) = connecting.await else { continue };
+                    let gossip = gossip.clone();
+                    task::spawn(async move {
+                        tokio::time::sleep(hold).await;
+                        let _ = gossip.handle_connection(connection).await;
+                    });
+                }
+            }
+        }
+    }
+
+    /// Two peers dial each other at once, and the accept gate of each holds the dial of the other
+    /// for the given time. Returns the `(neighbor_up, neighbor_down)` counts of both peers after
+    /// the link settled.
+    async fn held_crossing_round(
+        hold1: Duration,
+        hold2: Duration,
+        tag: &str,
+    ) -> ((u64, u64), (u64, u64)) {
+        let mut rng = rand::rngs::ChaCha12Rng::seed_from_u64(11);
+        let (relay_map, relay_url, _guard) = iroh::test_utils::run_relay_server().await.unwrap();
+        let memory_lookup = MemoryLookup::new();
+        let ep1 = create_endpoint(&mut rng, relay_map.clone(), Some(memory_lookup.clone()))
+            .await
+            .unwrap();
+        let ep2 = create_endpoint(&mut rng, relay_map, Some(memory_lookup.clone()))
+            .await
+            .unwrap();
+        let go1 = Gossip::builder().spawn(ep1.clone());
+        let go2 = Gossip::builder().spawn(ep2.clone());
+        let cancel = CancellationToken::new();
+        let tasks = [
+            spawn(gated_endpoint_loop(
+                ep1.clone(),
+                go1.clone(),
+                hold1,
+                cancel.clone(),
+            )),
+            spawn(gated_endpoint_loop(
+                ep2.clone(),
+                go2.clone(),
+                hold2,
+                cancel.clone(),
+            )),
+        ];
+        memory_lookup
+            .add_endpoint_info(EndpointAddr::new(ep1.id()).with_relay_url(relay_url.clone()));
+        memory_lookup.add_endpoint_info(EndpointAddr::new(ep2.id()).with_relay_url(relay_url));
+        let topic: TopicId = blake3::hash(tag.as_bytes()).into();
+
+        let _topics = [
+            go1.subscribe(topic, vec![ep2.id()]),
+            go2.subscribe(topic, vec![ep1.id()]),
+        ]
+        .try_join()
+        .await
+        .unwrap();
+
+        // Both gates let the dials through, then the losing connection is read for `DRAIN` and
+        // closed. A link that was kept stays up; one that both sides lost goes down.
+        tokio::time::sleep(hold1.max(hold2) + DRAIN + Duration::from_secs(3)).await;
+        let counts = (
+            (
+                go1.metrics().neighbor_up.get(),
+                go1.metrics().neighbor_down.get(),
+            ),
+            (
+                go2.metrics().neighbor_up.get(),
+                go2.metrics().neighbor_down.get(),
+            ),
+        );
+        cancel.cancel();
+        for task in tasks {
+            task.await.unwrap();
+        }
+        counts
+    }
+
+    /// The gates of both sides hold the dial of the other for longer than any fixed time since a
+    /// connection became active. Each side then reads the dial of the other late. Both must still
+    /// keep the same connection.
+    #[tokio::test]
+    #[traced_test]
+    async fn two_peers_whose_gates_hold_the_dials_equally_long_keep_one_connection() {
+        let hold = Duration::from_secs(7);
+        let counts = held_crossing_round(hold, hold, "held equally").await;
+        assert_eq!(
+            counts,
+            ((1, 0), (1, 0)),
+            "(neighbor_up, neighbor_down) of both peers"
+        );
+    }
+
+    /// The same, when one gate holds its dial a little longer than the other.
+    #[tokio::test]
+    #[traced_test]
+    async fn two_peers_whose_gates_hold_the_dials_unequally_long_keep_one_connection() {
+        let counts = held_crossing_round(
+            Duration::from_secs(6),
+            Duration::from_secs(8),
+            "held unequally",
+        )
+        .await;
+        assert_eq!(
+            counts,
+            ((1, 0), (1, 0)),
+            "(neighbor_up, neighbor_down) of both peers"
+        );
+    }
+
+    /// The same, with holds longer than the liveness bound. The active connection is then alive
+    /// only if its task saw datagrams in the last bound, which an idle held connection gets from
+    /// the keep-alive pings of the peer. This is the shape of the field, where nothing bounds a
+    /// hold.
+    #[tokio::test]
+    #[traced_test]
+    async fn two_peers_whose_gates_hold_the_dials_longer_than_the_bound_keep_one_connection() {
+        let hold = Duration::from_secs(12);
+        let counts = held_crossing_round(hold, hold, "held beyond the bound").await;
+        assert_eq!(
+            counts,
+            ((1, 0), (1, 0)),
+            "(neighbor_up, neighbor_down) of both peers"
+        );
+    }
+
+    /// The same, with unequal holds that are both longer than the liveness bound.
+    #[tokio::test]
+    #[traced_test]
+    async fn two_peers_whose_gates_hold_the_dials_unequally_beyond_the_bound_keep_one_connection() {
+        let counts = held_crossing_round(
+            Duration::from_secs(11),
+            Duration::from_secs(14),
+            "held unequally beyond the bound",
+        )
+        .await;
+        assert_eq!(
+            counts,
+            ((1, 0), (1, 0)),
+            "(neighbor_up, neighbor_down) of both peers"
+        );
+    }
+
+    /// A peer dies with no close and starts again with the same id. The old connection received
+    /// nothing for longer than the liveness bound, so it is no half of a crossing: the dial of the
+    /// restarted peer must be kept at once. A rule that always read a live-looking connection as a
+    /// crossing would only read this dial and turn the peer away until the old connection times out.
+    #[tokio::test]
+    #[traced_test]
+    async fn a_peer_that_restarts_after_its_old_connection_went_silent_is_kept() {
+        let (relay_map, relay_url, _guard) = iroh::test_utils::run_relay_server().await.unwrap();
+        let memory_lookup = MemoryLookup::new();
+        let ep_a = create_endpoint(
+            &mut rand::rngs::ChaCha12Rng::seed_from_u64(31),
+            relay_map.clone(),
+            Some(memory_lookup.clone()),
+        )
+        .await
+        .unwrap();
+        let id_a = ep_a.id();
+        let go_a = Gossip::builder().spawn(ep_a.clone());
+        let cancel = CancellationToken::new();
+        let task_a = spawn(endpoint_loop(ep_a.clone(), go_a.clone(), cancel.clone()));
+        memory_lookup.add_endpoint_info(EndpointAddr::new(id_a).with_relay_url(relay_url));
+        let topic: TopicId = blake3::hash(b"restart after silence").into();
+        let _topic_a = go_a.subscribe(topic, vec![]).await.unwrap();
+
+        // The peer lives in a runtime of its own, which is dropped without a close: its tasks end
+        // and its socket goes away, and nothing tells `a` that the connection is over.
+        // `block_on` is not allowed on a thread of the test runtime, so it runs on a blocking one.
+        let (relay_map_b, lookup_b) = (relay_map.clone(), memory_lookup.clone());
+        let (runtime_b, topic_b) = tokio::task::spawn_blocking(move || {
+            let runtime_b = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            let topic_b = runtime_b.block_on(async {
+                let ep_b = create_endpoint(
+                    &mut rand::rngs::ChaCha12Rng::seed_from_u64(32),
+                    relay_map_b,
+                    Some(lookup_b),
+                )
+                .await
+                .unwrap();
+                let go_b = Gossip::builder().spawn(ep_b.clone());
+                spawn(endpoint_loop(ep_b, go_b.clone(), CancellationToken::new()));
+                go_b.subscribe(topic, vec![id_a]).await.unwrap()
+            });
+            (runtime_b, topic_b)
+        })
+        .await
+        .unwrap();
+        timeout(Duration::from_secs(10), async {
+            while go_a.metrics().neighbor_up.get() == 0 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the peer links before it dies");
+        runtime_b.shutdown_background();
+        drop(topic_b);
+
+        // Longer than the liveness bound (10 s), shorter than the idle timeout of a path (15 s,
+        // `PATH_MAX_IDLE_TIMEOUT` in iroh) and of the connection (30 s). The margin to 15 s is
+        // 3 s, so a loaded host can make this test flake; the rule is not at fault then.
+        tokio::time::sleep(Duration::from_secs(12)).await;
+        assert_eq!(
+            go_a.metrics().neighbor_down.get(),
+            0,
+            "the old connection must still be open on `a`, or the test does not test a silent one"
+        );
+
+        let ep_b2 = create_endpoint(
+            &mut rand::rngs::ChaCha12Rng::seed_from_u64(32),
+            relay_map,
+            Some(memory_lookup.clone()),
+        )
+        .await
+        .unwrap();
+        let go_b2 = Gossip::builder().spawn(ep_b2.clone());
+        let task_b2 = spawn(endpoint_loop(ep_b2, go_b2.clone(), cancel.clone()));
+        let _topic_b2 = go_b2.subscribe(topic, vec![id_a]).await.unwrap();
+        timeout(Duration::from_secs(8), async {
+            while go_b2.metrics().neighbor_up.get() == 0 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the restarted peer links at once");
+
+        cancel.cancel();
+        task_a.await.unwrap().unwrap();
+        task_b2.await.unwrap().unwrap();
     }
 
     /// The same, when both peers ask the other for a link with `neighbor_peers`.
