@@ -521,6 +521,13 @@ where
         // of the peer ran it. A joiner that waits for a slow link sends its `Join` again and
         // again, and every copy would start the walk again. A peer whose connection was lost is
         // not active any more (`PeerDisconnected`), so its next `Join` is a first one.
+        //
+        // Known cost: a peer that restarts, or dials again, while we still hold its old
+        // connection is still active here, and its `Join` is answered and starts no walk. The old
+        // connection ends at the idle timeout of QUIC, and then the next `Join` runs the walk.
+        // The protocol cannot tell a copy of a `Join` from the first `Join` of a restarted peer;
+        // the network layer could, but telling the protocol on a re-dial broke a live link
+        // when two sides raced a connection at once (see the revert of that change).
         if already_active {
             return;
         }

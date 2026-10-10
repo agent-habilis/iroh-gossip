@@ -412,7 +412,7 @@ impl Actor {
                         return false;
                     },
                     Some(LocalActorMessage::HandleConnection(conn)) => {
-                        self.handle_connection(conn.remote_id(), ConnOrigin::Accept, conn).await;
+                        self.handle_connection(conn.remote_id(), ConnOrigin::Accept, conn);
                     }
                     None => {
                         debug!("all gossip handles dropped, stop gossip actor");
@@ -449,7 +449,7 @@ impl Actor {
                     Some(Ok(conn)) => {
                         debug!(peer = %peer_id.fmt_short(), "dial successful");
                         self.metrics.actor_tick_dialer_success.inc();
-                        self.handle_connection(peer_id, ConnOrigin::Dial, conn).await;
+                        self.handle_connection(peer_id, ConnOrigin::Dial, conn);
                     }
                     Some(Err(err)) => {
                         warn!(peer = %peer_id.fmt_short(), "dial failed: {err}");
@@ -543,37 +543,11 @@ impl Actor {
         }
     }
 
-    async fn handle_connection(
-        &mut self,
-        peer_id: EndpointId,
-        origin: ConnOrigin,
-        conn: Connection,
-    ) {
+    fn handle_connection(&mut self, peer_id: EndpointId, origin: ConnOrigin, conn: Connection) {
         let (send_tx, send_rx) = mpsc::channel(SEND_QUEUE_CAP);
         let conn_id = conn.stable_id();
 
         let local_id = self.endpoint.id();
-        // A new connection of a peer that we hold already replaces the old one (a re-dial: the
-        // peer restarted, or it lost the link on its side). The old connection closes later
-        // without a word to the protocol, because only the close of the active connection is
-        // told. So the protocol is told now, before it reads the first message of the new
-        // connection: the peer is not active any more, and its `Join` is a first one. A crossing,
-        // won or lost, is no re-dial: both sides hold the link, and it is decided below.
-        //
-        // The order matters. The protocol answers this event with `OutEvent::DisconnectPeer`, and
-        // that removes the entry of the peer in `self.peers` with its senders. So the event must
-        // come before the entry of the new connection is made: the match below then finds no
-        // entry and builds a fresh one. After it, the event would drop the senders of the new
-        // connection.
-        let replaces_active = self
-            .peers
-            .get(&peer_id)
-            .is_some_and(|state| state.replaced_by(local_id, peer_id, &conn));
-        if replaces_active {
-            debug!(peer = %peer_id.fmt_short(), "the peer dialed again: the old link is gone for the protocol");
-            self.handle_in_event(InEvent::PeerDisconnected(peer_id), Instant::now())
-                .await;
-        }
         let queue = match self.peers.entry(peer_id) {
             Entry::Occupied(mut entry) => {
                 if entry.get().loses_crossing(local_id, peer_id, &conn) {
@@ -960,16 +934,6 @@ fn drains(send_ended_cleanly: bool, conn_closed: bool) -> bool {
     send_ended_cleanly && !conn_closed
 }
 
-/// Whether a new connection crosses the active one: both sides dialed at once, so the two were
-/// dialed by different sides, and the active one is younger than [`CROSSING_WINDOW`].
-fn is_crossing(
-    active_dialed_by_lower: bool,
-    new_dialed_by_lower: bool,
-    active_age: Duration,
-) -> bool {
-    active_age < CROSSING_WINDOW && active_dialed_by_lower != new_dialed_by_lower
-}
-
 /// Whether a new connection loses against the active one: they cross, and the lower id dialed the
 /// active one.
 fn crossing_loser(
@@ -977,18 +941,7 @@ fn crossing_loser(
     new_dialed_by_lower: bool,
     active_age: Duration,
 ) -> bool {
-    is_crossing(active_dialed_by_lower, new_dialed_by_lower, active_age) && active_dialed_by_lower
-}
-
-/// Whether a new connection replaces the active one: the peer dialed again, because it restarted
-/// or lost the link on its side. A new connection that crosses the active one is not a re-dial,
-/// whether it wins the crossing or loses it.
-fn is_redial(
-    active_dialed_by_lower: bool,
-    new_dialed_by_lower: bool,
-    active_age: Duration,
-) -> bool {
-    !is_crossing(active_dialed_by_lower, new_dialed_by_lower, active_age)
+    active_age < CROSSING_WINDOW && active_dialed_by_lower && !new_dialed_by_lower
 }
 
 /// Whether the endpoint with the lower id dialed a connection: `local_dialed` says whether this
@@ -1021,27 +974,6 @@ impl PeerState {
             dialed_by_lower_id(local, peer, new.side().is_client()),
             active_since.elapsed(),
         )
-    }
-
-    /// Whether `new` replaces the active connection: see [`is_redial`]. The protocol is told that
-    /// the link is gone before the new connection is read.
-    fn replaced_by(&self, local: EndpointId, peer: EndpointId, new: &Connection) -> bool {
-        let PeerState::Active {
-            active_conn,
-            active_since,
-            ..
-        } = self
-        else {
-            return false;
-        };
-        match active_conn {
-            Some(active) => is_redial(
-                dialed_by_lower_id(local, peer, active.side().is_client()),
-                dialed_by_lower_id(local, peer, new.side().is_client()),
-                active_since.elapsed(),
-            ),
-            None => true,
-        }
     }
 
     fn active_conn_id(&self) -> Option<ConnId> {
@@ -2063,97 +1995,6 @@ pub(crate) mod tests {
         Result::Ok(())
     }
 
-    /// A peer that dials again while we hold a connection to it has replaced that connection: it
-    /// restarted, or it lost the link on its side. The old connection closes later without a word
-    /// to the protocol, because only the close of the active connection does. So the protocol must
-    /// be told at once, or it keeps the peer in the active view, and the `Join` that the peer sends
-    /// on the new connection is taken for a copy of an old one.
-    #[tokio::test]
-    #[traced_test]
-    async fn a_redial_of_an_active_peer_is_a_new_link_for_the_protocol() -> Result {
-        let rng = &mut rand::rngs::ChaCha12Rng::seed_from_u64(1);
-        let ct = CancellationToken::new();
-        let (relay_map, relay_url, _guard) = iroh::test_utils::run_relay_server().await.unwrap();
-
-        let (go_a, ep_a, ep_a_handle, _actor_a) =
-            Gossip::t_new(rng, Default::default(), relay_map.clone(), &ct).await?;
-        let (go_b, ep_b, ep_b_handle, _actor_b) =
-            Gossip::t_new(rng, Default::default(), relay_map, &ct).await?;
-        let id_a = ep_a.id();
-        let id_b = ep_b.id();
-
-        let lookup_b = MemoryLookup::new();
-        lookup_b.add_endpoint_info(EndpointAddr::new(id_a).with_relay_url(relay_url.clone()));
-        ep_b.address_lookup()?.add(lookup_b);
-
-        let topic: TopicId = blake3::hash(b"a_redial_of_an_active_peer_is_a_new_link").into();
-        let sub_a = go_a.subscribe(topic, Vec::new()).await?;
-        let sub_b = go_b.subscribe(topic, vec![id_a]).await?;
-        let (_sender_a, mut receiver_a) = sub_a.split();
-        let (sender_b, _receiver_b) = sub_b.split();
-
-        let up = async {
-            loop {
-                if receiver_a.try_next().await? == Some(Event::NeighborUp(id_b)) {
-                    break Result::<(), AnyError>::Ok(());
-                }
-            }
-        };
-        timeout(Duration::from_secs(10), up)
-            .await
-            .std_context("wait for the first link")??;
-
-        // `b` dials `a` again. Its gossip does not use the new connection, and the old one stays.
-        let _second = ep_b
-            .connect(
-                EndpointAddr::new(id_a).with_relay_url(relay_url),
-                GOSSIP_ALPN,
-            )
-            .await
-            .std_context("dial again")?;
-
-        let down = async {
-            loop {
-                if receiver_a.try_next().await? == Some(Event::NeighborDown(id_b)) {
-                    break Result::<(), AnyError>::Ok(());
-                }
-            }
-        };
-        timeout(Duration::from_secs(5), down)
-            .await
-            .std_context("the protocol was not told that the link was replaced")??;
-
-        // The link is replaced, not lost: `b` joins again on a connection of its own, and the
-        // protocol of `a` takes the peer as a new one.
-        let up_again = async {
-            loop {
-                sender_b.join_peers(vec![id_a]).await?;
-                let next = timeout(Duration::from_millis(500), receiver_a.try_next()).await;
-                if let Ok(event) = next {
-                    if event? == Some(Event::NeighborUp(id_b)) {
-                        break Result::<(), AnyError>::Ok(());
-                    }
-                }
-            }
-        };
-        timeout(Duration::from_secs(10), up_again)
-            .await
-            .std_context("the peer did not come back as a new link")??;
-
-        ct.cancel();
-        let wait = Duration::from_secs(2);
-        timeout(wait, ep_a_handle)
-            .await
-            .std_context("wait endpoint a task")?
-            .std_context("join endpoint a task")??;
-        timeout(wait, ep_b_handle)
-            .await
-            .std_context("wait endpoint b task")?
-            .std_context("join endpoint b task")??;
-
-        Result::Ok(())
-    }
-
     /// A connection that dies before the gossip handshake never made the peer a
     /// proto neighbor, so the proto never asks to disconnect it. The dead `Active`
     /// entry must not swallow every later send: the next send must dial again.
@@ -3044,31 +2885,6 @@ pub(crate) mod tests {
         // restarted, and its new dial must be kept.
         assert!(!crossing_loser(true, false, CROSSING_WINDOW));
         assert!(!crossing_loser(true, false, Duration::from_secs(60)));
-    }
-
-    #[test]
-    fn a_crossing_that_the_new_connection_wins_is_no_re_dial() {
-        let young = Duration::from_millis(200);
-        // Both sides dialed at once and the new connection was dialed by the lower id: it wins,
-        // both sides hold the link, and nothing was lost.
-        assert!(!is_redial(false, true, young));
-        // The new connection loses the crossing: it is closed and replaces nothing.
-        assert!(!is_redial(true, false, young));
-    }
-
-    #[test]
-    fn a_second_connection_of_the_same_kind_is_a_re_dial() {
-        let young = Duration::from_millis(200);
-        assert!(is_redial(true, true, young));
-        assert!(is_redial(false, false, young));
-    }
-
-    #[test]
-    fn a_new_connection_after_the_window_is_a_re_dial() {
-        // The peer restarted: the active connection is as old as the window, or older.
-        assert!(is_redial(false, true, CROSSING_WINDOW));
-        assert!(is_redial(false, true, Duration::from_secs(6)));
-        assert!(is_redial(true, false, Duration::from_secs(60)));
     }
 
     #[test]
