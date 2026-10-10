@@ -412,7 +412,7 @@ impl Actor {
                         return false;
                     },
                     Some(LocalActorMessage::HandleConnection(conn)) => {
-                        self.handle_connection(conn.remote_id(), ConnOrigin::Accept, conn);
+                        self.handle_connection(conn.remote_id(), ConnOrigin::Accept, conn).await;
                     }
                     None => {
                         debug!("all gossip handles dropped, stop gossip actor");
@@ -449,7 +449,7 @@ impl Actor {
                     Some(Ok(conn)) => {
                         debug!(peer = %peer_id.fmt_short(), "dial successful");
                         self.metrics.actor_tick_dialer_success.inc();
-                        self.handle_connection(peer_id, ConnOrigin::Dial, conn);
+                        self.handle_connection(peer_id, ConnOrigin::Dial, conn).await;
                     }
                     Some(Err(err)) => {
                         warn!(peer = %peer_id.fmt_short(), "dial failed: {err}");
@@ -543,11 +543,37 @@ impl Actor {
         }
     }
 
-    fn handle_connection(&mut self, peer_id: EndpointId, origin: ConnOrigin, conn: Connection) {
+    async fn handle_connection(
+        &mut self,
+        peer_id: EndpointId,
+        origin: ConnOrigin,
+        conn: Connection,
+    ) {
         let (send_tx, send_rx) = mpsc::channel(SEND_QUEUE_CAP);
         let conn_id = conn.stable_id();
 
         let local_id = self.endpoint.id();
+        // A new connection of a peer that we hold already replaces the old one (a re-dial: the
+        // peer restarted, or it lost the link on its side). The old connection closes later
+        // without a word to the protocol, because only the close of the active connection is
+        // told. So the protocol is told now, before it reads the first message of the new
+        // connection: the peer is not active any more, and its `Join` is a first one. A crossing
+        // is decided below and stays as it is.
+        //
+        // The order matters. The protocol answers this event with `OutEvent::DisconnectPeer`, and
+        // that removes the entry of the peer in `self.peers` with its senders. So the event must
+        // come before the entry of the new connection is made: the match below then finds no
+        // entry and builds a fresh one. After it, the event would drop the senders of the new
+        // connection.
+        let replaces_active = self.peers.get(&peer_id).is_some_and(|state| {
+            matches!(state, PeerState::Active { .. })
+                && !state.loses_crossing(local_id, peer_id, &conn)
+        });
+        if replaces_active {
+            debug!(peer = %peer_id.fmt_short(), "the peer dialed again: the old link is gone for the protocol");
+            self.handle_in_event(InEvent::PeerDisconnected(peer_id), Instant::now())
+                .await;
+        }
         let queue = match self.peers.entry(peer_id) {
             Entry::Occupied(mut entry) => {
                 if entry.get().loses_crossing(local_id, peer_id, &conn) {

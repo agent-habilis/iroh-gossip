@@ -513,9 +513,17 @@ where
     fn on_join(&mut self, peer: PI, data: Option<PeerData>, io: &mut impl IO<PI>) {
         // A `Join` is the application of the peer asking for the link, so it ends a leave.
         self.left.shift_remove(&peer);
+        let already_active = self.active_view.contains(&peer);
         // "A node that receives a join request will start by adding the new
         // node to its active view, even if it has to drop a random node from it. (6)"
         self.add_active(peer, data.clone(), Priority::High, true, io);
+        // The walk below puts the new node into the views of the swarm, and the first `Join`
+        // of the peer ran it. A joiner that waits for a slow link sends its `Join` again and
+        // again, and every copy would start the walk again. A peer whose connection was lost is
+        // not active any more (`PeerDisconnected`), so its next `Join` is a first one.
+        if already_active {
+            return;
+        }
 
         // "The contact node c will then send to all other nodes in its active view a ForwardJoin
         // request containing the new node identifier. Associated to the join procedure,
