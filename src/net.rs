@@ -1995,6 +1995,97 @@ pub(crate) mod tests {
         Result::Ok(())
     }
 
+    /// A peer that dials again while we hold a connection to it has replaced that connection: it
+    /// restarted, or it lost the link on its side. The old connection closes later without a word
+    /// to the protocol, because only the close of the active connection does. So the protocol must
+    /// be told at once, or it keeps the peer in the active view, and the `Join` that the peer sends
+    /// on the new connection is taken for a copy of an old one.
+    #[tokio::test]
+    #[traced_test]
+    async fn a_redial_of_an_active_peer_is_a_new_link_for_the_protocol() -> Result {
+        let rng = &mut rand::rngs::ChaCha12Rng::seed_from_u64(1);
+        let ct = CancellationToken::new();
+        let (relay_map, relay_url, _guard) = iroh::test_utils::run_relay_server().await.unwrap();
+
+        let (go_a, ep_a, ep_a_handle, _actor_a) =
+            Gossip::t_new(rng, Default::default(), relay_map.clone(), &ct).await?;
+        let (go_b, ep_b, ep_b_handle, _actor_b) =
+            Gossip::t_new(rng, Default::default(), relay_map, &ct).await?;
+        let id_a = ep_a.id();
+        let id_b = ep_b.id();
+
+        let lookup_b = MemoryLookup::new();
+        lookup_b.add_endpoint_info(EndpointAddr::new(id_a).with_relay_url(relay_url.clone()));
+        ep_b.address_lookup()?.add(lookup_b);
+
+        let topic: TopicId = blake3::hash(b"a_redial_of_an_active_peer_is_a_new_link").into();
+        let sub_a = go_a.subscribe(topic, Vec::new()).await?;
+        let sub_b = go_b.subscribe(topic, vec![id_a]).await?;
+        let (_sender_a, mut receiver_a) = sub_a.split();
+        let (sender_b, _receiver_b) = sub_b.split();
+
+        let up = async {
+            loop {
+                if receiver_a.try_next().await? == Some(Event::NeighborUp(id_b)) {
+                    break Result::<(), AnyError>::Ok(());
+                }
+            }
+        };
+        timeout(Duration::from_secs(10), up)
+            .await
+            .std_context("wait for the first link")??;
+
+        // `b` dials `a` again. Its gossip does not use the new connection, and the old one stays.
+        let _second = ep_b
+            .connect(
+                EndpointAddr::new(id_a).with_relay_url(relay_url),
+                GOSSIP_ALPN,
+            )
+            .await
+            .std_context("dial again")?;
+
+        let down = async {
+            loop {
+                if receiver_a.try_next().await? == Some(Event::NeighborDown(id_b)) {
+                    break Result::<(), AnyError>::Ok(());
+                }
+            }
+        };
+        timeout(Duration::from_secs(5), down)
+            .await
+            .std_context("the protocol was not told that the link was replaced")??;
+
+        // The link is replaced, not lost: `b` joins again on a connection of its own, and the
+        // protocol of `a` takes the peer as a new one.
+        let up_again = async {
+            loop {
+                sender_b.join_peers(vec![id_a]).await?;
+                let next = timeout(Duration::from_millis(500), receiver_a.try_next()).await;
+                if let Ok(event) = next {
+                    if event? == Some(Event::NeighborUp(id_b)) {
+                        break Result::<(), AnyError>::Ok(());
+                    }
+                }
+            }
+        };
+        timeout(Duration::from_secs(10), up_again)
+            .await
+            .std_context("the peer did not come back as a new link")??;
+
+        ct.cancel();
+        let wait = Duration::from_secs(2);
+        timeout(wait, ep_a_handle)
+            .await
+            .std_context("wait endpoint a task")?
+            .std_context("join endpoint a task")??;
+        timeout(wait, ep_b_handle)
+            .await
+            .std_context("wait endpoint b task")?
+            .std_context("join endpoint b task")??;
+
+        Result::Ok(())
+    }
+
     /// A connection that dies before the gossip handshake never made the peer a
     /// proto neighbor, so the proto never asks to disconnect it. The dead `Active`
     /// entry must not swallow every later send: the next send must dial again.

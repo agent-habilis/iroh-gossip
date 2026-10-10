@@ -1712,6 +1712,62 @@ mod tests {
         assert!(b.passive_view.contains(&4));
     }
 
+    fn forward_joins_of(io: &Io, joiner: u64) -> Vec<u64> {
+        sent(io)
+            .into_iter()
+            .filter_map(|(to, message)| match message {
+                Message::ForwardJoin(forward) if forward.peer.id == joiner => Some(to),
+                _ => None,
+            })
+            .collect()
+    }
+
+    // A joiner that waits for a slow link sends its `Join` again and again, and the copies arrive
+    // together. The walk of a `Join` puts the joiner into the views of the swarm. The first
+    // `Join` ran it, so a copy that finds the joiner active answers the joiner and starts no walk.
+    #[test]
+    fn a_repeated_join_of_an_active_peer_starts_no_forward_join() {
+        let mut contact = with_active(0, &[2, 3]);
+        let mut io = Io::new();
+
+        recv(&mut contact, 1, Message::Join(None), &mut io);
+        let mut first = forward_joins_of(&io, 1);
+        first.sort_unstable();
+        assert_eq!(
+            first,
+            vec![2, 3],
+            "the first Join starts a walk to each other neighbor"
+        );
+        io.clear();
+
+        recv(&mut contact, 1, Message::Join(None), &mut io);
+        assert!(
+            forward_joins_of(&io, 1).is_empty(),
+            "a repeated Join starts no walk: {:?}",
+            sent(&io)
+        );
+        assert!(contact.active_view.contains(&1));
+    }
+
+    // The rule above must not hide the walk of a joiner that came back: once the connection of the
+    // peer was lost, the peer is not active, and its next `Join` is a first `Join` again.
+    #[test]
+    fn a_join_of_a_peer_that_was_dropped_starts_a_walk() {
+        let mut contact = with_active(0, &[2, 3]);
+        let mut io = Io::new();
+        recv(&mut contact, 1, Message::Join(None), &mut io);
+        io.clear();
+
+        contact.handle(InEvent::PeerDisconnected(1), &mut io);
+        assert!(!contact.active_view.contains(&1));
+        io.clear();
+
+        recv(&mut contact, 1, Message::Join(None), &mut io);
+        let mut again = forward_joins_of(&io, 1);
+        again.sort_unstable();
+        assert_eq!(again, vec![2, 3], "a Join after the drop starts a walk");
+    }
+
     #[test]
     fn forward_join_for_a_left_joiner_is_passed_on_while_the_ttl_lasts() {
         let mut b = with_active(1, &[2, 3]);
