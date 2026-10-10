@@ -557,18 +557,18 @@ impl Actor {
         // peer restarted, or it lost the link on its side). The old connection closes later
         // without a word to the protocol, because only the close of the active connection is
         // told. So the protocol is told now, before it reads the first message of the new
-        // connection: the peer is not active any more, and its `Join` is a first one. A crossing
-        // is decided below and stays as it is.
+        // connection: the peer is not active any more, and its `Join` is a first one. A crossing,
+        // won or lost, is no re-dial: both sides hold the link, and it is decided below.
         //
         // The order matters. The protocol answers this event with `OutEvent::DisconnectPeer`, and
         // that removes the entry of the peer in `self.peers` with its senders. So the event must
         // come before the entry of the new connection is made: the match below then finds no
         // entry and builds a fresh one. After it, the event would drop the senders of the new
         // connection.
-        let replaces_active = self.peers.get(&peer_id).is_some_and(|state| {
-            matches!(state, PeerState::Active { .. })
-                && !state.loses_crossing(local_id, peer_id, &conn)
-        });
+        let replaces_active = self
+            .peers
+            .get(&peer_id)
+            .is_some_and(|state| state.replaced_by(local_id, peer_id, &conn));
         if replaces_active {
             debug!(peer = %peer_id.fmt_short(), "the peer dialed again: the old link is gone for the protocol");
             self.handle_in_event(InEvent::PeerDisconnected(peer_id), Instant::now())
@@ -970,6 +970,17 @@ fn crossing_loser(
     active_age < CROSSING_WINDOW && active_dialed_by_lower && !new_dialed_by_lower
 }
 
+/// Whether a new connection replaces the active one: the peer dialed again, because it restarted
+/// or lost the link on its side. A new connection that crosses the active one is not a re-dial,
+/// whether it wins the crossing or loses it.
+fn is_redial(
+    active_dialed_by_lower: bool,
+    new_dialed_by_lower: bool,
+    active_age: Duration,
+) -> bool {
+    !crossing_loser(active_dialed_by_lower, new_dialed_by_lower, active_age)
+}
+
 /// Whether the endpoint with the lower id dialed a connection: `local_dialed` says whether this
 /// side did. Both sides of a pair give the same answer, which is what lets them keep the same
 /// connection when both dial at once.
@@ -1000,6 +1011,27 @@ impl PeerState {
             dialed_by_lower_id(local, peer, new.side().is_client()),
             active_since.elapsed(),
         )
+    }
+
+    /// Whether `new` replaces the active connection: see [`is_redial`]. The protocol is told that
+    /// the link is gone before the new connection is read.
+    fn replaced_by(&self, local: EndpointId, peer: EndpointId, new: &Connection) -> bool {
+        let PeerState::Active {
+            active_conn,
+            active_since,
+            ..
+        } = self
+        else {
+            return false;
+        };
+        match active_conn {
+            Some(active) => is_redial(
+                dialed_by_lower_id(local, peer, active.side().is_client()),
+                dialed_by_lower_id(local, peer, new.side().is_client()),
+                active_since.elapsed(),
+            ),
+            None => true,
+        }
     }
 
     fn active_conn_id(&self) -> Option<ConnId> {
@@ -3002,6 +3034,31 @@ pub(crate) mod tests {
         // restarted, and its new dial must be kept.
         assert!(!crossing_loser(true, false, CROSSING_WINDOW));
         assert!(!crossing_loser(true, false, Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn a_crossing_that_the_new_connection_wins_is_no_re_dial() {
+        let young = Duration::from_millis(200);
+        // Both sides dialed at once and the new connection was dialed by the lower id: it wins,
+        // both sides hold the link, and nothing was lost.
+        assert!(!is_redial(false, true, young));
+        // The new connection loses the crossing: it is closed and replaces nothing.
+        assert!(!is_redial(true, false, young));
+    }
+
+    #[test]
+    fn a_second_connection_of_the_same_kind_is_a_re_dial() {
+        let young = Duration::from_millis(200);
+        assert!(is_redial(true, true, young));
+        assert!(is_redial(false, false, young));
+    }
+
+    #[test]
+    fn a_new_connection_after_the_window_is_a_re_dial() {
+        // The peer restarted: the active connection is as old as the window, or older.
+        assert!(is_redial(false, true, CROSSING_WINDOW));
+        assert!(is_redial(false, true, Duration::from_secs(6)));
+        assert!(is_redial(true, false, Duration::from_secs(60)));
     }
 
     #[test]
