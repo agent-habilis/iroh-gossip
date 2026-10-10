@@ -128,7 +128,7 @@ impl<PI> From<(PI, Option<PeerData>)> for PeerInfo<PI> {
 
 #[cfg(test)]
 mod test {
-    use std::{collections::HashSet, env, fmt, str::FromStr};
+    use std::{collections::HashSet, env, fmt, str::FromStr, time::Duration};
 
     use n0_tracing_test::traced_test;
     use rand::{rngs::ChaCha12Rng, SeedableRng};
@@ -209,6 +209,238 @@ mod test {
         } else {
             assert_eq!(network.conns(), vec![(0, 1), (0, 3), (1, 2)]);
         }
+        assert!(network.check_synchronicity());
+    }
+
+    /// A network of `count` peers with an active view of at most `capacity`.
+    fn small_view_network(count: u64, capacity: usize) -> (Network<u64, ChaCha12Rng>, TopicId) {
+        let rng = ChaCha12Rng::seed_from_u64(read_var("SEED", 0));
+        let mut config = Config::default();
+        config.membership.active_view_capacity = capacity;
+        let mut network = Network::new(config.clone().into(), rng);
+        for i in 0..count {
+            network.insert_with_config(i, config.clone());
+        }
+        (network, [0u8; 32].into())
+    }
+
+    #[test]
+    #[traced_test]
+    fn neighbor_peers_to_a_full_view_is_refused_and_evicts_nobody() {
+        // Node 3 has a neighbor (4), so it is not isolated. The refill that follows a refusal
+        // asks with high priority when the active view is empty (hyparview.rs, in
+        // `refill_active_from_passive`): the exception of HyParView for an isolated node,
+        // which is how a node gets into a full mesh.
+        let (mut network, t) = small_view_network(5, 2);
+        network.command(0, t, Command::Join(vec![]));
+        network.command(1, t, Command::Join(vec![0]));
+        network.command(2, t, Command::Join(vec![0]));
+        network.command(4, t, Command::Join(vec![]));
+        network.command(3, t, Command::Join(vec![4]));
+        network.run_trips(4);
+        let _ = network.events();
+        let mut before = network.neighbors(&0, &t).unwrap();
+        before.sort();
+        assert_eq!(before, vec![1, 2]);
+
+        network.command(3, t, Command::NeighborPeers(vec![0]));
+        network.run_trips(4);
+
+        let mut after = network.neighbors(&0, &t).unwrap();
+        after.sort();
+        assert_eq!(after, before, "the full view of 0 is unchanged");
+        assert_eq!(network.neighbors(&3, &t).unwrap(), vec![4]);
+        assert!(!network
+            .events()
+            .any(|(_, _, event)| matches!(event, Event::NeighborDown(_))));
+        assert!(network.check_synchronicity());
+    }
+
+    #[test]
+    #[traced_test]
+    fn join_to_a_full_view_evicts_a_neighbor() {
+        // The rule that `NeighborPeers` does not have: a Join is always accepted.
+        let (mut network, t) = small_view_network(4, 2);
+        network.command(0, t, Command::Join(vec![]));
+        network.command(1, t, Command::Join(vec![0]));
+        network.command(2, t, Command::Join(vec![0]));
+        network.run_trips(4);
+        let _ = network.events();
+
+        network.command(3, t, Command::Join(vec![0]));
+        network.run_trips(4);
+
+        let after = network.neighbors(&0, &t).unwrap();
+        assert!(after.contains(&3));
+        assert_eq!(after.len(), 2);
+        assert!(network
+            .events()
+            .any(|(_, _, event)| matches!(event, Event::NeighborDown(_))));
+    }
+
+    #[test]
+    #[traced_test]
+    fn neighbor_peers_to_a_free_slot_links_the_pair() {
+        let (mut network, t) = small_view_network(3, 3);
+        network.command(0, t, Command::Join(vec![]));
+        network.command(1, t, Command::Join(vec![0]));
+        network.command(2, t, Command::Join(vec![]));
+        network.run_trips(4);
+        let _ = network.events();
+
+        network.command(2, t, Command::NeighborPeers(vec![0]));
+        network.run_trips(4);
+
+        assert!(network.neighbors(&0, &t).unwrap().contains(&2));
+        assert!(network.neighbors(&2, &t).unwrap().contains(&0));
+        assert!(network.check_synchronicity());
+    }
+
+    #[test]
+    #[traced_test]
+    fn leave_peers_is_not_undone_by_refill() {
+        let rng = ChaCha12Rng::seed_from_u64(read_var("SEED", 0));
+        let mut network = Network::new(Config::default().into(), rng);
+        for i in 0..4 {
+            network.insert(i);
+        }
+        let t: TopicId = [0u8; 32].into();
+
+        network.command(0, t, Command::Join(vec![]));
+        (1..4).for_each(|i| network.command(i, t, Command::Join(vec![0])));
+        network.run_trips(4);
+        let _ = network.events();
+        assert!(network.neighbors(&0, &t).unwrap().contains(&1));
+        assert!(network.neighbors(&1, &t).unwrap().contains(&0));
+
+        network.command(0, t, Command::LeavePeers(vec![1]));
+        network.run_trips(4);
+
+        let events = network.events_sorted();
+        assert!(events.contains(&(0, t, Event::NeighborDown(1))));
+        assert!(events.contains(&(1, t, Event::NeighborDown(0))));
+        assert!(!events
+            .iter()
+            .any(|(_, _, e)| matches!(e, Event::NeighborUp(_))));
+
+        // 1 must not take 0 back into its passive view, and 0 must not touch other neighbours.
+        let swarm = |peer: u64| &network.peer(&peer).unwrap().state(&t).unwrap().swarm;
+        assert!(!swarm(1).passive_view.contains(&0));
+        assert!(!swarm(0).passive_view.contains(&1));
+        assert!(network.neighbors(&0, &t).unwrap().contains(&2));
+        assert!(network.neighbors(&0, &t).unwrap().contains(&3));
+
+        // The link must not come back by a refill.
+        network.run_duration(std::time::Duration::from_secs(30));
+        assert!(!network.neighbors(&0, &t).unwrap().contains(&1));
+        assert!(!network.neighbors(&1, &t).unwrap().contains(&0));
+        assert!(network.check_synchronicity());
+    }
+
+    #[test]
+    #[traced_test]
+    fn leave_peers_stays_away_across_shuffles() {
+        let rng = ChaCha12Rng::seed_from_u64(read_var("SEED", 0));
+        let mut network = Network::new(Config::default().into(), rng);
+        for i in 0..4 {
+            network.insert(i);
+        }
+        let t: TopicId = [0u8; 32].into();
+        network.command(0, t, Command::Join(vec![]));
+        (1..4).for_each(|i| network.command(i, t, Command::Join(vec![0])));
+        network.run_trips(4);
+        let _ = network.events();
+
+        network.command(0, t, Command::LeavePeers(vec![1]));
+        // Five shuffle rounds with the default 60 s interval.
+        network.run_duration(Duration::from_secs(300));
+
+        let relinked = network.events().any(|(peer, _, event)| {
+            matches!(
+                (peer, event),
+                (0, Event::NeighborUp(1)) | (1, Event::NeighborUp(0))
+            )
+        });
+        assert!(!relinked);
+        assert!(!network.neighbors(&0, &t).unwrap().contains(&1));
+        assert!(!network.neighbors(&1, &t).unwrap().contains(&0));
+        assert!(network.check_synchronicity());
+    }
+
+    #[test]
+    #[traced_test]
+    fn join_links_a_pair_again_after_a_leave_from_either_side() {
+        for joiner in [0u64, 1] {
+            let rng = ChaCha12Rng::seed_from_u64(read_var("SEED", 0));
+            let mut network = Network::new(Config::default().into(), rng);
+            network.insert(0);
+            network.insert(1);
+            let t: TopicId = [0u8; 32].into();
+            network.command(0, t, Command::Join(vec![]));
+            network.command(1, t, Command::Join(vec![0]));
+            network.run_trips(4);
+            network.command(0, t, Command::LeavePeers(vec![1]));
+            network.run_duration(Duration::from_secs(120));
+            assert!(network.neighbors(&0, &t).unwrap().is_empty());
+            assert!(network.neighbors(&1, &t).unwrap().is_empty());
+
+            network.command(joiner, t, Command::Join(vec![1 - joiner]));
+            network.run_trips(4);
+            assert_eq!(network.neighbors(&0, &t).unwrap(), vec![1]);
+            assert_eq!(network.neighbors(&1, &t).unwrap(), vec![0]);
+        }
+    }
+
+    /// A sender that cannot queue a data message drops it. The views must stay symmetric, and
+    /// the peer must get the messages that come after the refusal ends.
+    #[test]
+    #[traced_test]
+    fn refused_data_messages_keep_the_views_symmetric() {
+        let rng = ChaCha12Rng::seed_from_u64(read_var("SEED", 0));
+        let mut network = Network::new(Config::default().into(), rng);
+        for i in 0..6 {
+            network.insert(i);
+        }
+        let t: TopicId = [0u8; 32].into();
+        network.command(0, t, Command::Join(vec![]));
+        (1..6).for_each(|i| network.command(i, t, Command::Join(vec![0])));
+        network.run_trips(6);
+        let _ = network.events();
+        assert!(network.check_synchronicity());
+
+        network.refuse_data_to(3, true);
+        for round in 0..5 {
+            network.command(
+                round % 3,
+                t,
+                Command::Broadcast(format!("refused {round}").into_bytes().into(), Scope::Swarm),
+            );
+            network.run_trips(4);
+        }
+        network.run_duration(Duration::from_secs(120));
+        assert!(network.check_synchronicity());
+        let membership_changed = network
+            .events()
+            .any(|(_, _, e)| matches!(e, Event::NeighborDown(_) | Event::NeighborUp(_)));
+        assert!(
+            !membership_changed,
+            "refused data must not change the membership"
+        );
+
+        network.refuse_data_to(3, false);
+        network.command(
+            0,
+            t,
+            Command::Broadcast(b"after".to_vec().into(), Scope::Swarm),
+        );
+        network.run_duration(Duration::from_secs(30));
+        let got_after = network.events().any(|(peer, _, e)| {
+            peer == 3 && matches!(e, Event::Received(m) if m.content.as_ref() == b"after")
+        });
+        assert!(
+            got_after,
+            "node 3 must get the message sent after the refusal"
+        );
         assert!(network.check_synchronicity());
     }
 

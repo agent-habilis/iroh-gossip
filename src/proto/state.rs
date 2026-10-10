@@ -43,6 +43,31 @@ impl<PI> Message<PI> {
     pub fn kind(&self) -> MessageKind {
         self.message.kind()
     }
+
+    /// Whether the protocol repairs the loss of this message by itself, so that a sender
+    /// that cannot queue it may drop it.
+    ///
+    /// This holds for a plumtree `Gossip` (another neighbor sends an `IHave`, and a `Graft` then
+    /// fetches the message) and for an `IHave` (a lost repair hint). It does not hold for
+    /// anything else: a lost `Join` or `Neighbor` leaves the two views of a link different, a
+    /// lost `Disconnect` loses its `left` flag, and `Prune` and `Graft` are tree state.
+    pub(crate) fn is_droppable(&self) -> bool {
+        matches!(
+            self.message,
+            topic::Message::Gossip(
+                super::plumtree::Message::Gossip(_) | super::plumtree::Message::IHave(_)
+            )
+        )
+    }
+
+    /// A `Join` request for `topic`, for tests outside the `proto` module tree.
+    #[cfg(test)]
+    pub(crate) fn join_for_test(topic: TopicId) -> Self {
+        Self {
+            topic,
+            message: topic::Message::Swarm(super::hyparview::Message::Join(None)),
+        }
+    }
 }
 
 impl<PI: Serialize> Message<PI> {
@@ -377,5 +402,31 @@ fn track_in_event<PI: Serialize>(event: &InEvent<PI>, metrics: &Metrics) {
                     .inc_by(message.size().unwrap_or(0) as u64);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proto::{hyparview, plumtree};
+
+    fn message(message: topic::Message<u64>) -> Message<u64> {
+        Message {
+            topic: TopicId::from([0u8; 32]),
+            message,
+        }
+    }
+
+    /// Only a plumtree `Gossip` and `IHave` may be dropped by a sender that cannot queue them.
+    /// (`Gossip` is covered by the burst test in `net.rs`, which counts the data messages that
+    /// reach a peer. `Disconnect`, `Neighbor`, `Graft` have private fields, so the control test
+    /// in `net.rs` covers `Disconnect` and these lines cover the rest of the rule.)
+    #[test]
+    fn only_data_and_ihave_are_droppable() {
+        let swarm = |m| message(topic::Message::Swarm(m));
+        let gossip = |m| message(topic::Message::Gossip(m));
+        assert!(gossip(plumtree::Message::IHave(Vec::new())).is_droppable());
+        assert!(!gossip(plumtree::Message::Prune).is_droppable());
+        assert!(!swarm(hyparview::Message::Join(None)).is_droppable());
     }
 }

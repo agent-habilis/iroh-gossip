@@ -93,6 +93,8 @@ pub(crate) struct RecvLoop {
     conn: Connection,
     max_message_size: usize,
     in_event_tx: mpsc::Sender<InEvent>,
+    /// Gets `(peer, connection id)` once, when the first message of the peer was read.
+    carried_tx: mpsc::Sender<(EndpointId, usize)>,
 }
 
 impl RecvLoop {
@@ -100,6 +102,7 @@ impl RecvLoop {
         remote_endpoint_id: EndpointId,
         conn: Connection,
         in_event_tx: mpsc::Sender<InEvent>,
+        carried_tx: mpsc::Sender<(EndpointId, usize)>,
         max_message_size: usize,
     ) -> Self {
         Self {
@@ -107,12 +110,14 @@ impl RecvLoop {
             conn,
             max_message_size,
             in_event_tx,
+            carried_tx,
         }
     }
 
     pub(crate) async fn run(&mut self) -> Result<(), ReadError> {
         let mut read_futures = FuturesUnordered::new();
         let mut conn_is_closed = false;
+        let mut carried = false;
         let closed = self.conn.closed();
         tokio::pin!(closed);
         while !conn_is_closed || !read_futures.is_empty() {
@@ -143,6 +148,15 @@ impl RecvLoop {
                     match msg {
                         None => debug!(topic=%state.header.topic_id.fmt_short(), "stream closed"),
                         Some(msg) => {
+                            // Before the message itself, and again with the next message if the
+                            // channel was full: the actor must know that the peer sends on this
+                            // connection when it handles what the peer sent.
+                            if !carried {
+                                carried = self
+                                    .carried_tx
+                                    .try_send((self.remote_endpoint_id, self.conn.stable_id()))
+                                    .is_ok();
+                            }
                             if self.in_event_tx.send(InEvent::RecvMessage(self.remote_endpoint_id, msg)).await.is_err() {
                                 debug!("stop recv loop: actor closed");
                                 break;

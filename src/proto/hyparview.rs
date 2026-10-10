@@ -27,8 +27,12 @@ pub enum InEvent<PI> {
     PeerDisconnected(PI),
     /// Send a join request to a peer.
     RequestJoin(PI),
+    /// Ask the given peers for a link with low priority, while the active view has a free slot.
+    RequestNeighbors(Vec<PI>),
     /// Update the peer data that is transmitted on join requests.
     UpdatePeerData(PeerData),
+    /// Drop the given peers from the active view, telling each that we are not coming back.
+    Leave(Vec<PI>),
     /// Quit the swarm, informing peers about us leaving.
     Quit,
 }
@@ -62,7 +66,15 @@ pub enum Event<PI> {
 pub enum Timer<PI> {
     DoShuffle,
     PendingNeighborRequest(PI),
+    /// A request made with [`InEvent::RequestNeighbors`] got no answer: forget that it is pending.
+    NeighborRequestExpired(PI),
+    /// We answered a `Neighbor` request of the peer a while ago: forget that we did, so that its
+    /// next `Neighbor` is read as a request.
+    AnsweredNeighborExpired(PI),
 }
+
+/// How long a request made with [`InEvent::RequestNeighbors`] stays pending without an answer.
+const NEIGHBOR_REQUEST_EXPIRY: Duration = Duration::from_secs(20);
 
 /// Messages that we can send and receive from peers within the topic.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -164,8 +176,11 @@ pub struct Disconnect {
     /// Whether we are actually shutting down or closing the connection only because our limits are
     /// reached.
     alive: bool,
-    /// Obsolete field (kept in the struct to maintain wire compatibility).
-    _respond: bool,
+    /// Whether the sender left on purpose and wants to stay unlinked until a [`Message::Join`].
+    ///
+    /// This reuses the obsolete `respond` field, so the wire format is unchanged. No peer of
+    /// this fork ever sent `true` there.
+    left: bool,
 }
 
 /// Configuration for the swarm membership layer
@@ -225,6 +240,13 @@ pub struct Stats {
     total_connections: usize,
 }
 
+/// A node remembers at most this many times `passive_view_capacity` peers that left on purpose.
+const LEFT_CAPACITY_FACTOR: usize = 8;
+
+/// A node remembers the peers it answered with a `Neighbor`, at most this many in all: the active
+/// and the passive view together, `1` at least. See [`State::answered_neighbors`].
+const ANSWERED_CAPACITY_MIN: usize = 1;
+
 /// The state of the HyParView protocol
 #[derive(Debug)]
 pub struct State<PI, RG = ThreadRng> {
@@ -246,10 +268,31 @@ pub struct State<PI, RG = ThreadRng> {
     pub(crate) stats: Stats,
     /// The set of neighbor requests we sent out but did not yet receive a reply for
     pending_neighbor_requests: HashSet<PI>,
+    /// The peers we answered with a `Neighbor` and that did not send us anything since. Oldest first.
+    ///
+    /// A `Neighbor` message does not say whether it is a request or an answer: a node reads it as an
+    /// answer only when it holds an entry for the sender, either in `pending_neighbor_requests`
+    /// (we asked) or here (we answered). Without the second, a node that forgot its own answer reads
+    /// a late or doubled `Neighbor` as a new request and answers it, and two such nodes answer each
+    /// other for ever. The entry is spent by the next `Neighbor` from that peer and dropped with the
+    /// link, the request or the peer, or after [`NEIGHBOR_REQUEST_EXPIRY`]: the entry outlives the
+    /// link it belongs to when our connection to the peer stays up with no `Disconnect` and no
+    /// close, for example after the peer shed its side, and a genuine request of the peer would
+    /// then read as an answer. Each answer schedules its own expiry and does not carry a
+    /// generation, so a second answer to the same peer inside the period can be dropped by the
+    /// first timer. It is a separate set so that an answered peer does not look like a request in
+    /// flight (`handle_request_neighbors` skips pending peers and counts them against the free
+    /// slots of the active view).
+    answered_neighbors: indexmap::IndexSet<PI>,
     /// The opaque user peer data we received for other peers
     peer_data: HashMap<PI, PeerData>,
     /// List of peers that are disconnecting, but which we want to keep in the passive set once the connection closes
     alive_disconnect_peers: HashSet<PI>,
+    /// Peers that left us, or that we left, on purpose. Oldest first.
+    ///
+    /// A peer in this set is not added to the passive view and not adopted from a `ForwardJoin`.
+    /// Its `Neighbor` request is refused. Only a `Join` from either side clears it.
+    left: indexmap::IndexSet<PI>,
 }
 
 impl<PI, RG> State<PI, RG>
@@ -268,8 +311,10 @@ where
             rng,
             stats: Stats::default(),
             pending_neighbor_requests: Default::default(),
+            answered_neighbors: Default::default(),
             peer_data: Default::default(),
             alive_disconnect_peers: Default::default(),
+            left: Default::default(),
         }
     }
 
@@ -279,12 +324,18 @@ where
             InEvent::TimerExpired(timer) => match timer {
                 Timer::DoShuffle => self.handle_shuffle_timer(io),
                 Timer::PendingNeighborRequest(peer) => self.handle_pending_neighbor_timer(peer, io),
+                Timer::NeighborRequestExpired(peer) => self.handle_neighbor_request_expired(peer),
+                Timer::AnsweredNeighborExpired(peer) => {
+                    self.answered_neighbors.shift_remove(&peer);
+                }
             },
             InEvent::PeerDisconnected(peer) => self.handle_connection_closed(peer, io),
             InEvent::RequestJoin(peer) => self.handle_join(peer, io),
+            InEvent::RequestNeighbors(peers) => self.handle_request_neighbors(peers, io),
             InEvent::UpdatePeerData(data) => {
                 self.me_data = Some(data);
             }
+            InEvent::Leave(peers) => self.handle_leave(peers, io),
             InEvent::Quit => self.handle_quit(io),
         }
 
@@ -320,31 +371,71 @@ where
     }
 
     fn handle_join(&mut self, peer: PI, io: &mut impl IO<PI>) {
+        self.left.shift_remove(&peer);
         io.push(OutEvent::SendMessage(
             peer,
             Message::Join(self.me_data.clone()),
         ));
     }
 
+    /// Ask peers for a link with low priority, for as many free slots as the active view has.
+    ///
+    /// A peer with a full active view refuses a low priority request and keeps its neighbors,
+    /// where a `Join` always gets in and evicts one. No `ForwardJoin` goes out. There is no refill
+    /// timer: a dial that fails clears the pending request through `PeerDisconnected`, and the
+    /// application decides when to ask again. A request that nobody answers stops being pending
+    /// after [`NEIGHBOR_REQUEST_EXPIRY`] (`Timer::NeighborRequestExpired`), which only clears the
+    /// pending entry.
+    fn handle_request_neighbors(&mut self, peers: Vec<PI>, io: &mut impl IO<PI>) {
+        for peer in peers {
+            if self.active_view.len() + self.pending_neighbor_requests.len()
+                >= self.config.active_view_capacity
+            {
+                break;
+            }
+            if peer == self.me
+                || self.left.contains(&peer)
+                || self.active_view.contains(&peer)
+                || self.pending_neighbor_requests.contains(&peer)
+            {
+                continue;
+            }
+            self.send_neighbor(peer, Priority::Low, io);
+            io.push(OutEvent::ScheduleTimer(
+                NEIGHBOR_REQUEST_EXPIRY,
+                Timer::NeighborRequestExpired(peer),
+            ));
+        }
+    }
+
+    /// A request that nobody answered stops being pending, so that the application can ask again.
+    /// Unlike [`Self::handle_pending_neighbor_timer`], it does not touch the passive view and
+    /// does not refill the active view.
+    fn handle_neighbor_request_expired(&mut self, peer: PI) {
+        self.pending_neighbor_requests.remove(&peer);
+        self.answered_neighbors.shift_remove(&peer);
+    }
+
     /// We received a disconnect message.
     fn on_disconnect(&mut self, peer: PI, details: Disconnect, io: &mut impl IO<PI>) {
         self.pending_neighbor_requests.remove(&peer);
+        self.answered_neighbors.shift_remove(&peer);
+        let is_alive = details.alive && !details.left;
         if self.active_view.contains(&peer) {
-            self.remove_active(
-                &peer,
-                RemovalReason::DisconnectReceived {
-                    is_alive: details.alive,
-                },
-                io,
-            );
-        } else if details.alive && self.passive_view.contains(&peer) {
+            self.remove_active(&peer, RemovalReason::DisconnectReceived { is_alive }, io);
+        } else if is_alive && self.passive_view.contains(&peer) {
             self.alive_disconnect_peers.insert(peer);
+        }
+        // After `remove_active`, so that the tombstone also drops the peer data of a neighbor.
+        if details.left {
+            self.add_tombstone(peer);
         }
     }
 
     /// A connection was closed by the peer.
     fn handle_connection_closed(&mut self, peer: PI, io: &mut impl IO<PI>) {
         self.pending_neighbor_requests.remove(&peer);
+        self.answered_neighbors.shift_remove(&peer);
         if self.active_view.contains(&peer) {
             self.remove_active(&peer, RemovalReason::ConnectionClosed, io);
         } else if !self.alive_disconnect_peers.remove(&peer) {
@@ -353,14 +444,59 @@ where
         }
     }
 
-    fn handle_quit(&mut self, io: &mut impl IO<PI>) {
-        for peer in self.active_view.clone().into_iter() {
-            self.active_view.remove(&peer);
-            self.send_disconnect(peer, false, io);
+    /// Leave the given peers only. Other neighbors are kept and the active view is not refilled.
+    ///
+    /// Each peer in the active view gets a `Disconnect` with `alive = false` and `left = true`.
+    /// We tombstone every named peer, also when it is only in the passive view: after a leave,
+    /// only a `Join` from either side links the pair again.
+    fn handle_leave(&mut self, peers: Vec<PI>, io: &mut impl IO<PI>) {
+        for peer in peers {
+            if peer == self.me {
+                continue;
+            }
+            if self.active_view.remove(&peer).is_some() {
+                io.push(OutEvent::EmitEvent(Event::NeighborDown(peer)));
+                // `send_disconnect` sends a `ShuffleReply` first, so the far side learns some of
+                // our other peers. Look here first if links to the leaver still come back.
+                self.send_disconnect(peer, false, true, io);
+            }
+            self.add_tombstone(peer);
         }
     }
 
-    fn send_disconnect(&mut self, peer: PI, alive: bool, io: &mut impl IO<PI>) {
+    /// Remember that `peer` left on purpose and forget everything else we know about it.
+    ///
+    /// The set is bounded and the oldest tombstone goes first. It has no deadline: a leave on
+    /// purpose ends when either side sends a `Join`, not after a time.
+    ///
+    /// Limit: a peer can only tombstone itself, but one that leaves under more than `capacity`
+    /// identities pushes older tombstones out. Then the first dial from a forgotten peer is
+    /// accepted again.
+    fn add_tombstone(&mut self, peer: PI) {
+        self.passive_view.remove(&peer);
+        self.alive_disconnect_peers.remove(&peer);
+        self.pending_neighbor_requests.remove(&peer);
+        self.answered_neighbors.shift_remove(&peer);
+        if !self.active_view.contains(&peer) {
+            self.peer_data.remove(&peer);
+        }
+        self.left.shift_remove(&peer);
+        self.left.insert(peer);
+        let capacity = (LEFT_CAPACITY_FACTOR * self.config.passive_view_capacity).max(1);
+        while self.left.len() > capacity {
+            // O(n) on an `IndexSet`, but n is at most `capacity` and this runs once per leave.
+            self.left.shift_remove_index(0);
+        }
+    }
+
+    fn handle_quit(&mut self, io: &mut impl IO<PI>) {
+        for peer in self.active_view.clone().into_iter() {
+            self.active_view.remove(&peer);
+            self.send_disconnect(peer, false, false, io);
+        }
+    }
+
+    fn send_disconnect(&mut self, peer: PI, alive: bool, left: bool, io: &mut impl IO<PI>) {
         // Before disconnecting, send a `ShuffleReply` with some of our nodes to
         // prevent the other node from running out of connections. This is especially
         // relevant if the other node just joined the swarm.
@@ -369,18 +505,32 @@ where
             self.config.shuffle_active_view_count + self.config.shuffle_passive_view_count,
             io,
         );
-        let message = Message::Disconnect(Disconnect {
-            alive,
-            _respond: false,
-        });
+        let message = Message::Disconnect(Disconnect { alive, left });
         io.push(OutEvent::SendMessage(peer, message));
         io.push(OutEvent::DisconnectPeer(peer));
     }
 
     fn on_join(&mut self, peer: PI, data: Option<PeerData>, io: &mut impl IO<PI>) {
+        // A `Join` is the application of the peer asking for the link, so it ends a leave.
+        self.left.shift_remove(&peer);
+        let already_active = self.active_view.contains(&peer);
         // "A node that receives a join request will start by adding the new
         // node to its active view, even if it has to drop a random node from it. (6)"
         self.add_active(peer, data.clone(), Priority::High, true, io);
+        // The walk below puts the new node into the views of the swarm, and the first `Join`
+        // of the peer ran it. A joiner that waits for a slow link sends its `Join` again and
+        // again, and every copy would start the walk again. A peer whose connection was lost is
+        // not active any more (`PeerDisconnected`), so its next `Join` is a first one.
+        //
+        // Known cost: a peer that restarts, or dials again, while we still hold its old
+        // connection is still active here, and its `Join` is answered and starts no walk. The old
+        // connection ends at the idle timeout of QUIC, and then the next `Join` runs the walk.
+        // The protocol cannot tell a copy of a `Join` from the first `Join` of a restarted peer;
+        // the network layer could, but telling the protocol on a re-dial broke a live link
+        // when two sides raced a connection at once (see the revert of that change).
+        if already_active {
+            return;
+        }
 
         // "The contact node c will then send to all other nodes in its active view a ForwardJoin
         // request containing the new node identifier. Associated to the join procedure,
@@ -402,10 +552,54 @@ where
 
     fn on_forward_join(&mut self, sender: PI, message: ForwardJoin<PI>, io: &mut impl IO<PI>) {
         let peer_id = message.peer.id;
+        // The leave is between the joiner and us. Do not adopt it, but the walk is for the swarm,
+        // so pass it on while its ttl lasts. At ttl 0 we drop it: a node without the tombstone
+        // adopts at ttl 0, and if every node of a group holds the tombstone, a walk that is
+        // forwarded at ttl 0 would go round the group for ever.
+        if self.left.contains(&peer_id) {
+            if !message.ttl.expired() {
+                if let Some(next) = self
+                    .active_view
+                    .pick_random_without(&[&sender], &mut self.rng)
+                {
+                    let message = Message::ForwardJoin(ForwardJoin {
+                        peer: message.peer,
+                        ttl: message.ttl.next(),
+                    });
+                    io.push(OutEvent::SendMessage(*next, message));
+                }
+            }
+            return;
+        }
         // If the peer is already in our active view, we renew our neighbor relationship.
         if self.active_view.contains(&peer_id) {
-            self.insert_peer_info(message.peer, io);
-            self.send_neighbor(peer_id, Priority::High, io);
+            self.insert_peer_info(message.peer.clone(), io);
+            // A renew is not tracked: the peer is already in the active view, so a pending entry
+            // for it would count the same peer twice in `handle_request_neighbors`. A peer that
+            // answered us before reads the renew as an answer, and nothing comes back.
+            io.push(OutEvent::SendMessage(
+                peer_id,
+                Message::Neighbor(Neighbor {
+                    priority: Priority::High,
+                    data: self.me_data.clone(),
+                }),
+            ));
+            // The walk goes on while its ttl lasts. The contact node of a Join holds the joiner
+            // already, so a walk that stopped here would stop at the contact node as soon as the
+            // other nodes are linked to each other, and the joiner would get no link to a real
+            // peer. The joiner is never the next hop.
+            if !message.ttl.expired() {
+                if let Some(next) = self
+                    .active_view
+                    .pick_random_without(&[&sender, &peer_id], &mut self.rng)
+                {
+                    let message = Message::ForwardJoin(ForwardJoin {
+                        peer: message.peer,
+                        ttl: message.ttl.next(),
+                    });
+                    io.push(OutEvent::SendMessage(*next, message));
+                }
+            }
         }
         // "i) If the time to live is equal to zero or if the number of nodes in p’s active view is equal to one,
         // it will add the new node to its active view (7)"
@@ -448,14 +642,53 @@ where
     }
 
     fn on_neighbor(&mut self, from: PI, details: Neighbor, io: &mut impl IO<PI>) {
-        let is_reply = self.pending_neighbor_requests.remove(&from);
+        // Both entries are spent by this message, so that a doubled `Neighbor` is read as an
+        // answer once and not answered, whichever of the two the first one found.
+        let was_asked = self.pending_neighbor_requests.remove(&from);
+        let was_answered = self.answered_neighbors.shift_remove(&from);
+        let is_reply = was_asked || was_answered;
+        // This refuses a `High` priority request on purpose, against the HyParView paper: after a
+        // leave, only a `Join` links the pair again. The refusal tells the far side to tombstone
+        // us too, which ends a joint dial.
+        if self.left.contains(&from) {
+            self.send_disconnect(from, false, true, io);
+            return;
+        }
         let do_reply = !is_reply;
         // "A node q that receives a high priority neighbor request will always accept the request, even
         // if it has to drop a random member from its active view (again, the member that is dropped will
         // receive a Disconnect notification). If a node q receives a low priority Neighbor request, it will
         // only accept the request if it has a free slot in its active view, otherwise it will refuse the request."
         if !self.add_active(from, details.data, details.priority, do_reply, io) {
-            self.send_disconnect(from, true, io);
+            self.send_disconnect(from, true, false, io);
+        }
+        // When `do_reply` is set, the Neighbor message that `add_active` just sent answers the
+        // request we received. It is not a request in flight, so it must not wait in the pending
+        // set; the answer is remembered in its own set, so that the next `Neighbor` from this peer
+        // is read as an answer (and not answered again).
+        if do_reply {
+            self.pending_neighbor_requests.remove(&from);
+            self.remember_answer(from, io);
+        }
+    }
+
+    /// Remember that we answered a `Neighbor` request of `peer` (see [`State::answered_neighbors`]).
+    fn remember_answer(&mut self, peer: PI, io: &mut impl IO<PI>) {
+        self.answered_neighbors.shift_remove(&peer);
+        self.answered_neighbors.insert(peer);
+        // The entry lives as long as a request. It outlives the link it belongs to when our
+        // connection to the peer stays up with no `Disconnect` and no close (for example after the
+        // peer shed its side); nothing else drops it then, and a genuine request of the peer would
+        // read as an answer.
+        io.push(OutEvent::ScheduleTimer(
+            NEIGHBOR_REQUEST_EXPIRY,
+            Timer::AnsweredNeighborExpired(peer),
+        ));
+        let capacity = (self.config.active_view_capacity + self.config.passive_view_capacity)
+            .max(ANSWERED_CAPACITY_MIN);
+        while self.answered_neighbors.len() > capacity {
+            // O(n) on an `IndexSet`, but n is at most `capacity` and this runs once per answer.
+            self.answered_neighbors.shift_remove_index(0);
         }
     }
 
@@ -572,8 +805,12 @@ where
     /// Add a peer to the passive view.
     ///
     /// If the passive view is full, it will first remove a random peer and then insert the new peer.
-    /// If a peer is currently in the active view it will not be added.
+    /// If a peer is currently in the active view, or left on purpose, it will not be added.
     fn add_passive(&mut self, peer: PI, data: Option<PeerData>, io: &mut impl IO<PI>) {
+        // Check before `insert_peer_info`: a peer in no view must not keep peer data.
+        if self.left.contains(&peer) {
+            return;
+        }
         self.insert_peer_info((peer, data).into(), io);
         if self.active_view.contains(&peer) || self.passive_view.contains(&peer) || peer == self.me
         {
@@ -647,7 +884,7 @@ where
 
             match reason {
                 // send a disconnect message, then close connection.
-                RemovalReason::Random => self.send_disconnect(peer, true, io),
+                RemovalReason::Random => self.send_disconnect(peer, true, false, io),
                 // close connection without sending anything further.
                 RemovalReason::DisconnectReceived { is_alive: _ } => {
                     io.push(OutEvent::DisconnectPeer(peer))
@@ -761,4 +998,912 @@ enum RemovalReason {
     DisconnectReceived { is_alive: bool },
     /// A peer is removed after random selection to make room for a newly joined peer.
     Random,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+
+    use rand::{rngs::ChaCha12Rng, SeedableRng};
+
+    use super::*;
+    use crate::proto::{topic, Event as TopicEvent};
+
+    type Io = VecDeque<topic::OutEvent<u64>>;
+    type TestState = State<u64, ChaCha12Rng>;
+
+    fn state(me: u64) -> TestState {
+        State::new(me, None, Config::default(), ChaCha12Rng::seed_from_u64(me))
+    }
+
+    fn with_active(me: u64, peers: &[u64]) -> TestState {
+        let mut state = state(me);
+        for peer in peers {
+            state.active_view.insert(*peer);
+        }
+        state
+    }
+
+    fn recv(state: &mut TestState, from: u64, message: Message<u64>, io: &mut Io) {
+        state.handle(InEvent::RecvMessage(from, message), io);
+    }
+
+    fn sent(io: &Io) -> Vec<(u64, Message<u64>)> {
+        io.iter()
+            .filter_map(|event| match event {
+                topic::OutEvent::SendMessage(to, topic::Message::Swarm(message)) => {
+                    Some((*to, message.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn neighbor_ups(io: &Io) -> usize {
+        io.iter()
+            .filter(|e| matches!(e, topic::OutEvent::EmitEvent(TopicEvent::NeighborUp(_))))
+            .count()
+    }
+
+    fn disconnect(alive: bool, left: bool) -> Message<u64> {
+        Message::Disconnect(Disconnect { alive, left })
+    }
+
+    fn neighbor(priority: Priority) -> Message<u64> {
+        Message::Neighbor(Neighbor {
+            priority,
+            data: None,
+        })
+    }
+
+    fn forward_join(joiner: u64, ttl: u16) -> Message<u64> {
+        Message::ForwardJoin(ForwardJoin {
+            peer: PeerInfo {
+                id: joiner,
+                data: None,
+            },
+            ttl: Ttl(ttl),
+        })
+    }
+
+    // The answer to a Neighbor request is a Neighbor message too, but nobody answers it. If it
+    // is recorded as a pending request, the entry stays for the life of the link, and
+    // the refill rule that counts pending requests stops short of the active view capacity.
+    #[test]
+    fn a_join_handshake_leaves_no_pending_neighbor_request() {
+        let mut a = state(0);
+        let mut b = state(1);
+        let mut io = Io::new();
+        let neighbor_to = |io: &Io, peer: u64| {
+            sent(io)
+                .into_iter()
+                .find(|(to, message)| *to == peer && matches!(message, Message::Neighbor(_)))
+                .map(|(_, message)| message)
+                .expect("a Neighbor message")
+        };
+
+        // b joins a. a asks b for the link, and b answers.
+        recv(&mut a, 1, Message::Join(None), &mut io);
+        let request = neighbor_to(&io, 1);
+        io.clear();
+        recv(&mut b, 0, request, &mut io);
+        let answer = neighbor_to(&io, 0);
+        io.clear();
+        recv(&mut a, 1, answer, &mut io);
+
+        assert!(a.active_view.contains(&1) && b.active_view.contains(&0));
+        assert!(
+            a.pending_neighbor_requests.is_empty(),
+            "a: {:?}",
+            a.pending_neighbor_requests
+        );
+        assert!(
+            b.pending_neighbor_requests.is_empty(),
+            "b: {:?}",
+            b.pending_neighbor_requests
+        );
+    }
+
+    // A failed dial clears the pending request, and the next ForwardJoin asks again, so the peer
+    // gets two Neighbor requests and answers both. The first answer ends the request of the
+    // asking side; the second one finds no entry. Nobody answers an answer, so the exchange must
+    // end. When a node forgets its own answer at once, no node holds an entry that tells it that
+    // the next Neighbor is an answer, and each side answers the answer of the other for ever.
+    #[test]
+    fn two_requests_after_a_failed_dial_do_not_start_a_ping_pong() {
+        let mut carol = state(0);
+        let mut bob = state(1);
+        let rendezvous = 2;
+        let (mut carol_io, mut bob_io) = (Io::new(), Io::new());
+
+        recv(&mut bob, rendezvous, forward_join(0, 0), &mut bob_io);
+        bob.handle(InEvent::PeerDisconnected(0), &mut bob_io);
+        recv(&mut bob, rendezvous, forward_join(0, 0), &mut bob_io);
+        let requests: Vec<_> = sent(&bob_io)
+            .into_iter()
+            .filter(|(to, message)| *to == 0 && matches!(message, Message::Neighbor(_)))
+            .collect();
+        assert_eq!(requests.len(), 2, "bob asked carol twice");
+        bob_io.clear();
+
+        for (_, message) in requests {
+            recv(&mut carol, 1, message, &mut carol_io);
+        }
+        let mut crossed = 0;
+        let mut to_bob = sent(&carol_io);
+        carol_io.clear();
+        for _ in 0..200 {
+            crossed += to_bob.len();
+            for (_, message) in to_bob {
+                recv(&mut bob, 0, message, &mut bob_io);
+            }
+            let to_carol = sent(&bob_io);
+            bob_io.clear();
+            crossed += to_carol.len();
+            for (_, message) in to_carol {
+                recv(&mut carol, 1, message, &mut carol_io);
+            }
+            to_bob = sent(&carol_io);
+            carol_io.clear();
+            if to_bob.is_empty() {
+                break;
+            }
+        }
+        assert!(
+            crossed <= 4,
+            "the exchange did not stop: {crossed} Neighbor messages crossed"
+        );
+    }
+
+    // A second copy of a Neighbor request reaches a node after the link is up. Nobody answers
+    // an answer, so the exchange must end.
+    #[test]
+    fn a_late_copy_of_a_neighbor_request_does_not_start_a_ping_pong() {
+        let mut a = state(0);
+        let mut b = state(1);
+        let mut io = Io::new();
+        let neighbor_to = |io: &Io, peer: u64| {
+            sent(io)
+                .into_iter()
+                .find(|(to, message)| *to == peer && matches!(message, Message::Neighbor(_)))
+                .map(|(_, message)| message)
+                .expect("a Neighbor message")
+        };
+
+        recv(&mut a, 1, Message::Join(None), &mut io);
+        let request = neighbor_to(&io, 1);
+        io.clear();
+        recv(&mut b, 0, request.clone(), &mut io);
+        let answer = neighbor_to(&io, 0);
+        io.clear();
+        recv(&mut a, 1, answer, &mut io);
+
+        recv(&mut b, 0, request, &mut io);
+        let mut crossed = 0;
+        let mut to_a = sent(&io);
+        io.clear();
+        for _ in 0..200 {
+            crossed += to_a.len();
+            for (_, message) in to_a {
+                recv(&mut a, 1, message, &mut io);
+            }
+            let to_b = sent(&io);
+            io.clear();
+            crossed += to_b.len();
+            for (_, message) in to_b {
+                recv(&mut b, 0, message, &mut io);
+            }
+            to_a = sent(&io);
+            io.clear();
+            if to_a.is_empty() {
+                break;
+            }
+        }
+        assert!(
+            crossed <= 4,
+            "the exchange did not stop: {crossed} Neighbor messages crossed"
+        );
+    }
+
+    // A renew (a ForwardJoin for a peer that is already in the active view) sends a Neighbor
+    // that no entry tracks, so the active peer is not counted a second time as a request in
+    // flight. A peer that answered us before reads the renew as an answer and sends nothing back.
+    #[test]
+    fn a_renew_of_an_active_peer_holds_no_pending_entry_and_gets_no_answer() {
+        let mut a = state(0);
+        let mut b = state(1);
+        let rendezvous = 2;
+        let mut io = Io::new();
+        let neighbor_to = |io: &Io, peer: u64| {
+            sent(io)
+                .into_iter()
+                .find(|(to, message)| *to == peer && matches!(message, Message::Neighbor(_)))
+                .map(|(_, message)| message)
+                .expect("a Neighbor message")
+        };
+
+        a.handle(InEvent::RequestNeighbors(vec![1]), &mut io);
+        let request = neighbor_to(&io, 1);
+        io.clear();
+        recv(&mut b, 0, request, &mut io);
+        let answer = neighbor_to(&io, 0);
+        io.clear();
+        recv(&mut a, 1, answer, &mut io);
+        io.clear();
+        assert!(a.active_view.contains(&1), "a holds b after the answer");
+        assert!(a.pending_neighbor_requests.is_empty());
+
+        recv(&mut a, rendezvous, forward_join(1, 0), &mut io);
+        let renew = neighbor_to(&io, 1);
+        io.clear();
+        assert!(
+            a.pending_neighbor_requests.is_empty(),
+            "a renew must not wait in the pending set"
+        );
+        recv(&mut b, 0, renew, &mut io);
+        assert!(
+            sent(&io).is_empty(),
+            "b answered the renew: {:?}",
+            sent(&io)
+        );
+    }
+
+    // The entry that an answer left outlives the link it belongs to when our connection to the peer
+    // stays up with no Disconnect and no close, for example after the peer shed its side. Nothing
+    // else drops it then, and a genuine request of the peer would be read as an answer: it would
+    // get no Neighbor back, and the pair would be a half link.
+    #[test]
+    fn a_stale_answer_does_not_absorb_a_genuine_request_after_its_expiry() {
+        let mut a = state(0);
+        let mut io = Io::new();
+        let answered_to_one = |io: &Io| {
+            sent(io)
+                .iter()
+                .any(|(to, message)| *to == 1 && matches!(message, Message::Neighbor(_)))
+        };
+
+        recv(&mut a, 1, neighbor(Priority::High), &mut io);
+        assert!(answered_to_one(&io), "a answers the first request");
+        let expiries: Vec<_> = io
+            .iter()
+            .filter_map(|event| match event {
+                topic::OutEvent::ScheduleTimer(after, topic::Timer::Swarm(timer))
+                    if *after == NEIGHBOR_REQUEST_EXPIRY =>
+                {
+                    Some(timer.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(!expiries.is_empty(), "the answer schedules no expiry");
+        io.clear();
+
+        for timer in expiries {
+            a.handle(InEvent::TimerExpired(timer), &mut io);
+        }
+        io.clear();
+        recv(&mut a, 1, neighbor(Priority::High), &mut io);
+        assert!(
+            answered_to_one(&io),
+            "the genuine request after the expiry got no answer: {:?}",
+            sent(&io)
+        );
+    }
+
+    // Three nodes are linked to each other, and a fourth one joins through the first. Its Join
+    // starts a ForwardJoin walk, and the walk must end in a Neighbor request to the joiner from
+    // a node that is not the one it joined through. No network: every message is delivered.
+    #[test]
+    fn a_joiner_gets_a_link_to_a_peer_that_it_did_not_join_through() {
+        let (rendezvous, creator, a, joiner) = (0u64, 1u64, 2u64, 3u64);
+        let mut nodes = [
+            with_active(rendezvous, &[creator, a]),
+            with_active(creator, &[rendezvous, a]),
+            with_active(a, &[rendezvous, creator]),
+            state(joiner),
+        ];
+        let mut io = Io::new();
+        let mut queue: VecDeque<(u64, u64, Message<u64>)> = VecDeque::new();
+
+        nodes[joiner as usize].handle(InEvent::RequestJoin(rendezvous), &mut io);
+        queue.extend(
+            sent(&io)
+                .into_iter()
+                .map(|(to, message)| (joiner, to, message)),
+        );
+        io.clear();
+        let mut joiner_neighbors = 0;
+        for _ in 0..200 {
+            let Some((from, to, message)) = queue.pop_front() else {
+                break;
+            };
+            if matches!(message, Message::Neighbor(_)) && (from == joiner || to == joiner) {
+                joiner_neighbors += 1;
+            }
+            recv(&mut nodes[to as usize], from, message, &mut io);
+            queue.extend(
+                sent(&io)
+                    .into_iter()
+                    .map(|(next, message)| (to, next, message)),
+            );
+            io.clear();
+        }
+
+        let joiner_view = &nodes[joiner as usize].active_view;
+        assert!(
+            joiner_view.contains(&creator) || joiner_view.contains(&a),
+            "the joiner is linked to {:?} only, after {joiner_neighbors} Neighbor messages",
+            joiner_view.iter().collect::<Vec<_>>()
+        );
+        assert!(
+            queue.is_empty(),
+            "the exchange did not end: {} messages left",
+            queue.len()
+        );
+        // A guard against a storm, and a count that is exact on purpose. The exchange has 13 Neighbor
+        // messages that name the joiner, in this order (the walk is forced in a clique of three):
+        //  1-2   the handshake: the request of the contact node and the answer of the joiner;
+        //  3-4   two renews of the contact node (ttl 4): #3 is absorbed by the answered_neighbors
+        //        entry that #2 left, #4 is answered by the joiner (5);
+        //  5-6   the joiner's answer and the answer of the contact node to that answer (6);
+        //  7-8   two renews (ttl 1): #7 is answered by the joiner (9), #8 is absorbed;
+        //  9     the joiner's answer to #7, absorbed by the entry that #6 left at the contact node;
+        //  10-11 the Neighbor requests of the two walk ends (ttl 0) to the joiner;
+        //  12-13 the answers of the joiner.
+        // #6 is the price of the untracked renew of 709b650: a renew is not in the pending set of
+        // its sender, so the answer to it reads as a request. A change of that cost shows here as
+        // 12 or 14, and the table must be updated with it.
+        assert_eq!(
+            joiner_neighbors, 13,
+            "{joiner_neighbors} Neighbor messages named the joiner"
+        );
+    }
+
+    fn low_neighbor_requests(io: &Io) -> Vec<u64> {
+        sent(io)
+            .into_iter()
+            .filter(|(_, message)| {
+                matches!(
+                    message,
+                    Message::Neighbor(Neighbor {
+                        priority: Priority::Low,
+                        ..
+                    })
+                )
+            })
+            .map(|(to, _)| to)
+            .collect()
+    }
+
+    #[test]
+    fn request_neighbors_asks_with_low_priority_up_to_the_free_slots() {
+        // Capacity 5, three neighbors: two free slots, so two requests of ten ids.
+        let mut a = with_active(0, &[1, 2, 3]);
+        let mut io = Io::new();
+        a.handle(InEvent::RequestNeighbors((10..20).collect()), &mut io);
+
+        assert_eq!(low_neighbor_requests(&io), vec![10, 11]);
+        assert_eq!(sent(&io).len(), 2, "no Join and no other message");
+        assert!(
+            a.active_view.len() == 3,
+            "a request does not add a neighbor"
+        );
+    }
+
+    #[test]
+    fn request_neighbors_skips_neighbors_pending_requests_and_left_peers() {
+        let mut a = with_active(0, &[1]);
+        a.left.insert(2);
+        let mut io = Io::new();
+        a.handle(InEvent::RequestNeighbors(vec![1, 2, 3]), &mut io);
+        assert_eq!(low_neighbor_requests(&io), vec![3]);
+
+        // 3 is pending now: a second call does not ask again, and asks 4 within the budget.
+        io.clear();
+        a.handle(InEvent::RequestNeighbors(vec![3, 4]), &mut io);
+        assert_eq!(low_neighbor_requests(&io), vec![4]);
+    }
+
+    #[test]
+    fn request_neighbors_sends_nothing_when_the_active_view_is_full() {
+        let mut a = with_active(0, &[1, 2, 3, 4, 5]);
+        let mut io = Io::new();
+        a.handle(InEvent::RequestNeighbors(vec![10, 11]), &mut io);
+        assert!(sent(&io).is_empty());
+    }
+
+    #[test]
+    fn request_neighbors_sets_no_refill_timer() {
+        // A failed dial clears the pending request through `PeerDisconnected`, and the
+        // application asks again later. A refill timer here would also take a peer from the
+        // passive view. The only timer is the expiry of the pending entry.
+        let mut a = state(0);
+        let mut io = Io::new();
+        a.handle(InEvent::RequestNeighbors(vec![10]), &mut io);
+        assert!(!io.iter().any(|event| matches!(
+            event,
+            topic::OutEvent::ScheduleTimer(
+                _,
+                topic::Timer::Swarm(Timer::PendingNeighborRequest(_))
+            )
+        )));
+        let expiries: Vec<_> = io
+            .iter()
+            .filter_map(|event| match event {
+                topic::OutEvent::ScheduleTimer(
+                    after,
+                    topic::Timer::Swarm(Timer::NeighborRequestExpired(peer)),
+                ) => Some((*after, *peer)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(expiries, vec![(NEIGHBOR_REQUEST_EXPIRY, 10)]);
+        a.handle(InEvent::PeerDisconnected(10), &mut io);
+        assert!(a.pending_neighbor_requests.is_empty());
+    }
+
+    #[test]
+    fn an_expired_request_stops_being_pending_and_changes_nothing_else() {
+        let mut a = with_active(0, &[1]);
+        a.passive_view.insert(20);
+        let mut io = Io::new();
+        a.handle(InEvent::RequestNeighbors(vec![10]), &mut io);
+        assert!(a.pending_neighbor_requests.contains(&10));
+        io.clear();
+
+        a.handle(
+            InEvent::TimerExpired(Timer::NeighborRequestExpired(10)),
+            &mut io,
+        );
+
+        assert!(a.pending_neighbor_requests.is_empty());
+        assert!(
+            a.passive_view.contains(&20),
+            "the passive view is untouched"
+        );
+        assert!(sent(&io).is_empty(), "no refill: nothing is sent");
+        // The application can ask again.
+        a.handle(InEvent::RequestNeighbors(vec![10]), &mut io);
+        assert_eq!(low_neighbor_requests(&io), vec![10]);
+    }
+
+    #[test]
+    fn crossing_requests_link_both_sides_with_no_third_message() {
+        // a and b ask each other for a link at the same time. Each takes the request of the
+        // other as the answer to its own, so both link, and nobody sends a third message.
+        let mut a = state(0);
+        let mut b = state(1);
+        let (mut io_a, mut io_b) = (Io::new(), Io::new());
+        a.handle(InEvent::RequestNeighbors(vec![1]), &mut io_a);
+        b.handle(InEvent::RequestNeighbors(vec![0]), &mut io_b);
+        let to_b = low_neighbor_requests(&io_a);
+        let to_a = low_neighbor_requests(&io_b);
+        assert_eq!((to_b, to_a), (vec![1], vec![0]));
+        let (request_of_a, request_of_b) = (sent(&io_a).remove(0).1, sent(&io_b).remove(0).1);
+        io_a.clear();
+        io_b.clear();
+
+        recv(&mut b, 0, request_of_a, &mut io_b);
+        recv(&mut a, 1, request_of_b, &mut io_a);
+
+        assert!(a.active_view.contains(&1) && b.active_view.contains(&0));
+        assert!(
+            sent(&io_a).is_empty() && sent(&io_b).is_empty(),
+            "no third message"
+        );
+        assert!(a.pending_neighbor_requests.is_empty());
+        assert!(b.pending_neighbor_requests.is_empty());
+    }
+
+    /// Delivers what the states 0 (`a`) and 1 (`b`) send to each other, until nothing is left.
+    /// Returns the number of messages delivered, or `None` if more than `limit` rounds were needed.
+    fn settle(
+        a: &mut TestState,
+        b: &mut TestState,
+        io_a: &mut Io,
+        io_b: &mut Io,
+        limit: usize,
+    ) -> Option<usize> {
+        let mut delivered = 0;
+        for _ in 0..limit {
+            let to_b: Vec<_> = sent(io_a)
+                .into_iter()
+                .filter(|(to, _)| *to == 1)
+                .map(|(_, message)| message)
+                .collect();
+            let to_a: Vec<_> = sent(io_b)
+                .into_iter()
+                .filter(|(to, _)| *to == 0)
+                .map(|(_, message)| message)
+                .collect();
+            io_a.clear();
+            io_b.clear();
+            if to_a.is_empty() && to_b.is_empty() {
+                return Some(delivered);
+            }
+            for message in to_b {
+                delivered += 1;
+                recv(b, 0, message, io_b);
+            }
+            for message in to_a {
+                delivered += 1;
+                recv(a, 1, message, io_a);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn one_request_costs_two_messages() {
+        let mut a = state(0);
+        let mut b = state(1);
+        let (mut io_a, mut io_b) = (Io::new(), Io::new());
+        a.handle(InEvent::RequestNeighbors(vec![1]), &mut io_a);
+
+        let delivered = settle(&mut a, &mut b, &mut io_a, &mut io_b, 20);
+
+        assert_eq!(delivered, Some(2), "the request and its answer");
+        assert!(a.active_view.contains(&1) && b.active_view.contains(&0));
+    }
+
+    #[test]
+    fn crossing_requests_settle_with_at_most_one_extra_message() {
+        let mut a = state(0);
+        let mut b = state(1);
+        let (mut io_a, mut io_b) = (Io::new(), Io::new());
+        a.handle(InEvent::RequestNeighbors(vec![1]), &mut io_a);
+        b.handle(InEvent::RequestNeighbors(vec![0]), &mut io_b);
+
+        let delivered = settle(&mut a, &mut b, &mut io_a, &mut io_b, 20);
+
+        assert!(a.active_view.contains(&1) && b.active_view.contains(&0));
+        let delivered = delivered.expect("the exchange ends");
+        assert!(
+            delivered <= 3,
+            "two requests and at most one extra message: {delivered}"
+        );
+    }
+
+    #[test]
+    fn a_crossing_request_that_is_lost_still_links_both_sides() {
+        // a and b ask each other at once. The request of a never arrives (its connection was
+        // the loser of a crossing, and was closed unread). b's request does arrive, and a
+        // reads it as the answer to its own.
+        let mut a = state(0);
+        let mut b = state(1);
+        let (mut io_a, mut io_b) = (Io::new(), Io::new());
+        a.handle(InEvent::RequestNeighbors(vec![1]), &mut io_a);
+        b.handle(InEvent::RequestNeighbors(vec![0]), &mut io_b);
+        io_a.clear();
+        let request_of_b = sent(&io_b).remove(0).1;
+        io_b.clear();
+
+        recv(&mut a, 1, request_of_b, &mut io_a);
+        let delivered = settle(&mut a, &mut b, &mut io_a, &mut io_b, 20);
+        assert!(delivered.is_some(), "the exchange ends");
+        // b still waits for an answer that will not come. Its request expires, and the
+        // application asks again: a holds b and answers, and b reads that as the answer.
+        assert!(b.pending_neighbor_requests.contains(&0));
+        b.handle(
+            InEvent::TimerExpired(Timer::NeighborRequestExpired(0)),
+            &mut io_b,
+        );
+        b.handle(InEvent::RequestNeighbors(vec![0]), &mut io_b);
+        let delivered = settle(&mut a, &mut b, &mut io_a, &mut io_b, 20);
+
+        assert!(delivered.is_some(), "the exchange ends");
+        assert!(
+            a.active_view.contains(&1) && b.active_view.contains(&0),
+            "a holds b: {}, b holds a: {}",
+            a.active_view.contains(&1),
+            b.active_view.contains(&0)
+        );
+    }
+
+    #[test]
+    fn a_late_answer_to_a_request_still_links_the_pair() {
+        let mut a = state(0);
+        let mut io = Io::new();
+        a.handle(InEvent::RequestNeighbors(vec![10]), &mut io);
+        io.clear();
+        recv(&mut a, 10, neighbor(Priority::Low), &mut io);
+        assert!(a.active_view.contains(&10));
+        assert_eq!(neighbor_ups(&io), 1);
+        assert!(a.pending_neighbor_requests.is_empty());
+    }
+
+    #[test]
+    fn a_refused_request_keeps_the_peer_in_the_passive_view() {
+        let mut a = state(0);
+        a.passive_view.insert(10);
+        let mut io = Io::new();
+        a.handle(InEvent::RequestNeighbors(vec![10]), &mut io);
+        recv(&mut a, 10, disconnect(true, false), &mut io);
+        assert!(a.active_view.is_empty());
+        assert!(a.pending_neighbor_requests.is_empty());
+        assert!(a.passive_view.contains(&10));
+    }
+
+    #[test]
+    fn disconnect_wire_format_is_unchanged() {
+        let bytes = |alive, left| postcard::to_stdvec(&Disconnect { alive, left }).unwrap();
+        assert_eq!(bytes(true, false), [1, 0]);
+        assert_eq!(bytes(false, true), [0, 1]);
+    }
+
+    #[test]
+    fn leave_tombstones_a_peer_that_is_only_in_the_passive_view() {
+        let mut a = state(0);
+        a.passive_view.insert(1);
+        let mut io = Io::new();
+        a.handle(InEvent::Leave(vec![1]), &mut io);
+        assert!(a.left.contains(&1));
+        assert!(!a.passive_view.contains(&1));
+        assert!(sent(&io).is_empty());
+    }
+
+    #[test]
+    fn leave_sends_a_left_disconnect_and_keeps_other_neighbors() {
+        let mut a = with_active(0, &[1, 2]);
+        let mut io = Io::new();
+        a.handle(InEvent::Leave(vec![1]), &mut io);
+        assert!(sent(&io).contains(&(1, disconnect(false, true))));
+        assert!(a.active_view.contains(&2));
+        assert!(!a.active_view.contains(&1));
+    }
+
+    #[test]
+    fn neighbor_request_from_a_left_peer_is_refused_even_with_high_priority() {
+        let mut a = state(0);
+        a.passive_view.insert(1);
+        let mut io = Io::new();
+        a.handle(InEvent::Leave(vec![1]), &mut io);
+        io.clear();
+        recv(&mut a, 1, neighbor(Priority::High), &mut io);
+        assert!(!a.active_view.contains(&1));
+        assert!(sent(&io).contains(&(1, disconnect(false, true))));
+        assert_eq!(neighbor_ups(&io), 0);
+    }
+
+    #[test]
+    fn received_left_disconnect_tombstones_and_forgets_the_peer() {
+        let mut b = with_active(1, &[0, 2]);
+        b.passive_view.insert(3);
+        b.peer_data.insert(0, PeerData::new(vec![1]));
+        let mut io = Io::new();
+        recv(&mut b, 0, disconnect(false, true), &mut io);
+        assert!(b.left.contains(&0));
+        assert!(!b.active_view.contains(&0));
+        assert!(!b.passive_view.contains(&0));
+        assert!(!b.peer_data.contains_key(&0));
+    }
+
+    #[test]
+    fn refused_high_priority_neighbor_is_healed_by_a_join_in_one_flow() {
+        let mut a = with_active(0, &[1]);
+        let mut io = Io::new();
+        a.handle(InEvent::Leave(vec![1]), &mut io);
+        io.clear();
+
+        // The peer asks for a link with high priority, as an isolated node does.
+        recv(&mut a, 1, neighbor(Priority::High), &mut io);
+        assert!(a.active_view.is_empty());
+        assert!(sent(&io).contains(&(1, disconnect(false, true))));
+
+        // The same peer sends a Join. The link comes back and a Neighbor works again.
+        recv(&mut a, 1, Message::Join(None), &mut io);
+        assert!(a.active_view.contains(&1));
+        assert!(a.left.is_empty());
+    }
+
+    #[test]
+    fn plain_disconnect_does_not_tombstone() {
+        let mut b = with_active(1, &[0]);
+        let mut io = Io::new();
+        recv(&mut b, 0, disconnect(false, false), &mut io);
+        assert!(b.left.is_empty());
+        recv(&mut b, 0, neighbor(Priority::High), &mut io);
+        assert!(b.active_view.contains(&0));
+    }
+
+    #[test]
+    fn shuffle_reply_naming_a_left_peer_adds_neither_view_nor_peer_data() {
+        let mut b = with_active(1, &[2]);
+        let mut io = Io::new();
+        recv(&mut b, 2, disconnect(false, true), &mut io);
+        recv(&mut b, 3, disconnect(false, true), &mut io);
+        let reply = Message::ShuffleReply(ShuffleReply {
+            nodes: vec![
+                PeerInfo {
+                    id: 2,
+                    data: Some(PeerData::new(vec![1, 2, 3])),
+                },
+                PeerInfo { id: 4, data: None },
+            ],
+        });
+        recv(&mut b, 5, reply, &mut io);
+        assert!(!b.passive_view.contains(&2));
+        assert!(!b.peer_data.contains_key(&2));
+        assert!(b.passive_view.contains(&4));
+    }
+
+    fn forward_joins_of(io: &Io, joiner: u64) -> Vec<u64> {
+        sent(io)
+            .into_iter()
+            .filter_map(|(to, message)| match message {
+                Message::ForwardJoin(forward) if forward.peer.id == joiner => Some(to),
+                _ => None,
+            })
+            .collect()
+    }
+
+    // A joiner that waits for a slow link sends its `Join` again and again, and the copies arrive
+    // together. The walk of a `Join` puts the joiner into the views of the swarm. The first
+    // `Join` ran it, so a copy that finds the joiner active answers the joiner and starts no walk.
+    #[test]
+    fn a_repeated_join_of_an_active_peer_starts_no_forward_join() {
+        let mut contact = with_active(0, &[2, 3]);
+        let mut io = Io::new();
+
+        recv(&mut contact, 1, Message::Join(None), &mut io);
+        let mut first = forward_joins_of(&io, 1);
+        first.sort_unstable();
+        assert_eq!(
+            first,
+            vec![2, 3],
+            "the first Join starts a walk to each other neighbor"
+        );
+        io.clear();
+
+        recv(&mut contact, 1, Message::Join(None), &mut io);
+        assert!(
+            forward_joins_of(&io, 1).is_empty(),
+            "a repeated Join starts no walk: {:?}",
+            sent(&io)
+        );
+        assert!(contact.active_view.contains(&1));
+    }
+
+    // The rule above must not hide the walk of a joiner that came back: once the connection of the
+    // peer was lost, the peer is not active, and its next `Join` is a first `Join` again.
+    #[test]
+    fn a_join_of_a_peer_that_was_dropped_starts_a_walk() {
+        let mut contact = with_active(0, &[2, 3]);
+        let mut io = Io::new();
+        recv(&mut contact, 1, Message::Join(None), &mut io);
+        io.clear();
+
+        contact.handle(InEvent::PeerDisconnected(1), &mut io);
+        assert!(!contact.active_view.contains(&1));
+        io.clear();
+
+        recv(&mut contact, 1, Message::Join(None), &mut io);
+        let mut again = forward_joins_of(&io, 1);
+        again.sort_unstable();
+        assert_eq!(again, vec![2, 3], "a Join after the drop starts a walk");
+    }
+
+    #[test]
+    fn forward_join_for_a_left_joiner_is_passed_on_while_the_ttl_lasts() {
+        let mut b = with_active(1, &[2, 3]);
+        let mut io = Io::new();
+        recv(&mut b, 0, disconnect(false, true), &mut io);
+        io.clear();
+        recv(&mut b, 2, forward_join(0, 3), &mut io);
+        // No Neighbor to the joiner, and the walk goes on to the other neighbor.
+        assert_eq!(sent(&io), vec![(3, forward_join(0, 2))]);
+
+        // At ttl 0 the walk ends here.
+        io.clear();
+        recv(&mut b, 2, forward_join(0, 0), &mut io);
+        assert!(sent(&io).is_empty());
+        assert!(!b.pending_neighbor_requests.contains(&0));
+    }
+
+    /// Three nodes, each with the other two active, all holding the tombstone of the joiner.
+    #[test]
+    fn forward_join_walk_ends_when_every_node_holds_the_tombstone() {
+        let mut nodes: Vec<TestState> = (1..=3)
+            .map(|me| {
+                let others: Vec<u64> = (1..=3).filter(|p| *p != me).collect();
+                let mut node = with_active(me, &others);
+                node.left.insert(9);
+                node
+            })
+            .collect();
+        let mut in_flight = vec![(1u64, 2u64, forward_join(9, 6))];
+        let mut sends = 0;
+        while let Some((from, to, message)) = in_flight.pop() {
+            sends += 1;
+            assert!(sends <= 20, "the walk does not end");
+            let mut io = Io::new();
+            recv(&mut nodes[to as usize - 1], from, message, &mut io);
+            for (next, message) in sent(&io) {
+                in_flight.push((to, next, message));
+            }
+        }
+        assert!(sends <= 7, "one send per ttl step at most, got {sends}");
+    }
+
+    #[test]
+    fn forward_join_for_a_left_joiner_is_dropped_without_another_neighbor() {
+        let mut b = with_active(1, &[2]);
+        let mut io = Io::new();
+        recv(&mut b, 0, disconnect(false, true), &mut io);
+        io.clear();
+        recv(&mut b, 2, forward_join(0, 0), &mut io);
+        assert!(sent(&io).is_empty());
+        assert!(!b.pending_neighbor_requests.contains(&0));
+    }
+
+    #[test]
+    fn join_from_either_side_clears_the_tombstone() {
+        // The leaver rejoins.
+        let mut b = with_active(1, &[0]);
+        let mut io = Io::new();
+        recv(&mut b, 0, disconnect(false, true), &mut io);
+        assert!(b.left.contains(&0));
+        recv(&mut b, 0, Message::Join(None), &mut io);
+        assert!(b.left.is_empty());
+        assert!(b.active_view.contains(&0));
+
+        // The side that left asks for the link again.
+        let mut a = with_active(0, &[1]);
+        a.handle(InEvent::Leave(vec![1]), &mut io);
+        assert!(a.left.contains(&1));
+        io.clear();
+        a.handle(InEvent::RequestJoin(1), &mut io);
+        assert!(a.left.is_empty());
+        assert!(sent(&io)
+            .iter()
+            .any(|(to, m)| *to == 1 && matches!(m, Message::Join(_))));
+    }
+
+    #[test]
+    fn tombstones_are_bounded_and_the_oldest_goes_first() {
+        let config = Config {
+            passive_view_capacity: 2,
+            ..Default::default()
+        };
+        let mut a = State::new(0u64, None, config, ChaCha12Rng::seed_from_u64(0));
+        let mut io = Io::new();
+        a.handle(InEvent::Leave((1..=20).collect()), &mut io);
+        assert_eq!(a.left.len(), 16);
+        assert!(!a.left.contains(&1));
+        assert!(a.left.contains(&20));
+    }
+
+    /// A `Neighbor` from B is already on its way when A leaves B.
+    #[test]
+    fn crossing_neighbor_and_leave_end_with_tombstones_on_both_sides() {
+        let mut a = with_active(0, &[1]);
+        let mut b = state(1);
+        b.passive_view.insert(0);
+        let (mut a_io, mut b_io) = (Io::new(), Io::new());
+
+        b.refill_active_from_passive(&[], &mut b_io);
+        let b_to_a = sent(&b_io);
+        assert!(matches!(b_to_a.as_slice(), [(0, Message::Neighbor(_))]));
+        b_io.clear();
+
+        a.handle(InEvent::Leave(vec![1]), &mut a_io);
+        let a_to_b_leave = sent(&a_io);
+        a_io.clear();
+
+        for (_, message) in b_to_a {
+            recv(&mut a, 1, message, &mut a_io);
+        }
+        let a_to_b_refusal = sent(&a_io);
+
+        for (_, message) in a_to_b_leave.into_iter().chain(a_to_b_refusal) {
+            recv(&mut b, 0, message, &mut b_io);
+        }
+
+        assert!(a.left.contains(&1) && b.left.contains(&0));
+        assert!(a.active_view.is_empty() && b.active_view.is_empty());
+        assert_eq!(neighbor_ups(&a_io) + neighbor_ups(&b_io), 0);
+        assert!(sent(&b_io)
+            .iter()
+            .all(|(_, m)| !matches!(m, Message::Neighbor(_))));
+    }
 }

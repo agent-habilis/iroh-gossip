@@ -194,6 +194,31 @@ impl GossipSender {
         Ok(())
     }
 
+    /// Drops the connections to a set of neighbors, without leaving the topic.
+    ///
+    /// Each named peer that is a neighbor learns that we left on purpose, so it does not dial
+    /// us back to refill its neighbors. Other neighbors are not touched.
+    ///
+    /// After a leave, only [`join_peers`](Self::join_peers) from either side links the pair
+    /// again. Do not close the connection yourself: gossip closes it after the peer got the
+    /// notice, and an early close makes the peer see a lost connection instead.
+    pub async fn leave_peers(&self, peers: Vec<EndpointId>) -> Result<(), ApiError> {
+        self.send(Command::LeavePeers(peers)).await?;
+        Ok(())
+    }
+
+    /// Asks a set of peers for a link, without taking a slot from a peer that has none.
+    ///
+    /// [`join_peers`](Self::join_peers) is always accepted, and a peer with a full active view
+    /// drops a random neighbor to make room. This request has low priority: a peer with a full
+    /// active view refuses it and keeps its neighbors. At most as many requests go out as this
+    /// node has free slots in its active view. Use it to fill the view; use
+    /// [`join_peers`](Self::join_peers) to enter a swarm or to link a peer on purpose.
+    pub async fn neighbor_peers(&self, peers: Vec<EndpointId>) -> Result<(), ApiError> {
+        self.send(Command::NeighborPeers(peers)).await?;
+        Ok(())
+    }
+
     async fn send(&self, command: Command) -> Result<(), irpc::channel::SendError> {
         self.0.send(command).await?;
         Ok(())
@@ -380,6 +405,10 @@ pub enum Command {
     BroadcastNeighbors(#[debug("Bytes({})", _0.len())] Bytes),
     /// Connects to a set of peers.
     JoinPeers(Vec<EndpointId>),
+    /// Drops the connections to a set of neighbors, without leaving the topic.
+    LeavePeers(Vec<EndpointId>),
+    /// Asks a set of peers for a link with low priority.
+    NeighborPeers(Vec<EndpointId>),
 }
 
 /// Options for joining a gossip topic.
