@@ -567,14 +567,11 @@ impl Actor {
                 }
             }
             Entry::Vacant(entry) => {
-                entry.insert(PeerState::Active {
-                    active_send_tx: send_tx,
-                    active_conn_id: conn_id,
-                    other_conns: Vec::new(),
-                    active_conn: Some(conn.clone()),
-                    refused_since: None,
-                    active_rx: rx_clock.clone(),
-                });
+                entry.insert(PeerState::active(ConnEntry::new(
+                    send_tx,
+                    conn.clone(),
+                    rx_clock.clone(),
+                )));
                 Vec::new()
             }
         };
@@ -618,12 +615,12 @@ impl Actor {
         let error = task_result.err();
         debug!(%reason, ?error, "connection closed");
         if let Some(PeerState::Active {
-            active_conn_id,
+            chosen,
             other_conns,
             ..
         }) = self.peers.get_mut(&peer_id)
         {
-            if conn.stable_id() == *active_conn_id {
+            if conn.stable_id() == chosen.id {
                 debug!("active send connection closed, mark peer as disconnected");
                 // Remove the entry here rather than wait for `DisconnectPeer`:
                 // a connection that dies before the gossip handshake never made
@@ -735,7 +732,9 @@ impl Actor {
                 );
             }
             if let Some(PeerState::Active {
-                active_conn: Some(conn),
+                chosen: ConnEntry {
+                    conn: Some(conn), ..
+                },
                 ..
             }) = self.peers.remove(&peer_id)
             {
@@ -785,10 +784,10 @@ impl Actor {
                     let state = self.peers.entry(peer_id).or_default();
                     match state {
                         PeerState::Active {
-                            active_send_tx,
+                            chosen,
                             refused_since,
                             ..
-                        } => match active_send_tx.try_send(message) {
+                        } => match chosen.send_tx.try_send(message) {
                             Ok(()) => *refused_since = None,
                             Err(mpsc::error::TrySendError::Full(message)) => {
                                 let since = *refused_since.get_or_insert_with(Instant::now);
@@ -893,22 +892,42 @@ impl Actor {
 
 type ConnId = usize;
 
+/// One connection to a peer, as the actor tracks it.
+#[derive(Debug)]
+struct ConnEntry {
+    id: ConnId,
+    send_tx: mpsc::Sender<ProtoMessage>,
+    /// The connection, to close it when we disconnect a peer whose queue is stuck, and to tell who
+    /// dialed it. `None` only in tests that have no connection.
+    conn: Option<Connection>,
+    /// When the connection last received a datagram, as far as its task sampled.
+    rx: RxClock,
+}
+
+impl ConnEntry {
+    fn new(send_tx: mpsc::Sender<ProtoMessage>, conn: Connection, rx: RxClock) -> Self {
+        Self {
+            id: conn.stable_id(),
+            send_tx,
+            conn: Some(conn),
+            rx,
+        }
+    }
+}
+
 #[derive(Debug)]
 enum PeerState {
     Pending {
         queue: Vec<ProtoMessage>,
     },
     Active {
-        active_send_tx: mpsc::Sender<ProtoMessage>,
-        active_conn_id: ConnId,
+        /// The connection that sends go to.
+        chosen: ConnEntry,
+        /// Connections that were replaced by a newer one: their senders are dropped and they are
+        /// read until they close.
         other_conns: Vec<ConnId>,
-        /// The active connection, to close it when we disconnect a peer whose queue is stuck.
-        /// `None` only in tests that have no connection.
-        active_conn: Option<Connection>,
         /// Since when the send queue refuses messages, with none accepted in between.
         refused_since: Option<Instant>,
-        /// When the active connection last received a datagram, as far as its task sampled.
-        active_rx: RxClock,
     },
 }
 
@@ -1012,8 +1031,12 @@ impl PeerState {
     /// connection when the active one received nothing for [`LIVENESS_BOUND`].
     fn loses_crossing(&self, local: EndpointId, peer: EndpointId, new: &Connection) -> bool {
         let PeerState::Active {
-            active_conn: Some(active),
-            active_rx,
+            chosen:
+                ConnEntry {
+                    conn: Some(active),
+                    rx,
+                    ..
+                },
             ..
         } = self
         else {
@@ -1022,14 +1045,23 @@ impl PeerState {
         crossing_loser(
             dialed_by_lower_id(local, peer, active.side().is_client()),
             dialed_by_lower_id(local, peer, new.side().is_client()),
-            active_rx.age(),
+            rx.age(),
         )
     }
 
     fn active_conn_id(&self) -> Option<ConnId> {
         match self {
-            PeerState::Active { active_conn_id, .. } => Some(*active_conn_id),
+            PeerState::Active { chosen, .. } => Some(chosen.id),
             PeerState::Pending { .. } => None,
+        }
+    }
+
+    /// A peer with one connection, which sends go to.
+    fn active(chosen: ConnEntry) -> Self {
+        PeerState::Active {
+            chosen,
+            other_conns: Vec::new(),
+            refused_since: None,
         }
     }
 
@@ -1039,27 +1071,17 @@ impl PeerState {
         conn: Connection,
         rx_clock: RxClock,
     ) -> Vec<ProtoMessage> {
-        let conn_id = conn.stable_id();
+        let entry = ConnEntry::new(send_tx, conn, rx_clock);
         match self {
             PeerState::Pending { queue } => {
                 let queue = std::mem::take(queue);
-                *self = PeerState::Active {
-                    active_send_tx: send_tx,
-                    active_conn_id: conn_id,
-                    other_conns: Vec::new(),
-                    active_conn: Some(conn),
-                    refused_since: None,
-                    active_rx: rx_clock,
-                };
+                *self = PeerState::active(entry);
                 queue
             }
             PeerState::Active {
-                active_send_tx,
-                active_conn_id,
+                chosen,
                 other_conns,
-                active_conn,
                 refused_since,
-                active_rx,
             } => {
                 // We already have an active connection, and `loses_crossing` did not close the
                 // new one. We keep the old connection intact, but only use the new connection for
@@ -1071,12 +1093,9 @@ impl PeerState {
                 // going away. It is wrong for a crossing, where both sides dial at once and each
                 // would keep the connection that the other closes: that case is decided before
                 // this point.
-                other_conns.push(*active_conn_id);
-                *active_send_tx = send_tx;
-                *active_conn_id = conn_id;
-                *active_conn = Some(conn);
+                other_conns.push(chosen.id);
+                *chosen = entry;
                 *refused_since = None;
-                *active_rx = rx_clock;
                 Vec::new()
             }
         }
@@ -2652,14 +2671,12 @@ pub(crate) mod tests {
                 let (tx, rx) = mpsc::channel(SEND_QUEUE_CAP);
                 actor.peers.insert(
                     id,
-                    PeerState::Active {
-                        active_send_tx: tx.clone(),
-                        active_conn_id: conn_id,
-                        other_conns: Vec::new(),
-                        active_conn: None,
-                        refused_since: None,
-                        active_rx: RxClock::new(),
-                    },
+                    PeerState::active(ConnEntry {
+                        id: conn_id,
+                        send_tx: tx.clone(),
+                        conn: None,
+                        rx: RxClock::new(),
+                    }),
                 );
                 peers.push(FakePeer { id, tx, rx });
             }
