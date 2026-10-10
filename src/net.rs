@@ -1,7 +1,7 @@
 //! Networking for the `iroh-gossip` protocol
 
 use std::{
-    collections::{hash_map::Entry, BTreeSet, HashMap, HashSet, VecDeque},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     net::SocketAddr,
     pin::Pin,
     sync::{Arc, Mutex},
@@ -30,6 +30,7 @@ use tracing::{debug, error, error_span, trace, warn, Instrument};
 
 use self::{
     address_lookup::GossipAddressLookup,
+    conns::{Action, Conn, ConnSet},
     util::{RecvLoop, SendLoop, Timers},
 };
 use crate::{
@@ -39,6 +40,7 @@ use crate::{
 };
 
 mod address_lookup;
+mod conns;
 mod util;
 
 /// ALPN protocol name
@@ -299,6 +301,14 @@ struct Actor {
     in_event_tx: mpsc::Sender<InEvent>,
     /// Input events to the state (emitted from the connection loops)
     in_event_rx: mpsc::Receiver<InEvent>,
+    /// Sender for the first message that a connection read from its peer (cloned into the
+    /// connection loops).
+    carried_tx: mpsc::Sender<(EndpointId, ConnId)>,
+    /// See [`Actor::carried_tx`].
+    carried_rx: mpsc::Receiver<(EndpointId, ConnId)>,
+    /// When the connections of the peers are looked at next, for the ones that are parked too long
+    /// or went silent. See [`conns::PARK`].
+    next_conns_check: Instant,
     /// Queued timers
     timers: Timers<Timer>,
     /// Map of topics to their state.
@@ -344,6 +354,7 @@ impl Actor {
         let (rpc_tx, rpc_rx) = mpsc::channel(TO_ACTOR_CAP);
         let (local_tx, local_rx) = mpsc::channel(16);
         let (in_event_tx, in_event_rx) = mpsc::channel(IN_EVENT_CAP);
+        let (carried_tx, carried_rx) = mpsc::channel(IN_EVENT_CAP);
 
         let actor = Actor {
             alpn: alpn.unwrap_or_else(|| GOSSIP_ALPN.to_vec().into()),
@@ -353,6 +364,9 @@ impl Actor {
             rpc_rx,
             in_event_rx,
             in_event_tx,
+            carried_tx,
+            carried_rx,
+            next_conns_check: Instant::now() + CONNS_CHECK_INTERVAL,
             timers: Timers::new(),
             command_rx: StreamGroup::new().keyed(),
             peers: Default::default(),
@@ -471,6 +485,7 @@ impl Actor {
                 trace!(?i, "tick: in_event_rx");
                 self.metrics.actor_tick_in_event_rx.inc();
                 let event = event.expect("unreachable: in_event_tx is never dropped before receiver");
+                self.drain_carried();
                 self.handle_in_event(event, Instant::now()).await;
             }
             _ = self.timers.wait_next() => {
@@ -485,6 +500,12 @@ impl Actor {
                 trace!(?i, "tick: connection_tasks");
                 let (peer_id, conn, result) = res.expect("connection task panicked");
                 self.handle_connection_task_finished(peer_id, conn, result).await;
+            }
+            _ = n0_future::time::sleep(self.next_conns_check.saturating_duration_since(Instant::now())) => {
+                let now = Instant::now();
+                self.next_conns_check = now + CONNS_CHECK_INTERVAL;
+                self.drain_carried();
+                self.check_conns(now);
             }
             Some(res) = self.topic_event_forwarders.join_next(), if !self.topic_event_forwarders.is_empty() => {
                 let topic_id = res.expect("topic event forwarder panicked");
@@ -545,39 +566,32 @@ impl Actor {
 
     fn handle_connection(&mut self, peer_id: EndpointId, origin: ConnOrigin, conn: Connection) {
         let (send_tx, send_rx) = mpsc::channel(SEND_QUEUE_CAP);
-        let conn_id = conn.stable_id();
-
-        let local_id = self.endpoint.id();
         let rx_clock = RxClock::new();
-        let queue = match self.peers.entry(peer_id) {
-            Entry::Occupied(mut entry) => {
-                if entry.get().loses_crossing(local_id, peer_id, &conn) {
-                    debug!(active = ?entry.get().active_conn_id(), new = conn_id, "crossing: the active connection was dialed by the lower endpoint id, the new one only reads");
-                    // The loser keeps no state and gets no sender, so its send loop ends at
-                    // once. Its read loop runs for `DRAIN` more, and then the connection is
-                    // closed. Closing it now would drop what the peer already sent on it, and a
-                    // `Neighbor` request among that is lost: the peer waits for an answer that
-                    // never comes.
-                    drop(send_tx);
-                    Vec::new()
-                } else {
-                    entry
-                        .get_mut()
-                        .accept_conn(send_tx, conn.clone(), rx_clock.clone())
-                }
-            }
-            Entry::Vacant(entry) => {
-                entry.insert(PeerState::active(ConnEntry::new(
-                    send_tx,
-                    conn.clone(),
-                    rx_clock.clone(),
-                )));
-                Vec::new()
-            }
-        };
+        let dialed_by_lower =
+            dialed_by_lower_id(self.endpoint.id(), peer_id, conn.side().is_client());
+        let entry = Conn::new(
+            conn.stable_id(),
+            ConnHandle {
+                send_tx: Some(send_tx),
+                conn: Some(conn.clone()),
+            },
+            dialed_by_lower,
+            rx_clock.clone(),
+        );
+        // A connection that is not chosen gets a sender too and keeps reading: the peer may send
+        // on it. See [`conns`].
+        let (queue, actions) = self
+            .peers
+            .entry(peer_id)
+            .or_default()
+            .admit(entry, Instant::now());
+        self.apply_actions(peer_id, actions);
 
         let max_message_size = self.state.max_message_size();
-        let in_event_tx = self.in_event_tx.clone();
+        let link = ActorLink {
+            in_event_tx: self.in_event_tx.clone(),
+            carried_tx: self.carried_tx.clone(),
+        };
 
         // Spawn a task for this connection
         self.connection_tasks.spawn(
@@ -589,7 +603,7 @@ impl Actor {
                         conn.clone(),
                         origin,
                         send_rx,
-                        in_event_tx,
+                        link,
                         max_message_size,
                         queue,
                     ) => res,
@@ -599,6 +613,70 @@ impl Actor {
             }
             .instrument(error_span!("conn", peer = %peer_id.fmt_short())),
         );
+    }
+
+    /// Does what the set of connections of a peer asks for after a change.
+    fn apply_actions(&mut self, peer_id: EndpointId, actions: Vec<Action>) {
+        let Some(PeerState::Active {
+            conns,
+            refused_since,
+        }) = self.peers.get_mut(&peer_id)
+        else {
+            return;
+        };
+        for action in actions {
+            match action {
+                Action::Choose(conn_id) => {
+                    debug!(conn_id, "send on this connection from now on");
+                    *refused_since = None;
+                }
+                Action::StopSending(conn_id) => {
+                    debug!(
+                        conn_id,
+                        "stop sending on this connection: it drains and closes"
+                    );
+                    if let Some(conn) = conns.get_mut(conn_id) {
+                        conn.handle.send_tx = None;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Takes in what the connections carried. A reader sends this signal before it sends the
+    /// message, so a message that arrives finds its connection already chosen, or its answer goes to
+    /// the one that the peer left. The signal has no select arm of its own: an arm would be one more
+    /// step of the event loop, and the tests that drive the loop by hand count steps.
+    fn drain_carried(&mut self) {
+        while let Ok((peer_id, conn_id)) = self.carried_rx.try_recv() {
+            self.handle_carried(peer_id, conn_id);
+        }
+    }
+
+    /// A message of the peer was read on a connection.
+    fn handle_carried(&mut self, peer_id: EndpointId, conn_id: ConnId) {
+        let Some(PeerState::Active { conns, .. }) = self.peers.get_mut(&peer_id) else {
+            return;
+        };
+        let actions = conns.carried(conn_id, Instant::now());
+        self.apply_actions(peer_id, actions);
+    }
+
+    /// Looks at the connections of every peer: one can have gone silent, or have been parked for
+    /// too long.
+    fn check_conns(&mut self, now: Instant) {
+        let mut changes = Vec::new();
+        for (peer_id, state) in &mut self.peers {
+            if let PeerState::Active { conns, .. } = state {
+                let actions = conns.tick(now);
+                if !actions.is_empty() {
+                    changes.push((*peer_id, actions));
+                }
+            }
+        }
+        for (peer_id, actions) in changes {
+            self.apply_actions(peer_id, actions);
+        }
     }
 
     #[tracing::instrument(name = "conn", skip_all, fields(peer = %peer_id.fmt_short()))]
@@ -614,14 +692,14 @@ impl Actor {
         let reason = conn.close_reason().expect("just closed");
         let error = task_result.err();
         debug!(%reason, ?error, "connection closed");
-        if let Some(PeerState::Active {
-            chosen,
-            other_conns,
-            ..
-        }) = self.peers.get_mut(&peer_id)
-        {
-            if conn.stable_id() == chosen.id {
-                debug!("active send connection closed, mark peer as disconnected");
+        if let Some(PeerState::Active { conns, .. }) = self.peers.get_mut(&peer_id) {
+            let conn_id = conn.stable_id();
+            let (actions, none_left) = conns.closed(conn_id, Instant::now());
+            if none_left {
+                debug!(
+                    conn_id,
+                    "last connection to send on closed, mark peer as disconnected"
+                );
                 // Remove the entry here rather than wait for `DisconnectPeer`:
                 // a connection that dies before the gossip handshake never made
                 // the peer a proto neighbor, so the proto never asks to
@@ -631,22 +709,10 @@ impl Actor {
                 self.handle_in_event(InEvent::PeerDisconnected(peer_id), Instant::now())
                     .await;
             } else {
-                let conn_id = conn.stable_id();
-                let was_replaced = other_conns.contains(&conn_id);
-                other_conns.retain(|x| *x != conn_id);
-                if was_replaced {
-                    debug!(
-                        conn_id,
-                        "replaced connection closed, {} others left",
-                        other_conns.len() + 1
-                    );
-                } else {
-                    // Never active: it lost a crossing, was read for `DRAIN`, and is closed now.
-                    debug!(
-                        conn_id,
-                        "connection that lost a crossing closed after its drain"
-                    );
-                }
+                // Another connection takes over, or this one was not the one sends went to. The
+                // protocol is told nothing: it sees one peer.
+                debug!(conn_id, "connection closed, others left");
+                self.apply_actions(peer_id, actions);
             }
         } else {
             debug!("peer already marked as disconnected");
@@ -731,14 +797,15 @@ impl Actor {
                     "disconnect: the send queue of the peer refused a message for too long, or one that must not be dropped",
                 );
             }
-            if let Some(PeerState::Active {
-                chosen: ConnEntry {
-                    conn: Some(conn), ..
-                },
-                ..
-            }) = self.peers.remove(&peer_id)
-            {
-                conn.close(0u32.into(), b"send queue refused");
+            if let Some(PeerState::Active { mut conns, .. }) = self.peers.remove(&peer_id) {
+                let chosen = conns.chosen().map(|conn| conn.id);
+                for conn in conns.drain_all() {
+                    if Some(conn.id) == chosen {
+                        if let Some(conn) = conn.handle.conn {
+                            conn.close(0u32.into(), b"send queue refused");
+                        }
+                    }
+                }
             }
             self.handle_in_event_inner(InEvent::PeerDisconnected(peer_id), Instant::now())
                 .await;
@@ -784,10 +851,9 @@ impl Actor {
                     let state = self.peers.entry(peer_id).or_default();
                     match state {
                         PeerState::Active {
-                            chosen,
+                            conns,
                             refused_since,
-                            ..
-                        } => match chosen.send_tx.try_send(message) {
+                        } => match send_on_chosen(conns, message) {
                             Ok(()) => *refused_since = None,
                             Err(mpsc::error::TrySendError::Full(message)) => {
                                 let since = *refused_since.get_or_insert_with(Instant::now);
@@ -892,27 +958,14 @@ impl Actor {
 
 type ConnId = usize;
 
-/// One connection to a peer, as the actor tracks it.
+/// What the actor keeps of one connection besides its standing in the [`ConnSet`].
 #[derive(Debug)]
-struct ConnEntry {
-    id: ConnId,
-    send_tx: mpsc::Sender<ProtoMessage>,
-    /// The connection, to close it when we disconnect a peer whose queue is stuck, and to tell who
-    /// dialed it. `None` only in tests that have no connection.
+struct ConnHandle {
+    /// `None` once the connection was stopped: its send loop ends, and it drains and closes.
+    send_tx: Option<mpsc::Sender<ProtoMessage>>,
+    /// To close it when we disconnect a peer whose queue is stuck. `None` only in tests that have
+    /// no connection.
     conn: Option<Connection>,
-    /// When the connection last received a datagram, as far as its task sampled.
-    rx: RxClock,
-}
-
-impl ConnEntry {
-    fn new(send_tx: mpsc::Sender<ProtoMessage>, conn: Connection, rx: RxClock) -> Self {
-        Self {
-            id: conn.stable_id(),
-            send_tx,
-            conn: Some(conn),
-            rx,
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -921,31 +974,48 @@ enum PeerState {
         queue: Vec<ProtoMessage>,
     },
     Active {
-        /// The connection that sends go to.
-        chosen: ConnEntry,
-        /// Connections that were replaced by a newer one: their senders are dropped and they are
-        /// read until they close.
-        other_conns: Vec<ConnId>,
+        /// The connections to the peer: the one that sends go to, and the ones that are parked.
+        conns: ConnSet<ConnHandle>,
         /// Since when the send queue refuses messages, with none accepted in between.
         refused_since: Option<Instant>,
     },
 }
 
-/// How long the active connection can receive nothing and still be taken as alive, when a second
-/// connection arrives. An alive active connection means the second one is the other half of a
-/// crossing: the peer dialed at the same time, and a gate on either side can hold a dial for
-/// longer than any fixed time since the connection became active. An active connection that
-/// received nothing for this long is dead: it is a re-dial after a break that this side has not
-/// seen yet (the peer restarted), and the rule must keep the new connection.
+/// How often the connections of the peers are looked at.
+const CONNS_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Sends `message` on the chosen connection of a peer.
+fn send_on_chosen(
+    conns: &ConnSet<ConnHandle>,
+    message: ProtoMessage,
+) -> Result<(), mpsc::error::TrySendError<ProtoMessage>> {
+    match conns.chosen().and_then(|conn| conn.handle.send_tx.as_ref()) {
+        Some(send_tx) => send_tx.try_send(message),
+        None => Err(mpsc::error::TrySendError::Closed(message)),
+    }
+}
+
+/// What a connection loop uses to talk to the actor.
+struct ActorLink {
+    in_event_tx: mpsc::Sender<InEvent>,
+    /// Gets the id of the connection when it reads the first message of the peer.
+    carried_tx: mpsc::Sender<(EndpointId, ConnId)>,
+}
+
+/// How long a connection can receive nothing and still be taken as alive. A live connection ranks
+/// before a dead one in the choice of the connection that sends go to (see [`conns`]): a
+/// connection that went silent for this long is a connection of a peer that restarted or lost the
+/// path, and a new one from the same peer must win at once. A connection that a gate holds is
+/// alive at the QUIC level: the peer sends keep-alives on it.
 ///
 /// The value is two keep-alive intervals of iroh (5 s each): a live path of an idle connection
 /// receives one ping per interval, so a live connection always changes its count within it. The
 /// bound cannot be read from iroh, which keeps its interval private (`HEARTBEAT_INTERVAL` in
 /// `iroh/src/socket.rs`): read that constant again when iroh moves.
 ///
-/// The bound limits the restart case, it does not remove it: a peer that restarts and dials again
-/// less than this time after its last datagram is still read as a crossing, and its dial is only
-/// read, not kept, until the dead connection is dropped.
+/// The bound limits the restart case, it does not remove it: a restarted peer that dials again less
+/// than this time after its last datagram has a dial that ranks like a live connection until it
+/// carries its first message, and then it wins.
 const LIVENESS_BOUND: Duration = Duration::from_secs(10);
 
 /// How often the task of a connection reads the count of datagrams it received.
@@ -963,11 +1033,15 @@ impl RxClock {
     }
 
     fn touch(&self) {
-        *self.0.lock().expect("lock is not poisoned") = Instant::now();
+        self.touch_at(Instant::now());
     }
 
-    fn age(&self) -> Duration {
-        self.0.lock().expect("lock is not poisoned").elapsed()
+    fn touch_at(&self, now: Instant) {
+        *self.0.lock().expect("lock is not poisoned") = now;
+    }
+
+    fn age_at(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(*self.0.lock().expect("lock is not poisoned"))
     }
 }
 
@@ -1001,18 +1075,6 @@ fn drains(send_ended_cleanly: bool, conn_closed: bool) -> bool {
     send_ended_cleanly && !conn_closed
 }
 
-/// Whether a new connection loses against the active one: they cross, and the lower id dialed the
-/// active one. The answer depends on facts that both sides of a pair share (who dialed which
-/// connection) and on whether the active connection is alive, which does not depend on when the
-/// gate of this side let the new connection through.
-fn crossing_loser(
-    active_dialed_by_lower: bool,
-    new_dialed_by_lower: bool,
-    active_rx_age: Duration,
-) -> bool {
-    active_rx_age < LIVENESS_BOUND && active_dialed_by_lower && !new_dialed_by_lower
-}
-
 /// Whether the endpoint with the lower id dialed a connection: `local_dialed` says whether this
 /// side did. Both sides of a pair give the same answer, which is what lets them keep the same
 /// connection when both dial at once.
@@ -1021,84 +1083,24 @@ fn dialed_by_lower_id(local: EndpointId, peer: EndpointId, local_dialed: bool) -
 }
 
 impl PeerState {
-    /// Whether `new` is the loser of a crossing with the active connection, and is to be closed.
-    ///
-    /// A crossing is both sides dialing at once: each side then holds the connection it dialed and
-    /// the one it accepted. If each side kept its newest, each would keep the one that the other
-    /// closes, and the peer would be lost on both sides. The connection that the lower endpoint
-    /// id dialed wins, on both sides. A first connection is always kept, and so is a second
-    /// one of the same kind (a re-dial after a connection that broke), and so is any new
-    /// connection when the active one received nothing for [`LIVENESS_BOUND`].
-    fn loses_crossing(&self, local: EndpointId, peer: EndpointId, new: &Connection) -> bool {
-        let PeerState::Active {
-            chosen:
-                ConnEntry {
-                    conn: Some(active),
-                    rx,
-                    ..
-                },
-            ..
-        } = self
-        else {
-            return false;
-        };
-        crossing_loser(
-            dialed_by_lower_id(local, peer, active.side().is_client()),
-            dialed_by_lower_id(local, peer, new.side().is_client()),
-            rx.age(),
-        )
-    }
-
-    fn active_conn_id(&self) -> Option<ConnId> {
-        match self {
-            PeerState::Active { chosen, .. } => Some(chosen.id),
-            PeerState::Pending { .. } => None,
-        }
-    }
-
-    /// A peer with one connection, which sends go to.
-    fn active(chosen: ConnEntry) -> Self {
-        PeerState::Active {
-            chosen,
-            other_conns: Vec::new(),
-            refused_since: None,
-        }
-    }
-
-    fn accept_conn(
-        &mut self,
-        send_tx: mpsc::Sender<ProtoMessage>,
-        conn: Connection,
-        rx_clock: RxClock,
-    ) -> Vec<ProtoMessage> {
-        let entry = ConnEntry::new(send_tx, conn, rx_clock);
-        match self {
+    /// A new connection to the peer. Returns the messages that were queued for the peer while no
+    /// connection existed (they go to this connection, the first one), and what to do.
+    fn admit(&mut self, conn: Conn<ConnHandle>, now: Instant) -> (Vec<ProtoMessage>, Vec<Action>) {
+        let queue = match self {
             PeerState::Pending { queue } => {
                 let queue = std::mem::take(queue);
-                *self = PeerState::active(entry);
+                *self = PeerState::Active {
+                    conns: ConnSet::default(),
+                    refused_since: None,
+                };
                 queue
             }
-            PeerState::Active {
-                chosen,
-                other_conns,
-                refused_since,
-            } => {
-                // We already have an active connection, and `loses_crossing` did not close the
-                // new one. We keep the old connection intact, but only use the new connection for
-                // sending from now on. By dropping the `send_tx` of the old connection, the send
-                // loop part of the `connection_loop` of the old connection will terminate, which
-                // will also notify the peer that the old connection may be dropped.
-                //
-                // This is right for a re-dial, where the new connection replaces one that is
-                // going away. It is wrong for a crossing, where both sides dial at once and each
-                // would keep the connection that the other closes: that case is decided before
-                // this point.
-                other_conns.push(chosen.id);
-                *chosen = entry;
-                *refused_since = None;
-                Vec::new()
-            }
-        }
+            PeerState::Active { .. } => Vec::new(),
+        };
+        let PeerState::Active { conns, .. } = self else {
+            unreachable!("the state is active now");
+        };
+        (queue, conns.admit(conn, now))
     }
 }
 
@@ -1181,7 +1183,7 @@ async fn connection_loop(
     conn: Connection,
     origin: ConnOrigin,
     send_rx: mpsc::Receiver<ProtoMessage>,
-    in_event_tx: mpsc::Sender<InEvent>,
+    link: ActorLink,
     max_message_size: usize,
     queue: Vec<ProtoMessage>,
 ) -> Result<(), ConnectionLoopError> {
@@ -1189,7 +1191,13 @@ async fn connection_loop(
 
     let mut send_loop = SendLoop::new(conn.clone(), send_rx, max_message_size);
     let observed = conn.clone();
-    let mut recv_loop = RecvLoop::new(from, conn, in_event_tx, max_message_size);
+    let mut recv_loop = RecvLoop::new(
+        from,
+        conn,
+        link.in_event_tx,
+        link.carried_tx,
+        max_message_size,
+    );
 
     let send_fut = send_loop.run(queue).instrument(error_span!("send"));
     let recv_fut = recv_loop.run().instrument(error_span!("recv"));
@@ -2197,7 +2205,7 @@ pub(crate) mod tests {
         .std_context("wait dial failure")?;
         tracing::info!("a's bootstrap dial failed; b now connects inbound");
 
-        // The rescue path: `b` dials in, and `accept_conn` must flush the `Join`
+        // The rescue path: `b` dials in, and the admission of the connection must flush the `Join`
         // still queued for `b`.
         let conn = ep_b
             .connect(id_a, GOSSIP_ALPN)
@@ -2669,15 +2677,20 @@ pub(crate) mod tests {
             for conn_id in 0..n {
                 let id = SecretKey::from_bytes(&rng.random()).public();
                 let (tx, rx) = mpsc::channel(SEND_QUEUE_CAP);
-                actor.peers.insert(
-                    id,
-                    PeerState::active(ConnEntry {
-                        id: conn_id,
-                        send_tx: tx.clone(),
-                        conn: None,
-                        rx: RxClock::new(),
-                    }),
+                let mut state = PeerState::default();
+                state.admit(
+                    Conn::new(
+                        conn_id,
+                        ConnHandle {
+                            send_tx: Some(tx.clone()),
+                            conn: None,
+                        },
+                        true,
+                        RxClock::new(),
+                    ),
+                    Instant::now(),
                 );
+                actor.peers.insert(id, state);
                 peers.push(FakePeer { id, tx, rx });
             }
             let now = Instant::now();
@@ -2939,29 +2952,6 @@ pub(crate) mod tests {
         // The connection that the higher id dialed loses on both sides.
         assert!(!dialed_by_lower_id(high, low, true));
         assert!(!dialed_by_lower_id(low, high, false));
-    }
-
-    #[test]
-    fn a_new_connection_loses_only_to_a_live_active_one_that_the_lower_id_dialed() {
-        let young = Duration::from_millis(200);
-        assert!(crossing_loser(true, false, young));
-        // The new one was dialed by the lower id, or both were: no loser.
-        assert!(!crossing_loser(true, true, young));
-        assert!(!crossing_loser(false, false, young));
-        assert!(!crossing_loser(false, true, young));
-        // An active connection that received nothing for the bound, or longer, is no crossing: the
-        // peer restarted, and its new dial must be kept.
-        assert!(!crossing_loser(true, false, LIVENESS_BOUND));
-        assert!(!crossing_loser(true, false, Duration::from_secs(60)));
-    }
-
-    #[test]
-    fn the_rule_reads_the_life_of_the_active_connection_not_its_age() {
-        // The active connection received a datagram 8 s ago: the peer is there, and a new
-        // connection from it is the other half of a crossing, however late the gate let it through.
-        assert!(crossing_loser(true, false, Duration::from_secs(8)));
-        // It received nothing for a minute: the peer restarted, and its new dial is kept.
-        assert!(!crossing_loser(true, false, Duration::from_secs(60)));
     }
 
     #[test]
@@ -3255,13 +3245,155 @@ pub(crate) mod tests {
         );
     }
 
-    /// A peer dies with no close and starts again with the same id. The old connection received
-    /// nothing for longer than the liveness bound, so it is no half of a crossing: the dial of the
-    /// restarted peer must be kept at once. A rule that always read a live-looking connection as a
-    /// crossing would only read this dial and turn the peer away until the old connection times out.
+    /// Like `endpoint_loop`, but the gate of this side refuses the connections that the lower
+    /// endpoint id dialed (or the higher one, with `refuse_lower == false`): it holds them for
+    /// `refuse_after` and then closes them without handing them to gossip. The others are handed
+    /// over at once.
+    async fn refusing_endpoint_loop(
+        endpoint: Endpoint,
+        gossip: Gossip,
+        refuse_lower: bool,
+        refuse_after: Duration,
+        cancel: CancellationToken,
+    ) {
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break,
+                incoming = endpoint.accept() => {
+                    let Some(incoming) = incoming else { break };
+                    let Ok(connecting) = incoming.accept() else { continue };
+                    let Ok(connection) = connecting.await else { continue };
+                    // This side accepted the connection, so the peer dialed it.
+                    let dialed_by_lower =
+                        dialed_by_lower_id(endpoint.id(), connection.remote_id(), false);
+                    if dialed_by_lower == refuse_lower {
+                        task::spawn(async move {
+                            tokio::time::sleep(refuse_after).await;
+                            connection.close(0u32.into(), b"refused");
+                        });
+                    } else {
+                        let gossip = gossip.clone();
+                        task::spawn(async move {
+                            let _ = gossip.handle_connection(connection).await;
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    /// Two peers dial each other at once. With `refuse_lower`, the gate of the higher id refuses the
+    /// connection that the lower id dialed; without it, the gate of the lower id refuses the one
+    /// that the higher id dialed. Returns `(neighbor_up, neighbor_down)` of both
+    /// peers, lower id first, after the link settled.
+    async fn one_sided_refusal_round(refuse_lower: bool, tag: &str) -> ((u64, u64), (u64, u64)) {
+        let mut rng = rand::rngs::ChaCha12Rng::seed_from_u64(41);
+        let (relay_map, relay_url, _guard) = iroh::test_utils::run_relay_server().await.unwrap();
+        let memory_lookup = MemoryLookup::new();
+        let mut eps = Vec::new();
+        for _ in 0..2 {
+            eps.push(
+                create_endpoint(&mut rng, relay_map.clone(), Some(memory_lookup.clone()))
+                    .await
+                    .unwrap(),
+            );
+        }
+        eps.sort_by_key(|ep| ep.id());
+        let (low, high) = (eps.remove(0), eps.remove(0));
+        let go_low = Gossip::builder().spawn(low.clone());
+        let go_high = Gossip::builder().spawn(high.clone());
+        let cancel = CancellationToken::new();
+        // The higher id refuses the dial of the lower id, or the lower id refuses the dial of the
+        // higher id. The other side hands everything over at once.
+        let refusing = Duration::from_secs(6);
+        let plain = |ep: &Endpoint, go: &Gossip, cancel: &CancellationToken| {
+            let (ep, go, cancel) = (ep.clone(), go.clone(), cancel.clone());
+            spawn(async move { endpoint_loop(ep, go, cancel).await.unwrap() })
+        };
+        let tasks = if refuse_lower {
+            [
+                plain(&low, &go_low, &cancel),
+                spawn(refusing_endpoint_loop(
+                    high.clone(),
+                    go_high.clone(),
+                    true,
+                    refusing,
+                    cancel.clone(),
+                )),
+            ]
+        } else {
+            [
+                spawn(refusing_endpoint_loop(
+                    low.clone(),
+                    go_low.clone(),
+                    false,
+                    refusing,
+                    cancel.clone(),
+                )),
+                plain(&high, &go_high, &cancel),
+            ]
+        };
+        memory_lookup
+            .add_endpoint_info(EndpointAddr::new(low.id()).with_relay_url(relay_url.clone()));
+        memory_lookup.add_endpoint_info(EndpointAddr::new(high.id()).with_relay_url(relay_url));
+        let topic: TopicId = blake3::hash(tag.as_bytes()).into();
+        let _topics = [
+            go_low.subscribe(topic, vec![high.id()]),
+            go_high.subscribe(topic, vec![low.id()]),
+        ]
+        .try_join()
+        .await
+        .unwrap();
+
+        // The refused connection closes at 6 s. The link must be up before that, and stay up.
+        tokio::time::sleep(Duration::from_secs(12)).await;
+        let counts = (
+            (
+                go_low.metrics().neighbor_up.get(),
+                go_low.metrics().neighbor_down.get(),
+            ),
+            (
+                go_high.metrics().neighbor_up.get(),
+                go_high.metrics().neighbor_down.get(),
+            ),
+        );
+        cancel.cancel();
+        for task in tasks {
+            task.await.unwrap();
+        }
+        counts
+    }
+
+    /// The gate of the higher id refuses the connection that the lower id dialed, and hands over
+    /// the one it dialed itself. The lower id keeps its own dial by the old rule, reads the other
+    /// only and closes it, and the pair has no connection. The pair must take the one that works.
     #[tokio::test]
     #[traced_test]
-    async fn a_peer_that_restarts_after_its_old_connection_went_silent_is_kept() {
+    async fn a_gate_that_refuses_the_dial_of_the_lower_id_leaves_the_pair_on_the_other_one() {
+        let counts = one_sided_refusal_round(true, "refuse the dial of the lower id").await;
+        assert_eq!(
+            counts,
+            ((1, 0), (1, 0)),
+            "(neighbor_up, neighbor_down) of lower, higher"
+        );
+    }
+
+    /// The same when the connection that is refused is the one the rule would drop anyway: a guard.
+    #[tokio::test]
+    #[traced_test]
+    async fn a_gate_that_refuses_the_dial_of_the_higher_id_changes_nothing() {
+        let counts = one_sided_refusal_round(false, "refuse the dial of the higher id").await;
+        assert_eq!(
+            counts,
+            ((1, 0), (1, 0)),
+            "(neighbor_up, neighbor_down) of lower, higher"
+        );
+    }
+
+    /// A peer dies with no close and starts again with the same id, `silence` after it died. Waits
+    /// for the restarted peer to link.
+    async fn restart_round(silence: Duration, tag: &str) {
         let (relay_map, relay_url, _guard) = iroh::test_utils::run_relay_server().await.unwrap();
         let memory_lookup = MemoryLookup::new();
         let ep_a = create_endpoint(
@@ -3276,7 +3408,7 @@ pub(crate) mod tests {
         let cancel = CancellationToken::new();
         let task_a = spawn(endpoint_loop(ep_a.clone(), go_a.clone(), cancel.clone()));
         memory_lookup.add_endpoint_info(EndpointAddr::new(id_a).with_relay_url(relay_url));
-        let topic: TopicId = blake3::hash(b"restart after silence").into();
+        let topic: TopicId = blake3::hash(tag.as_bytes()).into();
         let _topic_a = go_a.subscribe(topic, vec![]).await.unwrap();
 
         // The peer lives in a runtime of its own, which is dropped without a close: its tasks end
@@ -3318,7 +3450,7 @@ pub(crate) mod tests {
         // Longer than the liveness bound (10 s), shorter than the idle timeout of a path (15 s,
         // `PATH_MAX_IDLE_TIMEOUT` in iroh) and of the connection (30 s). The margin to 15 s is
         // 3 s, so a loaded host can make this test flake; the rule is not at fault then.
-        tokio::time::sleep(Duration::from_secs(12)).await;
+        tokio::time::sleep(silence).await;
         assert_eq!(
             go_a.metrics().neighbor_down.get(),
             0,
@@ -3346,6 +3478,23 @@ pub(crate) mod tests {
         cancel.cancel();
         task_a.await.unwrap().unwrap();
         task_b2.await.unwrap().unwrap();
+    }
+
+    /// The old connection received nothing for longer than the liveness bound, so it ranks below
+    /// the dial of the restarted peer at once.
+    #[tokio::test]
+    #[traced_test]
+    async fn a_peer_that_restarts_after_its_old_connection_went_silent_is_kept() {
+        restart_round(Duration::from_secs(12), "restart after silence").await;
+    }
+
+    /// The old connection looks alive for a few seconds more. The dial of the restarted peer is
+    /// parked until it carries its first message, and then it wins. This is a guard of the new
+    /// rule: it is also green on ea2f887.
+    #[tokio::test]
+    #[traced_test]
+    async fn a_peer_that_restarts_inside_the_liveness_bound_is_kept_when_it_speaks() {
+        restart_round(Duration::from_secs(3), "restart inside the bound").await;
     }
 
     /// The same, when both peers ask the other for a link with `neighbor_peers`.
