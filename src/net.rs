@@ -960,6 +960,16 @@ fn drains(send_ended_cleanly: bool, conn_closed: bool) -> bool {
     send_ended_cleanly && !conn_closed
 }
 
+/// Whether a new connection crosses the active one: both sides dialed at once, so the two were
+/// dialed by different sides, and the active one is younger than [`CROSSING_WINDOW`].
+fn is_crossing(
+    active_dialed_by_lower: bool,
+    new_dialed_by_lower: bool,
+    active_age: Duration,
+) -> bool {
+    active_age < CROSSING_WINDOW && active_dialed_by_lower != new_dialed_by_lower
+}
+
 /// Whether a new connection loses against the active one: they cross, and the lower id dialed the
 /// active one.
 fn crossing_loser(
@@ -967,7 +977,7 @@ fn crossing_loser(
     new_dialed_by_lower: bool,
     active_age: Duration,
 ) -> bool {
-    active_age < CROSSING_WINDOW && active_dialed_by_lower && !new_dialed_by_lower
+    is_crossing(active_dialed_by_lower, new_dialed_by_lower, active_age) && active_dialed_by_lower
 }
 
 /// Whether a new connection replaces the active one: the peer dialed again, because it restarted
@@ -978,7 +988,7 @@ fn is_redial(
     new_dialed_by_lower: bool,
     active_age: Duration,
 ) -> bool {
-    !crossing_loser(active_dialed_by_lower, new_dialed_by_lower, active_age)
+    !is_crossing(active_dialed_by_lower, new_dialed_by_lower, active_age)
 }
 
 /// Whether the endpoint with the lower id dialed a connection: `local_dialed` says whether this
