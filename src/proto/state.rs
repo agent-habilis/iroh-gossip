@@ -51,22 +51,13 @@ impl<PI> Message<PI> {
     /// fetches the message) and for an `IHave` (a lost repair hint). It does not hold for
     /// anything else: a lost `Join` or `Neighbor` leaves the two views of a link different, a
     /// lost `Disconnect` loses its `left` flag, and `Prune` and `Graft` are tree state.
-    pub(crate) fn is_droppable(&self) -> bool {
+    pub fn is_droppable(&self) -> bool {
         matches!(
             self.message,
             topic::Message::Gossip(
                 super::plumtree::Message::Gossip(_) | super::plumtree::Message::IHave(_)
             )
         )
-    }
-
-    /// A `Join` request for `topic`, for tests outside the `proto` module tree.
-    #[cfg(test)]
-    pub(crate) fn join_for_test(topic: TopicId) -> Self {
-        Self {
-            topic,
-            message: topic::Message::Swarm(super::hyparview::Message::Join(None)),
-        }
     }
 }
 

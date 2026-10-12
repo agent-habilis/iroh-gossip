@@ -327,6 +327,11 @@ struct Actor {
     /// Peers to disconnect after the current event: their send queue refused a message that
     /// must not be dropped, or refused messages for longer than `send_refused_deadline`.
     overflow_disconnects: VecDeque<EndpointId>,
+    /// Connections whose send loop ended while the actor still sent on them, to drop after the
+    /// current event. The result of their task is read by an arm of the event loop that sits behind
+    /// the arms that carry data, so a busy actor can send to the dead connection for a long time
+    /// before that arm runs.
+    dead_conns: VecDeque<(EndpointId, ConnId)>,
     /// See [`SEND_REFUSED_DEADLINE`]. A field so that a test can shorten it.
     send_refused_deadline: Duration,
 }
@@ -378,6 +383,7 @@ impl Actor {
             topic_event_forwarders: Default::default(),
             address_lookup,
             overflow_disconnects: Default::default(),
+            dead_conns: Default::default(),
             send_refused_deadline: SEND_REFUSED_DEADLINE,
         };
 
@@ -692,8 +698,17 @@ impl Actor {
         let reason = conn.close_reason().expect("just closed");
         let error = task_result.err();
         debug!(%reason, ?error, "connection closed");
+        self.drop_conn(peer_id, conn.stable_id()).await;
+        self.drain_queues().await;
+    }
+
+    /// Takes the closed connection `conn_id` out of the set of `peer_id`. A peer with no connection
+    /// left is removed and the protocol is told `PeerDisconnected`. A peer with another connection
+    /// keeps it, and the set chooses it. The caller runs [`Self::drain_queues`] after it: this
+    /// takes `handle_in_event_inner`, not `handle_in_event`, because `process_dead_conns` calls it
+    /// from inside `handle_in_event`, and an async fn cannot call itself.
+    async fn drop_conn(&mut self, peer_id: EndpointId, conn_id: ConnId) {
         if let Some(PeerState::Active { conns, .. }) = self.peers.get_mut(&peer_id) {
-            let conn_id = conn.stable_id();
             let (actions, none_left) = conns.closed(conn_id, Instant::now());
             if none_left {
                 debug!(
@@ -706,7 +721,7 @@ impl Actor {
                 // disconnect it, and the dead sender swallows every later send
                 // instead of letting the next one re-dial.
                 self.peers.remove(&peer_id);
-                self.handle_in_event(InEvent::PeerDisconnected(peer_id), Instant::now())
+                self.handle_in_event_inner(InEvent::PeerDisconnected(peer_id), Instant::now())
                     .await;
             } else {
                 // Another connection takes over, or this one was not the one sends went to. The
@@ -776,8 +791,35 @@ impl Actor {
 
     async fn handle_in_event(&mut self, event: InEvent, now: Instant) {
         self.handle_in_event_inner(event, now).await;
+        self.drain_queues().await;
+    }
+
+    /// What an event leaves for after it: the peers to disconnect, the connections to drop and the
+    /// topics to quit.
+    async fn drain_queues(&mut self) {
         self.process_overflow_disconnects().await;
+        self.process_dead_conns().await;
         self.process_quit_queue().await;
+    }
+
+    /// Drops the connections whose send loop ended, as the result of their task would
+    /// (`handle_connection_task_finished`). The result of the task, when it comes, finds the
+    /// connection gone.
+    async fn process_dead_conns(&mut self) {
+        while let Some((peer_id, conn_id)) = self.dead_conns.pop_front() {
+            let Some(PeerState::Active { conns, .. }) = self.peers.get_mut(&peer_id) else {
+                continue;
+            };
+            let Some(entry) = conns.get_mut(conn_id) else {
+                continue;
+            };
+            if let Some(conn) = entry.handle.conn.as_ref() {
+                if conn.close_reason().is_none() {
+                    conn.close(0u32.into(), b"send loop ended");
+                }
+            }
+            self.drop_conn(peer_id, conn_id).await;
+        }
     }
 
     /// Disconnect the peers whose send queue refused a message that must not be dropped, or
@@ -875,12 +917,28 @@ impl Actor {
                                 }
                             }
                             Err(mpsc::error::TrySendError::Closed(_message)) => {
-                                // Removing the peer is handled by the in_event PeerDisconnected sent
-                                // in [`Self::handle_connection_task_finished`].
-                                warn!(
-                                    peer = %peer_id.fmt_short(),
-                                    "failed to send: connection task send loop terminated",
-                                );
+                                // The send loop of the chosen connection ended. Waiting for
+                                // [`Self::handle_connection_task_finished`] is not enough: the arm
+                                // that reads the result of the task is behind the arms that carry
+                                // data, and the protocol sends to this peer until that arm runs. So
+                                // the connection is dropped after this event, once, and the log has
+                                // one line for each connection, not one for each message.
+                                match conns.chosen().map(|conn| conn.id) {
+                                    Some(conn_id) => {
+                                        if !self.dead_conns.contains(&(peer_id, conn_id)) {
+                                            self.dead_conns.push_back((peer_id, conn_id));
+                                            warn!(
+                                                peer = %peer_id.fmt_short(),
+                                                conn_id,
+                                                "failed to send: connection task send loop terminated",
+                                            );
+                                        }
+                                    }
+                                    None => warn!(
+                                        peer = %peer_id.fmt_short(),
+                                        "failed to send: connection task send loop terminated",
+                                    ),
+                                }
                             }
                         },
                         PeerState::Pending { queue } => {
@@ -2644,6 +2702,15 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// A `Join` request for `topic`: the actor takes its sender as a neighbor, and the stuck-queue
+    /// tests need any message to fill a queue with.
+    fn join_for_test(topic: TopicId) -> ProtoMessage {
+        ProtoMessage {
+            topic,
+            message: proto::topic::Message::Swarm(proto::hyparview::Message::Join(None)),
+        }
+    }
+
     /// A manual actor with fake peers: each has a send queue that the test reads or not.
     struct Rig {
         actor: Actor,
@@ -2703,7 +2770,7 @@ pub(crate) mod tests {
             for peer in &mut peers {
                 actor
                     .handle_in_event(
-                        proto::InEvent::RecvMessage(peer.id, ProtoMessage::join_for_test(topic)),
+                        proto::InEvent::RecvMessage(peer.id, join_for_test(topic)),
                         now,
                     )
                     .await;
@@ -2730,8 +2797,17 @@ pub(crate) mod tests {
         /// Fills the send queue of a peer and keeps its receiver, so that it is never closed.
         fn stick(&mut self, peer: usize) {
             // Any message will do.
-            let sample = ProtoMessage::join_for_test(self.topic);
+            let sample = join_for_test(self.topic);
             while self.peers[peer].tx.try_send(sample.clone()).is_ok() {}
+        }
+
+        /// Ends the send loop of a peer: the receiver of its queue is dropped, so that a send on
+        /// the queue gets `Closed`, as it does when the send loop of a connection returned.
+        fn end_send_loop(&mut self, peer: usize) {
+            drop(std::mem::replace(
+                &mut self.peers[peer].rx,
+                mpsc::channel(1).1,
+            ));
         }
 
         fn drain_data(&mut self, peer: usize) -> usize {
@@ -2841,6 +2917,75 @@ pub(crate) mod tests {
         assert_eq!(rig.actor.metrics.msgs_dropped_send_queue_full.get(), 0);
         assert_eq!(rig.actor.metrics.send_overflow_disconnects.get(), 1);
         assert!(!rig.actor.peers.contains_key(&stuck));
+        Ok(())
+    }
+
+    /// A peer whose only connection lost its send loop is disconnected at the next send. It does
+    /// not wait for the result of the connection task: the arm of the event loop that reads it is
+    /// behind the arms that carry data, so a busy actor would keep sending to the dead peer.
+    #[tokio::test]
+    #[traced_test]
+    async fn a_peer_whose_send_loop_ended_is_disconnected_at_the_next_send() -> Result {
+        let mut rig = Rig::new(12, 2).await?;
+        let gone = rig.peers[0].id;
+        rig.end_send_loop(0);
+
+        rig.broadcast("after the send loop ended").await;
+        // A second send finds no peer to send to and logs nothing more.
+        rig.broadcast("and again").await;
+
+        assert!(
+            !rig.actor.peers.contains_key(&gone),
+            "the peer with the dead send loop is gone"
+        );
+        assert_eq!(rig.neighbor_downs(), vec![gone]);
+        assert_eq!(rig.drain_data(1), 2, "the other peer got both broadcasts");
+        Ok(())
+    }
+
+    /// A peer with a second connection keeps the peer: the connection with the dead send loop
+    /// leaves the set, the other one is chosen, and the protocol sees no `NeighborDown`.
+    #[tokio::test]
+    #[traced_test]
+    async fn a_peer_with_a_second_connection_switches_when_the_chosen_send_loop_ended() -> Result {
+        let mut rig = Rig::new(13, 1).await?;
+        let peer = rig.peers[0].id;
+        let (second_tx, mut second_rx) = mpsc::channel(SEND_QUEUE_CAP);
+        let Some(PeerState::Active { conns, .. }) = rig.actor.peers.get_mut(&peer) else {
+            panic!("the peer is active");
+        };
+        conns.admit(
+            Conn::new(
+                1,
+                ConnHandle {
+                    send_tx: Some(second_tx),
+                    conn: None,
+                },
+                true,
+                RxClock::new(),
+            ),
+            Instant::now(),
+        );
+        let chosen = conns.chosen().expect("a chosen connection").id;
+        let other = 1 - chosen;
+        // Ends the send loop of the chosen connection: its receiver is dropped.
+        if chosen == 0 {
+            rig.end_send_loop(0);
+        } else {
+            second_rx.close();
+        }
+
+        rig.broadcast("after the send loop ended").await;
+
+        let Some(PeerState::Active { conns, .. }) = rig.actor.peers.get(&peer) else {
+            panic!("the peer is still active: it has another connection");
+        };
+        assert_eq!(conns.chosen().map(|conn| conn.id), Some(other));
+        assert!(conns.get(chosen).is_none(), "the dead connection is gone");
+        assert!(
+            rig.neighbor_downs().is_empty(),
+            "the peer is not disconnected"
+        );
         Ok(())
     }
 

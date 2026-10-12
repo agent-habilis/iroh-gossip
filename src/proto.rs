@@ -50,7 +50,7 @@ use std::{fmt, hash::Hash};
 use bytes::Bytes;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-mod hyparview;
+pub(crate) mod hyparview;
 mod plumtree;
 pub mod state;
 pub mod topic;
