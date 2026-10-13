@@ -1,0 +1,13 @@
+# Tokio calls that panic in a browser, where there is no Tokio runtime. The wasm32 clippy row of the CI passes
+# `-D clippy::disallowed_methods`; `Cargo.toml` allows the lint on every other target.
+# Use `n0_future::task::spawn` and `n0_future::time::{sleep, timeout, interval}` instead.
+disallowed-methods = [
+    { path = "tokio::spawn", reason = "panics in a browser: use n0_future::task::spawn" },
+    { path = "tokio::task::spawn_blocking", reason = "panics in a browser: there is no blocking pool" },
+    { path = "tokio::time::sleep", reason = "panics in a browser: use n0_future::time::sleep" },
+    { path = "tokio::time::sleep_until", reason = "panics in a browser: use n0_future::time::sleep" },
+    { path = "tokio::time::timeout", reason = "panics in a browser: use n0_future::time::timeout" },
+    { path = "tokio::time::timeout_at", reason = "panics in a browser: use n0_future::time::timeout" },
+    { path = "tokio::time::interval", reason = "panics in a browser: use n0_future::time::interval" },
+    { path = "tokio::time::interval_at", reason = "panics in a browser: use n0_future::time::interval" },
+]

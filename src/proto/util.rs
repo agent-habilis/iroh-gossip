@@ -262,6 +262,14 @@ impl<T> TimerMap<T> {
         }
     }
 
+    /// Release memory after a burst, see [`SHRINK_MIN_CAPACITY`].
+    fn shrink(&mut self) {
+        if self.heap.capacity() > SHRINK_MIN_CAPACITY && self.heap.capacity() > 4 * self.heap.len()
+        {
+            self.heap.shrink_to(self.heap.len() * 2);
+        }
+    }
+
     /// Get a reference to the earliest entry in the `TimerMap`.
     pub fn first(&self) -> Option<&Instant> {
         self.heap.peek().map(|x| &x.time)
@@ -331,8 +339,16 @@ impl<K, V> Default for TimeBoundCache<K, V> {
 impl<K: Hash + Eq + Clone, V> TimeBoundCache<K, V> {
     /// Insert an item into the cache, marked with an expiration time.
     pub fn insert(&mut self, key: K, value: V, expires: Instant) {
+        // The expiry heap keeps at most one entry that is at or before the expiry in the map.
+        // A later expiry needs no new entry: `expire_until` moves a stale entry forward.
+        let needs_entry = match self.map.get(&key) {
+            Some((current, _)) => expires < *current,
+            None => true,
+        };
         self.map.insert(key.clone(), (expires, value));
-        self.expiry.insert(expires, key);
+        if needs_entry {
+            self.expiry.insert(expires, key);
+        }
     }
 
     /// Returns `true` if the map contains a value for the specified key.
@@ -369,27 +385,44 @@ impl<K: Hash + Eq + Clone, V> TimeBoundCache<K, V> {
     ///
     /// Returns the number of items that were removed.
     pub fn expire_until(&mut self, instant: Instant) -> usize {
-        let drain = self.expiry.drain_until(&instant);
         let mut count = 0;
-        for (time, key) in drain {
+        while let Some((time, key)) = self.expiry.pop_before(instant) {
             match self.map.entry(key) {
                 hash_map::Entry::Occupied(entry) if entry.get().0 == time => {
-                    // If the entry's time matches that of the item we are draining from the expiry list,
-                    // remove the entry from the map and increase the count of items we removed.
+                    // The entry's time matches the heap entry: remove it from the map and count it.
                     entry.remove();
                     count += 1;
                 }
+                hash_map::Entry::Occupied(entry) if entry.get().0 > time => {
+                    // The key was re-inserted with a later time and has no entry for it yet.
+                    // Move the heap entry forward.
+                    let (later, key) = (entry.get().0, entry.key().clone());
+                    self.expiry.insert(later, key);
+                }
                 hash_map::Entry::Occupied(_entry) => {
-                    // If the entry's time does not match the time of the item we are draining,
-                    // do not remove the entry: It means that it was re-added with a later time.
+                    // The map time is earlier than this heap entry. A re-insert with an earlier
+                    // time pushed its own entry, which has been handled already.
                 }
                 hash_map::Entry::Vacant(_) => {
-                    // If the entry is not in the map, it means that it was already removed,
-                    // which can happen if it was inserted multiple times.
+                    // The key is already removed, which happens when it was inserted multiple times.
                 }
             }
         }
+        self.expiry.shrink();
+        shrink_map(&mut self.map);
         count
+    }
+}
+
+/// Capacity above which a drained collection is shrunk, so that a burst does not hold memory forever.
+///
+/// Shrinking only when the capacity is more than 4 times the length avoids reallocating on every
+/// drain, which runs once per second.
+const SHRINK_MIN_CAPACITY: usize = 64;
+
+fn shrink_map<K: Hash + Eq, V>(map: &mut HashMap<K, V>) {
+    if map.capacity() > SHRINK_MIN_CAPACITY && map.capacity() > 4 * map.len() {
+        map.shrink_to(map.len() * 2);
     }
 }
 
@@ -528,5 +561,54 @@ mod test {
         cache.expire_until(t2);
         assert_eq!(cache.get(&4), None);
         assert_eq!(cache.get(&5), Some(&50));
+    }
+
+    #[test]
+    fn time_bound_cache_reinsert_does_not_grow_expiry_heap() {
+        let mut cache = TimeBoundCache::default();
+        let t0 = Instant::now();
+        let n = 10_000;
+        for i in 0..n {
+            cache.insert(1, i, t0 + Duration::from_millis(i as u64));
+        }
+        let last = t0 + Duration::from_millis(n as u64 - 1);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.expiry.heap.len(), 1);
+        assert_eq!(cache.get(&1), Some(&(n - 1)));
+        assert_eq!(cache.expires(&1), Some(&last));
+
+        // The key must live until its latest expiry, not its first.
+        assert_eq!(cache.expire_until(t0 + Duration::from_millis(5)), 0);
+        assert!(cache.contains_key(&1));
+        assert_eq!(cache.expire_until(last), 1);
+        assert!(cache.is_empty());
+        assert_eq!(cache.expiry.heap.len(), 0);
+    }
+
+    #[test]
+    fn time_bound_cache_shrinks_after_drain() {
+        let mut cache = TimeBoundCache::default();
+        let t0 = Instant::now();
+        for i in 0..10_000u64 {
+            cache.insert(i, (), t0);
+        }
+        assert_eq!(cache.expire_until(t0), 10_000);
+        assert!(cache.is_empty());
+        assert!(cache.expiry.heap.capacity() < 100);
+        assert!(cache.map.capacity() < 100);
+    }
+
+    #[test]
+    fn time_bound_cache_earlier_reinsert_shortens_expiry() {
+        let mut cache = TimeBoundCache::default();
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(1);
+        let t2 = t0 + Duration::from_secs(2);
+        cache.insert(1, (), t2);
+        cache.insert(1, (), t1);
+        assert_eq!(cache.expires(&1), Some(&t1));
+        assert_eq!(cache.expire_until(t1), 1);
+        assert!(cache.is_empty());
+        assert_eq!(cache.expire_until(t2), 0);
     }
 }

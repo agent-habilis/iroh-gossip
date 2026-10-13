@@ -164,6 +164,24 @@ pub enum Command<PI> {
     Join(Vec<PI>),
     /// Broadcast a message for this topic.
     Broadcast(#[debug("<{}b>", _0.len())] Bytes, Scope),
+    /// Drop the connections to the given neighbors, without leaving the topic.
+    ///
+    /// Each named peer in the active view is told that we left it on purpose, and is removed
+    /// from the active view. Other neighbors are not touched.
+    ///
+    /// Both sides then keep the other in a bounded set of left peers: they do not add it to the
+    /// passive view and do not adopt it from a `ForwardJoin`, and they refuse its `Neighbor`
+    /// requests, also with high priority. After a leave, only a [`Command::Join`] from either
+    /// side links the pair again. A node whose only known peers left it stays unlinked until
+    /// the application joins a peer.
+    LeavePeers(Vec<PI>),
+    /// Ask peers for a link with low priority.
+    ///
+    /// Unlike [`Command::Join`], a peer with a full active view refuses the request and keeps
+    /// its neighbors. A [`Command::Join`] is always accepted and evicts a random neighbor.
+    /// At most as many requests go out as the active view has free slots. On a topic
+    /// that was not joined, the command is dropped.
+    NeighborPeers(Vec<PI>),
     /// Leave this topic and drop all state.
     Quit,
 }
@@ -272,6 +290,10 @@ impl<PI: PeerIdentity, R: Rng> State<PI, R> {
                 Command::Broadcast(data, scope) => {
                     self.gossip
                         .handle(GossipIn::Broadcast(data, scope), now, io)
+                }
+                Command::LeavePeers(peers) => self.swarm.handle(SwarmIn::Leave(peers), io),
+                Command::NeighborPeers(peers) => {
+                    self.swarm.handle(SwarmIn::RequestNeighbors(peers), io)
                 }
                 Command::Quit => self.swarm.handle(SwarmIn::Quit, io),
             },

@@ -30,6 +30,9 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(iroh_docsrs)"] }
 
 [lints.clippy]
 unused-async = "warn"
+# `clippy.toml` lists the Tokio calls that panic in a browser. On a native target `n0_future`
+# re-exports them, so the wasm32 clippy row turns it on with `-D clippy::disallowed_methods`.
+disallowed_methods = "allow"
 
 [dependencies]
 blake3 = "1.8"
@@ -51,7 +54,7 @@ iroh-metrics = { version = "1.0.1", default-features = false }
 # second iroh in the graph, and types crossing the gossip/endpoint boundary
 # stopped unifying (E0308). A consumer's [patch.crates-io] cannot fix that for
 # it: cargo honours one only in a workspace root, and never inherits it.
-iroh-base = { version = "=1.0.3", git = "https://github.com/agent-habilis/iroh", rev = "c814688e6c0967b2764efe7159059d1d68c4b2f4", default-features = false, features = ["key"] }
+iroh-base = { version = "=1.0.3", git = "https://github.com/agent-habilis/iroh", rev = "0e7cdb4cd73952c49699cd7ae971a1fc2982b866", default-features = false, features = ["key"] }
 n0-future = "0.3"
 postcard = { version = "1", default-features = false, features = [
     "alloc",
@@ -64,7 +67,7 @@ serde = { version = "1.0.164", features = ["derive"] }
 # net dependencies (optional)
 futures-concurrency = { version = "7.6.1", optional = true }
 # FORK PIN -- see the iroh-base note above.
-iroh = { version = "=1.0.3", git = "https://github.com/agent-habilis/iroh", rev = "c814688e6c0967b2764efe7159059d1d68c4b2f4", default-features = false, optional = true }
+iroh = { version = "=1.0.3", git = "https://github.com/agent-habilis/iroh", rev = "0e7cdb4cd73952c49699cd7ae971a1fc2982b866", default-features = false, optional = true }
 tokio = { version = "1", optional = true, features = ["io-util", "sync"] }
 tokio-util = { version = "0.7.12", optional = true, features = ["codec"] }
 tracing = "0.1"
@@ -105,7 +108,7 @@ clap = { version = "4", features = ["derive"] }
 humantime-serde = { version = "1.1.1" }
 # FORK PIN -- see the iroh-base note above. The dev-dep must match the normal
 # one, or the test binaries link a different iroh than the library.
-iroh = { version = "=1.0.3", git = "https://github.com/agent-habilis/iroh", rev = "c814688e6c0967b2764efe7159059d1d68c4b2f4", default-features = false, features = [
+iroh = { version = "=1.0.3", git = "https://github.com/agent-habilis/iroh", rev = "0e7cdb4cd73952c49699cd7ae971a1fc2982b866", default-features = false, features = [
     "metrics",
     "test-utils",
     "tls-ring"
