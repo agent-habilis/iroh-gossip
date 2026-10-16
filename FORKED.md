@@ -27,6 +27,18 @@ Every other dial failure stays a warn.
 
 If upstream changes the `dial failed` log, keep the split in `dial_had_no_address`.
 
+## A dial that is older than five seconds is replaced when its caller asks again
+
+`net.rs`: `Dialer` drops a pending dial and starts a new one when `Command::JoinPeers` names the
+same peer and the dial is older than `DIAL_REPLACED_AFTER` (5 s). Upstream skips every later request
+while a dial is in flight. A dial that began while nobody served the peer then misses the peer for
+up to the 30 s idle timeout after the peer is served, because the handshake backs off its
+retransmits. Nothing replaces a dial by itself, and a dial that nobody asks for again still runs to
+its timeout and logs `dial failed`. The replaced dial ends without a log line above debug (a
+`generation` tells it from its successor).
+
+If upstream changes `Dialer`, keep `replace_old_dial` and the `generation` check in `next_conn`.
+
 ## A send on a connection that was closed in order is logged at debug
 
 `net.rs`: when the send loop of the chosen connection has ended and the connection was closed

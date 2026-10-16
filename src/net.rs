@@ -559,7 +559,13 @@ impl Actor {
                     Command::BroadcastNeighbors(message) => {
                         ProtoCommand::Broadcast(message, Scope::Neighbors)
                     }
-                    Command::JoinPeers(peers) => ProtoCommand::Join(peers),
+                    Command::JoinPeers(peers) => {
+                        let now = Instant::now();
+                        for peer in &peers {
+                            self.dialer.replace_old_dial(*peer, now);
+                        }
+                        ProtoCommand::Join(peers)
+                    }
                     Command::LeavePeers(peers) => ProtoCommand::LeavePeers(peers),
                     Command::NeighborPeers(peers) => ProtoCommand::NeighborPeers(peers),
                 };
@@ -1431,14 +1437,28 @@ fn dial_had_no_address(err: &iroh::endpoint::ConnectError) -> bool {
     )
 }
 
+/// A dial that is older than this is replaced when its caller asks for the same peer again. The
+/// handshake backs off its retransmits, so a dial that began while nobody served the peer misses
+/// the peer for up to the idle timeout after the peer is served.
+const DIAL_REPLACED_AFTER: Duration = Duration::from_secs(5);
+
+/// The end of a dial: the connection or the error, or nothing if the dial was dropped.
+type DialOutcome = Option<Result<Connection, iroh::endpoint::ConnectError>>;
+
+#[derive(Debug)]
+struct PendingDial {
+    cancel: CancellationToken,
+    started: Instant,
+    /// Tells the dial of the peer from a dial that replaced it, when the old one ends.
+    generation: u64,
+}
+
 #[derive(Debug)]
 struct Dialer {
     endpoint: Endpoint,
-    pending: JoinSet<(
-        EndpointId,
-        Option<Result<Connection, iroh::endpoint::ConnectError>>,
-    )>,
-    pending_dials: HashMap<EndpointId, CancellationToken>,
+    pending: JoinSet<(EndpointId, u64, DialOutcome)>,
+    pending_dials: HashMap<EndpointId, PendingDial>,
+    next_generation: u64,
 }
 
 impl Dialer {
@@ -1448,6 +1468,7 @@ impl Dialer {
             endpoint,
             pending: Default::default(),
             pending_dials: Default::default(),
+            next_generation: 0,
         }
     }
 
@@ -1457,7 +1478,16 @@ impl Dialer {
             return;
         }
         let cancel = CancellationToken::new();
-        self.pending_dials.insert(endpoint_id, cancel.clone());
+        let generation = self.next_generation;
+        self.next_generation += 1;
+        self.pending_dials.insert(
+            endpoint_id,
+            PendingDial {
+                cancel: cancel.clone(),
+                started: Instant::now(),
+                generation,
+            },
+        );
         let endpoint = self.endpoint.clone();
         self.pending.spawn(
             async move {
@@ -1466,10 +1496,25 @@ impl Dialer {
                     _ = cancel.cancelled() => None,
                     res = endpoint.connect(endpoint_id, &alpn) => Some(res),
                 };
-                (endpoint_id, res)
+                (endpoint_id, generation, res)
             }
             .instrument(tracing::Span::current()),
         );
+    }
+
+    /// Drops the dial of a peer that its caller asks for again, if the dial is older than
+    /// [`DIAL_REPLACED_AFTER`]. The next [`Self::queue_dial`] for the peer starts a new dial. The
+    /// dropped dial ends without a result.
+    fn replace_old_dial(&mut self, endpoint_id: EndpointId, now: Instant) {
+        let Some(dial) = self.pending_dials.get(&endpoint_id) else {
+            return;
+        };
+        if now.saturating_duration_since(dial.started) < DIAL_REPLACED_AFTER {
+            return;
+        }
+        debug!(peer = %endpoint_id.fmt_short(), "replace a dial that is still pending");
+        dial.cancel.cancel();
+        self.pending_dials.remove(&endpoint_id);
     }
 
     /// Checks if a endpoint is currently being dialed.
@@ -1479,19 +1524,20 @@ impl Dialer {
 
     /// Waits for the next dial operation to complete.
     /// `None` means disconnected
-    async fn next_conn(
-        &mut self,
-    ) -> (
-        EndpointId,
-        Option<Result<Connection, iroh::endpoint::ConnectError>>,
-    ) {
+    async fn next_conn(&mut self) -> (EndpointId, DialOutcome) {
         match self.pending_dials.is_empty() {
             false => {
                 let (endpoint_id, res) = loop {
                     match self.pending.join_next().await {
-                        Some(Ok((endpoint_id, res))) => {
-                            self.pending_dials.remove(&endpoint_id);
-                            break (endpoint_id, res);
+                        Some(Ok((endpoint_id, generation, res))) => {
+                            let current = self
+                                .pending_dials
+                                .get(&endpoint_id)
+                                .is_some_and(|dial| dial.generation == generation);
+                            if current {
+                                self.pending_dials.remove(&endpoint_id);
+                                break (endpoint_id, res);
+                            }
                         }
                         Some(Err(e)) => {
                             error!("next conn error: {:?}", e);
@@ -1518,7 +1564,7 @@ pub(crate) mod tests {
     use futures_concurrency::future::TryJoin;
     use iroh::{
         address_lookup::memory::MemoryLookup,
-        endpoint::{presets, BindError},
+        endpoint::{presets, BindError, QuicTransportConfig},
         protocol::Router,
         tls::CaTlsConfig,
         RelayMap, RelayMode, RelayUrl, SecretKey,
@@ -1596,6 +1642,15 @@ pub(crate) mod tests {
             cancel: &CancellationToken,
         ) -> Result<(Self, Actor, EndpointHandle), BindError> {
             let endpoint = create_endpoint(rng, relay_map, None).await?;
+            Ok(Self::t_new_with_actor_on(endpoint, config, cancel))
+        }
+
+        /// [`Self::t_new_with_actor`] on an endpoint that the test built.
+        fn t_new_with_actor_on(
+            endpoint: Endpoint,
+            config: proto::Config,
+            cancel: &CancellationToken,
+        ) -> (Self, Actor, EndpointHandle) {
             let metrics = Arc::new(Metrics::default());
             let address_lookup = GossipAddressLookup::default();
             endpoint
@@ -1625,7 +1680,7 @@ pub(crate) mod tests {
                 cancel.child_token(),
             ));
 
-            Ok((gossip, actor, endpoint_task))
+            (gossip, actor, endpoint_task)
         }
 
         /// Crates a new testing gossip instance with the normal actor loop.
@@ -1635,13 +1690,22 @@ pub(crate) mod tests {
             relay_map: RelayMap,
             cancel: &CancellationToken,
         ) -> Result<(Self, Endpoint, EndpointHandle, impl Drop + use<>), BindError> {
-            let (g, actor, ep_handle) =
-                Gossip::t_new_with_actor(rng, config, relay_map, cancel).await?;
+            let endpoint = create_endpoint(rng, relay_map, None).await?;
+            Ok(Gossip::t_new_on(endpoint, config, cancel))
+        }
+
+        /// [`Self::t_new`] on an endpoint that the test built.
+        fn t_new_on(
+            endpoint: Endpoint,
+            config: proto::Config,
+            cancel: &CancellationToken,
+        ) -> (Self, Endpoint, EndpointHandle, impl Drop + use<>) {
+            let (g, actor, ep_handle) = Gossip::t_new_with_actor_on(endpoint, config, cancel);
             let ep = actor.endpoint.clone();
             let me = ep.id().fmt_short();
             let actor_handle =
                 task::spawn(actor.run().instrument(tracing::error_span!("gossip", %me)));
-            Ok((g, ep, ep_handle, AbortOnDropHandle::new(actor_handle)))
+            (g, ep, ep_handle, AbortOnDropHandle::new(actor_handle))
         }
     }
 
@@ -2224,34 +2288,57 @@ pub(crate) mod tests {
         NoAddress,
         /// The peer speaks another protocol, so the handshake ends in an error.
         WrongProtocol,
+        /// The address of the peer leads to a socket that never answers.
+        TimesOut,
     }
 
     /// Dials a peer that fails the dial once, and returns the WARN and ERROR events of
-    /// `iroh_gossip::net`.
+    /// `iroh_gossip::net`. The dialer gives up on a silent peer after one second.
     async fn warnings_of_a_failed_dial(failed_dial: FailedDial) -> Result<Vec<String>> {
         let warnings = Arc::new(Mutex::new(Vec::new()));
         let _log = tracing::subscriber::set_default(KeepsNetWarnings(Arc::clone(&warnings)));
         let rng = &mut rand::rngs::ChaCha12Rng::seed_from_u64(1);
         let ct = CancellationToken::new();
         let (relay_map, relay_url, _guard) = iroh::test_utils::run_relay_server().await.unwrap();
+        let idle_timeout = Duration::from_secs(1)
+            .try_into()
+            .expect("1 s is an idle timeout");
+        let dialer = Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Custom(relay_map.clone()))
+            .secret_key(SecretKey::from_bytes(&rng.random()))
+            .alpns(vec![GOSSIP_ALPN.to_vec()])
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+            .transport_config(
+                QuicTransportConfig::builder()
+                    .max_idle_timeout(Some(idle_timeout))
+                    .build(),
+            )
+            .bind()
+            .await?;
+        dialer.online().await;
         let (go1, ep1, ep1_handle, _test_actor_handle1) =
-            Gossip::t_new(rng, Default::default(), relay_map.clone(), &ct).await?;
-        let peer = if failed_dial == FailedDial::WrongProtocol {
-            let peer = Endpoint::builder(presets::Minimal)
-                .relay_mode(RelayMode::Custom(relay_map))
-                .secret_key(SecretKey::from_bytes(&rng.random()))
-                .alpns(vec![b"not-gossip".to_vec()])
-                .ca_tls_config(CaTlsConfig::insecure_skip_verify())
-                .bind()
-                .await?;
-            peer.online().await;
-            peer
-        } else {
-            create_endpoint(rng, relay_map, None).await?
+            Gossip::t_new_on(dialer, Default::default(), &ct);
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").std_context("bind silent socket")?;
+        let peer = match failed_dial {
+            FailedDial::WrongProtocol => {
+                let peer = Endpoint::builder(presets::Minimal)
+                    .relay_mode(RelayMode::Custom(relay_map))
+                    .secret_key(SecretKey::from_bytes(&rng.random()))
+                    .alpns(vec![b"not-gossip".to_vec()])
+                    .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+                    .bind()
+                    .await?;
+                peer.online().await;
+                Some(peer)
+            }
+            FailedDial::Refused => Some(create_endpoint(rng, relay_map, None).await?),
+            FailedDial::NoAddress | FailedDial::TimesOut => None,
         };
-        let peer_id = peer.id();
-        let answerer = (failed_dial != FailedDial::NoAddress).then(|| {
-            let accepting = peer.clone();
+        let peer_id = match &peer {
+            Some(peer) => peer.id(),
+            None => SecretKey::from_bytes(&rng.random()).public(),
+        };
+        let answerer = peer.clone().map(|accepting| {
             spawn(async move {
                 while let Some(incoming) = accepting.accept().await {
                     if failed_dial == FailedDial::Refused {
@@ -2262,9 +2349,22 @@ pub(crate) mod tests {
                 }
             })
         });
-        if failed_dial != FailedDial::NoAddress {
+        let addr = match failed_dial {
+            FailedDial::NoAddress => None,
+            FailedDial::TimesOut => Some(
+                EndpointAddr::new(peer_id).with_ip_addr(
+                    silent
+                        .local_addr()
+                        .std_context("address of silent socket")?,
+                ),
+            ),
+            FailedDial::Refused | FailedDial::WrongProtocol => {
+                Some(EndpointAddr::new(peer_id).with_relay_url(relay_url))
+            }
+        };
+        if let Some(addr) = addr {
             let memory_lookup = MemoryLookup::new();
-            memory_lookup.add_endpoint_info(EndpointAddr::new(peer_id).with_relay_url(relay_url));
+            memory_lookup.add_endpoint_info(addr);
             ep1.address_lookup()?.add(memory_lookup);
         }
 
@@ -2313,6 +2413,20 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// A dial that nobody asks for again runs to its own timeout and logs the warning. Only a new
+    /// request for the same peer replaces a dial, and a replaced dial logs nothing.
+    #[tokio::test]
+    async fn a_dial_that_is_not_asked_again_times_out_with_a_warning() -> Result {
+        let warnings = warnings_of_a_failed_dial(FailedDial::TimesOut).await?;
+        assert!(
+            warnings
+                .iter()
+                .any(|event| event.contains("dial failed: timed out")),
+            "{warnings:?}"
+        );
+        Ok(())
+    }
+
     /// Every other dial failure stays a warning: here the handshake fails with another code.
     #[tokio::test]
     async fn a_dial_that_fails_for_another_reason_is_a_warning() -> Result {
@@ -2322,6 +2436,97 @@ pub(crate) mod tests {
             "{warnings:?}"
         );
         Ok(())
+    }
+
+    /// A dial that starts while nobody serves the key stays in flight until its idle timeout: the
+    /// handshake backs off its retransmits, and the last one before the timeout is long past when
+    /// the key gets served. A caller that asks for the peer again, as the healer of the app does,
+    /// must get a new dial, so that the link comes soon after the key is served, not at the timeout.
+    #[tokio::test]
+    async fn a_dial_to_a_key_that_is_served_late_links_soon_after() -> Result {
+        const SERVED_AFTER: Duration = Duration::from_secs(22);
+        let warnings = Arc::new(Mutex::new(Vec::new()));
+        let _log = tracing::subscriber::set_default(KeepsNetWarnings(Arc::clone(&warnings)));
+        let rng = &mut rand::rngs::ChaCha12Rng::seed_from_u64(1);
+        let ct = CancellationToken::new();
+        let (relay_map, relay_url, _guard) = iroh::test_utils::run_relay_server().await.unwrap();
+        let (go1, ep1, ep1_handle, _test_actor_handle1) =
+            Gossip::t_new(rng, Default::default(), relay_map.clone(), &ct).await?;
+        let secret_key = SecretKey::from_bytes(&rng.random());
+        let peer_id = secret_key.public();
+        let memory_lookup = MemoryLookup::new();
+        memory_lookup.add_endpoint_info(EndpointAddr::new(peer_id).with_relay_url(relay_url));
+        ep1.address_lookup()?.add(memory_lookup);
+
+        let topic: TopicId = blake3::hash(b"a_dial_to_a_key_that_is_served_late").into();
+        let (sender1, mut receiver1) = go1.subscribe(topic, vec![peer_id]).await?.split();
+
+        let served_at = Arc::new(Mutex::new(None));
+        let server = spawn({
+            let served_at = Arc::clone(&served_at);
+            let ct = ct.clone();
+            async move {
+                tokio::time::sleep(SERVED_AFTER).await;
+                let peer = Endpoint::builder(presets::Minimal)
+                    .relay_mode(RelayMode::Custom(relay_map))
+                    .secret_key(secret_key)
+                    .alpns(vec![GOSSIP_ALPN.to_vec()])
+                    .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+                    .bind()
+                    .await?;
+                peer.online().await;
+                *served_at.lock().expect("served_at mutex poisoned") =
+                    Some(std::time::Instant::now());
+                let (go2, _ep2, ep2_handle, _test_actor_handle2) =
+                    Gossip::t_new_on(peer, Default::default(), &ct);
+                let _sub2 = go2.subscribe(topic, Vec::new()).await?;
+                ep2_handle.await.std_context("join endpoint2 task")??;
+                Ok::<(), AnyError>(())
+            }
+        });
+
+        // Ask for the peer every 400 ms until it links, as the healer of the app does.
+        timeout(Duration::from_secs(50), async {
+            let mut tick = tokio::time::interval(Duration::from_millis(400));
+            loop {
+                tokio::select! {
+                    _ = tick.tick() => sender1.join_peers(vec![peer_id]).await?,
+                    event = receiver1.try_next() => {
+                        if event? == Some(Event::NeighborUp(peer_id)) {
+                            return Ok::<(), AnyError>(());
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .std_context("wait for the link")??;
+        let served_at = served_at
+            .lock()
+            .expect("served_at mutex poisoned")
+            .expect("the key is served before the link");
+        let late_by = served_at.elapsed();
+        assert!(
+            late_by < Duration::from_secs(6),
+            "the link came {late_by:?} after the key was served"
+        );
+        // The dials that were replaced were not faults.
+        assert_eq!(
+            *warnings.lock().expect("warnings mutex poisoned"),
+            Vec::<String>::new()
+        );
+
+        ct.cancel();
+        let wait = Duration::from_secs(2);
+        timeout(wait, ep1_handle)
+            .await
+            .std_context("wait endpoint1 task")?
+            .std_context("join endpoint1 task")??;
+        timeout(wait, server)
+            .await
+            .std_context("wait the server task")?
+            .std_context("join the server task")??;
+        Result::Ok(())
     }
 
     /// A connection that dies before the gossip handshake never made the peer a
