@@ -30,7 +30,9 @@ peer (`queue_dial` on every send in `PeerState::Pending`), so the retry is bound
 the hyparview messages to that peer. A peer that never gets an address is dialed once per message,
 each at debug. So that a real missing address stays visible, the log says it once at warn: when the
 dials of a peer have failed for want of an address for longer than `NO_ADDRESS_WARN_AFTER` (30 s).
-A dial that works, or fails in another way, ends the spell. Every other dial failure stays a warn.
+A dial that works, or fails in another way, ends the spell. So does a gap of 60 s with no dial of the
+peer. At most 1024 peers are kept (`MAX_NO_ADDRESS_SPELLS`), the oldest out first. Every other dial
+failure stays a warn.
 
 If upstream changes the `dial failed` log, keep the split in `dial_had_no_address` and the
 `NoAddressWatch` that counts the spell.

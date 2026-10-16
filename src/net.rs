@@ -1463,10 +1463,25 @@ const NO_ADDRESS_WARN_AFTER: Duration = if cfg!(test) {
     Duration::from_secs(30)
 };
 
+/// A run of failed dials for want of an address ends when the peer is not dialed for this long,
+/// so the entry of a peer that is gone does not stay. The disconnect of the peer cannot end it:
+/// each failed dial is followed by one. Twice the bound of the warning, so that a peer that
+/// is dialed with each message is not cut short. Tests use a short time.
+const NO_ADDRESS_SPELL_ENDS_AFTER: Duration = if cfg!(test) {
+    Duration::from_secs(2)
+} else {
+    Duration::from_secs(60)
+};
+
+/// How many peers [`NoAddressWatch`] keeps. The oldest one goes out when a new one comes in.
+const MAX_NO_ADDRESS_SPELLS: usize = 1024;
+
 /// Since when the dials of a peer fail for want of an address, and whether the log said so.
 #[derive(Debug)]
 struct NoAddressSpell {
     since: Instant,
+    /// The last failed dial.
+    last: Instant,
     warned: bool,
 }
 
@@ -1480,10 +1495,25 @@ impl NoAddressWatch {
     /// Notes that a dial of the peer failed for want of an address. Returns `true` once per
     /// spell: when the peer has had no address for longer than [`NO_ADDRESS_WARN_AFTER`].
     fn note(&mut self, endpoint_id: EndpointId, now: Instant) -> bool {
+        self.spells.retain(|_, spell| {
+            now.saturating_duration_since(spell.last) <= NO_ADDRESS_SPELL_ENDS_AFTER
+        });
+        if self.spells.len() >= MAX_NO_ADDRESS_SPELLS && !self.spells.contains_key(&endpoint_id) {
+            let oldest = self
+                .spells
+                .iter()
+                .min_by_key(|(_, spell)| spell.last)
+                .map(|(id, _)| *id);
+            if let Some(oldest) = oldest {
+                self.spells.remove(&oldest);
+            }
+        }
         let spell = self.spells.entry(endpoint_id).or_insert(NoAddressSpell {
             since: now,
+            last: now,
             warned: false,
         });
+        spell.last = now;
         let too_long = now.saturating_duration_since(spell.since) > NO_ADDRESS_WARN_AFTER;
         let warn_now = too_long && !spell.warned;
         spell.warned |= too_long;
@@ -2500,6 +2530,40 @@ pub(crate) mod tests {
         assert!(!watch.note(peer, start));
         watch.forget(peer);
         assert!(!watch.note(peer, start + NO_ADDRESS_WARN_AFTER * 2));
+    }
+
+    /// A spell is a run of failed dials. When the peer is not dialed for a long gap, the run is
+    /// over: the next failure starts a new spell, and the old entry cannot stay for ever.
+    #[test]
+    fn a_spell_ends_when_the_peer_is_not_dialed_for_a_long_gap() {
+        let mut watch = NoAddressWatch::default();
+        let peer = peer_id_of(5);
+        let start = Instant::now();
+        assert!(!watch.note(peer, start));
+        let later = start + NO_ADDRESS_SPELL_ENDS_AFTER + Duration::from_millis(1);
+        assert!(!watch.note(peer, later), "the gap ended the spell");
+        assert!(watch.note(
+            peer,
+            later + NO_ADDRESS_WARN_AFTER + Duration::from_millis(1)
+        ));
+    }
+
+    /// The map of spells has a cap: the oldest one goes out first.
+    #[test]
+    fn the_spells_are_capped_and_the_oldest_goes_out_first() {
+        let mut watch = NoAddressWatch::default();
+        let start = Instant::now();
+        let peer_of = |i: usize| {
+            let mut bytes = [7u8; 32];
+            bytes[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            SecretKey::from_bytes(&bytes).public()
+        };
+        for i in 0..=MAX_NO_ADDRESS_SPELLS {
+            watch.note(peer_of(i), start + Duration::from_micros(i as u64));
+        }
+        assert_eq!(watch.spells.len(), MAX_NO_ADDRESS_SPELLS);
+        assert!(!watch.spells.contains_key(&peer_of(0)), "the oldest stayed");
+        assert!(watch.spells.contains_key(&peer_of(MAX_NO_ADDRESS_SPELLS)));
     }
 
     /// The spells of two peers do not mix.
