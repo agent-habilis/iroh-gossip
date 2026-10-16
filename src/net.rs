@@ -931,11 +931,19 @@ impl Actor {
                                     Some(conn_id) => {
                                         if !self.dead_conns.contains(&(peer_id, conn_id)) {
                                             self.dead_conns.push_back((peer_id, conn_id));
-                                            warn!(
-                                                peer = %peer_id.fmt_short(),
-                                                conn_id,
-                                                "failed to send: connection task send loop terminated",
-                                            );
+                                            if closed_in_order(conns.chosen()) {
+                                                debug!(
+                                                    peer = %peer_id.fmt_short(),
+                                                    conn_id,
+                                                    "send on a connection that was closed in order",
+                                                );
+                                            } else {
+                                                warn!(
+                                                    peer = %peer_id.fmt_short(),
+                                                    conn_id,
+                                                    "failed to send: connection task send loop terminated",
+                                                );
+                                            }
                                         }
                                     }
                                     None => warn!(
@@ -1375,6 +1383,18 @@ impl Stream for TopicCommandStream {
             Poll::Pending => Poll::Pending,
         }
     }
+}
+
+/// Whether the connection was closed in order, by its peer or by us: an application closed it.
+/// A peer that leaves does so, and the next send finds the send loop ended. A reset, a timeout, a
+/// transport error, a connection that is still open and a missing connection are not.
+fn closed_in_order(conn: Option<&conns::Conn<ConnHandle>>) -> bool {
+    use iroh::endpoint::ConnectionError;
+    matches!(
+        conn.and_then(|conn| conn.handle.conn.as_ref())
+            .and_then(Connection::close_reason),
+        Some(ConnectionError::ApplicationClosed(_) | ConnectionError::LocallyClosed)
+    )
 }
 
 /// Whether the peer answered the dial with a refusal, as an endpoint that is closing does.
@@ -3058,6 +3078,95 @@ pub(crate) mod tests {
         );
         assert_eq!(rig.neighbor_downs(), vec![gone]);
         assert_eq!(rig.drain_data(1), 2, "the other peer got both broadcasts");
+        Ok(())
+    }
+
+    /// A connection of `endpoint` to a peer, closed with an application code by the peer
+    /// (`close_reason()` is `ApplicationClosed`) or by `endpoint` (`LocallyClosed`).
+    async fn connection_closed_in_order(
+        endpoint: &Endpoint,
+        by_the_peer: bool,
+    ) -> Result<Connection> {
+        let peer = Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Disabled)
+            .alpns(vec![GOSSIP_ALPN.to_vec()])
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+            .bind()
+            .await?;
+        let port = peer.bound_sockets()[0].port();
+        let addr = EndpointAddr::new(peer.id()).with_ip_addr(std::net::SocketAddr::from((
+            std::net::Ipv4Addr::LOCALHOST,
+            port,
+        )));
+        let accepting = peer.clone();
+        let closer = spawn(async move {
+            let incoming = accepting.accept().await.expect("an incoming connection");
+            let conn = incoming
+                .accept()
+                .expect("accept the connection")
+                .await
+                .expect("finish the handshake");
+            if by_the_peer {
+                conn.close(7u32.into(), b"the peer closed it");
+            }
+            conn.closed().await;
+        });
+        let conn = endpoint.connect(addr, GOSSIP_ALPN).await?;
+        if !by_the_peer {
+            conn.close(8u32.into(), b"we closed it");
+        }
+        conn.closed().await;
+        closer.await.std_context("join the closing peer")?;
+        Ok(conn)
+    }
+
+    /// The actor sends to a peer whose connection was closed in order, by the peer or by us, so
+    /// the send loop ended: that is the race of a leaving peer, not a fault to warn about. The
+    /// reason of the close is on the connection, and the connection task logs it when it finishes.
+    #[tokio::test]
+    async fn a_send_on_a_connection_that_was_closed_in_order_is_not_a_warning() -> Result {
+        for by_the_peer in [true, false] {
+            let warnings = Arc::new(Mutex::new(Vec::new()));
+            let _log = tracing::subscriber::set_default(KeepsNetWarnings(Arc::clone(&warnings)));
+            let mut rig = Rig::new(14, 2).await?;
+            let closed = connection_closed_in_order(&rig.actor.endpoint, by_the_peer).await?;
+            let peer = rig.peers[0].id;
+            let Some(PeerState::Active { conns, .. }) = rig.actor.peers.get_mut(&peer) else {
+                panic!("the peer is active");
+            };
+            conns.get_mut(0).expect("the first connection").handle.conn = Some(closed);
+            rig.end_send_loop(0);
+
+            rig.broadcast("after the connection was closed").await;
+
+            let warnings = warnings.lock().expect("warnings mutex poisoned").clone();
+            assert_eq!(
+                warnings,
+                Vec::<String>::new(),
+                "closed by the peer: {by_the_peer}"
+            );
+            assert!(!rig.actor.peers.contains_key(&peer), "the peer is dropped");
+        }
+        Ok(())
+    }
+
+    /// A peer with no connection to read a reason from keeps the warning.
+    #[tokio::test]
+    async fn a_send_on_a_connection_without_a_close_reason_is_a_warning() -> Result {
+        let warnings = Arc::new(Mutex::new(Vec::new()));
+        let _log = tracing::subscriber::set_default(KeepsNetWarnings(Arc::clone(&warnings)));
+        let mut rig = Rig::new(15, 2).await?;
+        rig.end_send_loop(0);
+
+        rig.broadcast("after the send loop ended").await;
+
+        let warnings = warnings.lock().expect("warnings mutex poisoned").clone();
+        assert!(
+            warnings
+                .iter()
+                .any(|event| event.contains("failed to send")),
+            "{warnings:?}"
+        );
         Ok(())
     }
 

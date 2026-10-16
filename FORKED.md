@@ -17,3 +17,13 @@ a new connection") is logged at debug, not warn. A closing endpoint gives that a
 not a fault, and the caller already retries or gives up. Every other dial failure stays a warn.
 
 If upstream changes the `dial failed` log, keep the split in `dial_was_refused`.
+
+## A send on a connection that was closed in order is logged at debug
+
+`net.rs`: when the send loop of the chosen connection has ended and the connection was closed
+with an application code, by the peer or by us (`close_reason()` is `ApplicationClosed` or
+`LocallyClosed`), the line is at debug, not warn. A peer that leaves does that, and the next send
+finds the loop ended. A reset, a timeout, a transport error, an open connection and a missing
+connection stay a warn.
+
+If upstream changes the `failed to send` log, keep the split in `closed_in_order`.
