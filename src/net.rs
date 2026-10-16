@@ -474,6 +474,8 @@ impl Actor {
                     Some(Err(err)) => {
                         if dial_was_refused(&err) {
                             debug!(peer = %peer_id.fmt_short(), "dial refused: {err}");
+                        } else if dial_had_no_address(&err) {
+                            debug!(peer = %peer_id.fmt_short(), "dial without an address: {err}");
                         } else {
                             warn!(peer = %peer_id.fmt_short(), "dial failed: {err}");
                         }
@@ -1416,6 +1418,19 @@ fn dial_was_refused(err: &iroh::endpoint::ConnectError) -> bool {
     )
 }
 
+/// Whether the dialer knows no address of the peer. The gossip learns a peer by id, often before
+/// anyone told the endpoint where to reach it, and the actor dials again when it knows.
+fn dial_had_no_address(err: &iroh::endpoint::ConnectError) -> bool {
+    use iroh::endpoint::{ConnectError, ConnectWithOptsError};
+    matches!(
+        err,
+        ConnectError::Connect {
+            source: ConnectWithOptsError::NoAddress { .. },
+            ..
+        }
+    )
+}
+
 #[derive(Debug)]
 struct Dialer {
     endpoint: Endpoint,
@@ -2200,10 +2215,20 @@ pub(crate) mod tests {
         fn exit(&self, _: &tracing::span::Id) {}
     }
 
+    /// How the peer of `warnings_of_a_failed_dial` makes the dial fail.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum FailedDial {
+        /// The peer refuses every connection, as a closing endpoint does.
+        Refused,
+        /// The dialer knows no address of the peer.
+        NoAddress,
+        /// The peer speaks another protocol, so the handshake ends in an error.
+        WrongProtocol,
+    }
+
     /// Dials a peer that fails the dial once, and returns the WARN and ERROR events of
-    /// `iroh_gossip::net`. The peer either refuses every connection, as a closing endpoint does,
-    /// or has no address at all.
-    async fn warnings_of_a_failed_dial(peer_refuses: bool) -> Result<Vec<String>> {
+    /// `iroh_gossip::net`.
+    async fn warnings_of_a_failed_dial(failed_dial: FailedDial) -> Result<Vec<String>> {
         let warnings = Arc::new(Mutex::new(Vec::new()));
         let _log = tracing::subscriber::set_default(KeepsNetWarnings(Arc::clone(&warnings)));
         let rng = &mut rand::rngs::ChaCha12Rng::seed_from_u64(1);
@@ -2211,17 +2236,33 @@ pub(crate) mod tests {
         let (relay_map, relay_url, _guard) = iroh::test_utils::run_relay_server().await.unwrap();
         let (go1, ep1, ep1_handle, _test_actor_handle1) =
             Gossip::t_new(rng, Default::default(), relay_map.clone(), &ct).await?;
-        let peer = create_endpoint(rng, relay_map, None).await?;
+        let peer = if failed_dial == FailedDial::WrongProtocol {
+            let peer = Endpoint::builder(presets::Minimal)
+                .relay_mode(RelayMode::Custom(relay_map))
+                .secret_key(SecretKey::from_bytes(&rng.random()))
+                .alpns(vec![b"not-gossip".to_vec()])
+                .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+                .bind()
+                .await?;
+            peer.online().await;
+            peer
+        } else {
+            create_endpoint(rng, relay_map, None).await?
+        };
         let peer_id = peer.id();
-        let refuser = peer_refuses.then(|| {
+        let answerer = (failed_dial != FailedDial::NoAddress).then(|| {
             let accepting = peer.clone();
             spawn(async move {
                 while let Some(incoming) = accepting.accept().await {
-                    incoming.refuse();
+                    if failed_dial == FailedDial::Refused {
+                        incoming.refuse();
+                    } else if let Ok(connecting) = incoming.accept() {
+                        let _ = connecting.await;
+                    }
                 }
             })
         });
-        if peer_refuses {
+        if failed_dial != FailedDial::NoAddress {
             let memory_lookup = MemoryLookup::new();
             memory_lookup.add_endpoint_info(EndpointAddr::new(peer_id).with_relay_url(relay_url));
             ep1.address_lookup()?.add(memory_lookup);
@@ -2239,8 +2280,8 @@ pub(crate) mod tests {
         .std_context("wait dial failure")?;
 
         ct.cancel();
-        if let Some(refuser) = refuser {
-            refuser.abort();
+        if let Some(answerer) = answerer {
+            answerer.abort();
         }
         timeout(Duration::from_secs(2), ep1_handle)
             .await
@@ -2254,14 +2295,28 @@ pub(crate) mod tests {
     /// retries or gives up, so it is not a fault to warn about.
     #[tokio::test]
     async fn a_dial_that_a_closing_peer_refuses_is_not_a_warning() -> Result {
-        assert_eq!(warnings_of_a_failed_dial(true).await?, Vec::<String>::new());
+        assert_eq!(
+            warnings_of_a_failed_dial(FailedDial::Refused).await?,
+            Vec::<String>::new()
+        );
         Ok(())
     }
 
-    /// Every other dial failure stays a warning: here the peer has no address to dial.
+    /// A peer that the gossip learned by id, before anyone told the endpoint its address, cannot
+    /// be dialed yet. The actor dials again when the address is known, so this is not a fault.
+    #[tokio::test]
+    async fn a_dial_to_a_peer_without_an_address_is_not_a_warning() -> Result {
+        assert_eq!(
+            warnings_of_a_failed_dial(FailedDial::NoAddress).await?,
+            Vec::<String>::new()
+        );
+        Ok(())
+    }
+
+    /// Every other dial failure stays a warning: here the handshake fails with another code.
     #[tokio::test]
     async fn a_dial_that_fails_for_another_reason_is_a_warning() -> Result {
-        let warnings = warnings_of_a_failed_dial(false).await?;
+        let warnings = warnings_of_a_failed_dial(FailedDial::WrongProtocol).await?;
         assert!(
             warnings.iter().any(|event| event.contains("dial failed")),
             "{warnings:?}"

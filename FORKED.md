@@ -18,6 +18,15 @@ not a fault, and the caller already retries or gives up. Every other dial failur
 
 If upstream changes the `dial failed` log, keep the split in `dial_was_refused`.
 
+## A dial to a peer without an address is logged at debug
+
+`net.rs`: a dial that fails with iroh's `ConnectWithOptsError::NoAddress` ("No addressing
+information available") is logged at debug, not warn. The gossip learns a peer by id, often before
+anyone told the endpoint where to reach it, and the actor dials again when the address is known.
+Every other dial failure stays a warn.
+
+If upstream changes the `dial failed` log, keep the split in `dial_had_no_address`.
+
 ## A send on a connection that was closed in order is logged at debug
 
 `net.rs`: when the send loop of the chosen connection has ended and the connection was closed
