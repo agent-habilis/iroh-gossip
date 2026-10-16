@@ -9,3 +9,11 @@ struct (one field), which a current peer cannot decode, so no decodable `Disconn
 `true` there.
 
 If upstream changes this field, the merge conflicts here. Keep `left` and its meaning.
+
+## A refused dial is logged at debug
+
+`net.rs`: a dial that the peer answers with `CONNECTION_REFUSED` ("the server refused to accept
+a new connection") is logged at debug, not warn. A closing endpoint gives that answer, so it is
+not a fault, and the caller already retries or gives up. Every other dial failure stays a warn.
+
+If upstream changes the `dial failed` log, keep the split in `dial_was_refused`.

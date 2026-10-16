@@ -472,7 +472,11 @@ impl Actor {
                         self.handle_connection(peer_id, ConnOrigin::Dial, conn);
                     }
                     Some(Err(err)) => {
-                        warn!(peer = %peer_id.fmt_short(), "dial failed: {err}");
+                        if dial_was_refused(&err) {
+                            debug!(peer = %peer_id.fmt_short(), "dial refused: {err}");
+                        } else {
+                            warn!(peer = %peer_id.fmt_short(), "dial failed: {err}");
+                        }
                         self.metrics.actor_tick_dialer_failure.inc();
                         let peer_state = self.peers.get(&peer_id);
                         let is_active = matches!(peer_state, Some(PeerState::Active { .. }));
@@ -1373,6 +1377,25 @@ impl Stream for TopicCommandStream {
     }
 }
 
+/// Whether the peer answered the dial with a refusal, as an endpoint that is closing does.
+/// That is a clear answer, and the caller retries or gives up, so it is not a fault to warn about.
+fn dial_was_refused(err: &iroh::endpoint::ConnectError) -> bool {
+    use iroh::endpoint::{ConnectError, ConnectingError, ConnectionError, TransportErrorCode};
+    let (ConnectError::Connection { source, .. }
+    | ConnectError::Connecting {
+        source: ConnectingError::ConnectionError { source, .. },
+        ..
+    }) = err
+    else {
+        return false;
+    };
+    matches!(
+        source,
+        ConnectionError::ConnectionClosed(close)
+            if close.error_code == TransportErrorCode::CONNECTION_REFUSED
+    )
+}
+
 #[derive(Debug)]
 struct Dialer {
     endpoint: Endpoint,
@@ -2129,6 +2152,101 @@ pub(crate) mod tests {
             .std_context("join endpoint2 task")??;
 
         Result::Ok(())
+    }
+
+    /// Keeps the WARN and ERROR events of `iroh_gossip::net` that the thread of the test logs.
+    /// A test on the current-thread runtime runs every task on that thread, the actor included.
+    struct KeepsNetWarnings(Arc<Mutex<Vec<String>>>);
+
+    impl tracing::Subscriber for KeepsNetWarnings {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let meta = event.metadata();
+            if *meta.level() <= tracing::Level::WARN && meta.target() == "iroh_gossip::net" {
+                self.0
+                    .lock()
+                    .expect("warnings mutex poisoned")
+                    .push(format!("{event:?}"));
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// Dials a peer that fails the dial once, and returns the WARN and ERROR events of
+    /// `iroh_gossip::net`. The peer either refuses every connection, as a closing endpoint does,
+    /// or has no address at all.
+    async fn warnings_of_a_failed_dial(peer_refuses: bool) -> Result<Vec<String>> {
+        let warnings = Arc::new(Mutex::new(Vec::new()));
+        let _log = tracing::subscriber::set_default(KeepsNetWarnings(Arc::clone(&warnings)));
+        let rng = &mut rand::rngs::ChaCha12Rng::seed_from_u64(1);
+        let ct = CancellationToken::new();
+        let (relay_map, relay_url, _guard) = iroh::test_utils::run_relay_server().await.unwrap();
+        let (go1, ep1, ep1_handle, _test_actor_handle1) =
+            Gossip::t_new(rng, Default::default(), relay_map.clone(), &ct).await?;
+        let peer = create_endpoint(rng, relay_map, None).await?;
+        let peer_id = peer.id();
+        let refuser = peer_refuses.then(|| {
+            let accepting = peer.clone();
+            spawn(async move {
+                while let Some(incoming) = accepting.accept().await {
+                    incoming.refuse();
+                }
+            })
+        });
+        if peer_refuses {
+            let memory_lookup = MemoryLookup::new();
+            memory_lookup.add_endpoint_info(EndpointAddr::new(peer_id).with_relay_url(relay_url));
+            ep1.address_lookup()?.add(memory_lookup);
+        }
+
+        let topic: TopicId = blake3::hash(b"a_failed_dial_and_the_level_of_its_log").into();
+        let _sub1 = go1.subscribe(topic, vec![peer_id]).await?;
+        let metrics = go1.metrics().clone();
+        timeout(Duration::from_secs(20), async {
+            while metrics.actor_tick_dialer_failure.get() == 0 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .std_context("wait dial failure")?;
+
+        ct.cancel();
+        if let Some(refuser) = refuser {
+            refuser.abort();
+        }
+        timeout(Duration::from_secs(2), ep1_handle)
+            .await
+            .std_context("wait endpoint1 task")?
+            .std_context("join endpoint1 task")??;
+        let warnings = warnings.lock().expect("warnings mutex poisoned").clone();
+        Ok(warnings)
+    }
+
+    /// A peer that is closing refuses a new connection. That is a clear answer, and the caller
+    /// retries or gives up, so it is not a fault to warn about.
+    #[tokio::test]
+    async fn a_dial_that_a_closing_peer_refuses_is_not_a_warning() -> Result {
+        assert_eq!(warnings_of_a_failed_dial(true).await?, Vec::<String>::new());
+        Ok(())
+    }
+
+    /// Every other dial failure stays a warning: here the peer has no address to dial.
+    #[tokio::test]
+    async fn a_dial_that_fails_for_another_reason_is_a_warning() -> Result {
+        let warnings = warnings_of_a_failed_dial(false).await?;
+        assert!(
+            warnings.iter().any(|event| event.contains("dial failed")),
+            "{warnings:?}"
+        );
+        Ok(())
     }
 
     /// A connection that dies before the gossip handshake never made the peer a
