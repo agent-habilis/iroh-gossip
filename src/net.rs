@@ -467,17 +467,28 @@ impl Actor {
                 self.metrics.actor_tick_dialer.inc();
                 match res {
                     Some(Ok(conn)) => {
+                        self.dialer.no_address.forget(peer_id);
                         debug!(peer = %peer_id.fmt_short(), "dial successful");
                         self.metrics.actor_tick_dialer_success.inc();
                         self.handle_connection(peer_id, ConnOrigin::Dial, conn);
                     }
                     Some(Err(err)) => {
-                        if dial_was_refused(&err) {
-                            debug!(peer = %peer_id.fmt_short(), "dial refused: {err}");
-                        } else if dial_had_no_address(&err) {
-                            debug!(peer = %peer_id.fmt_short(), "dial without an address: {err}");
+                        if dial_had_no_address(&err) {
+                            if self.dialer.no_address.note(peer_id, Instant::now()) {
+                                warn!(
+                                    peer = %peer_id.fmt_short(),
+                                    "dial without an address for over {NO_ADDRESS_WARN_AFTER:?}: {err}"
+                                );
+                            } else {
+                                debug!(peer = %peer_id.fmt_short(), "dial without an address: {err}");
+                            }
                         } else {
-                            warn!(peer = %peer_id.fmt_short(), "dial failed: {err}");
+                            self.dialer.no_address.forget(peer_id);
+                            if dial_was_refused(&err) {
+                                debug!(peer = %peer_id.fmt_short(), "dial refused: {err}");
+                            } else {
+                                warn!(peer = %peer_id.fmt_short(), "dial failed: {err}");
+                            }
                         }
                         self.metrics.actor_tick_dialer_failure.inc();
                         let peer_state = self.peers.get(&peer_id);
@@ -1442,6 +1453,49 @@ fn dial_had_no_address(err: &iroh::endpoint::ConnectError) -> bool {
 /// the peer for up to the idle timeout after the peer is served.
 const DIAL_REPLACED_AFTER: Duration = Duration::from_secs(5);
 
+/// How long a peer may fail the dial for want of an address before the log says so at warn.
+/// The dial repeats with each message to the peer, and the address of a peer that the gossip
+/// learned from the overlay comes from the app a few hundred ms later, so a short gap is the
+/// normal case and stays at debug. Tests use a short bound.
+const NO_ADDRESS_WARN_AFTER: Duration = if cfg!(test) {
+    Duration::from_secs(1)
+} else {
+    Duration::from_secs(30)
+};
+
+/// Since when the dials of a peer fail for want of an address, and whether the log said so.
+#[derive(Debug)]
+struct NoAddressSpell {
+    since: Instant,
+    warned: bool,
+}
+
+/// The peers whose last dial failed for want of an address.
+#[derive(Debug, Default)]
+struct NoAddressWatch {
+    spells: HashMap<EndpointId, NoAddressSpell>,
+}
+
+impl NoAddressWatch {
+    /// Notes that a dial of the peer failed for want of an address. Returns `true` once per
+    /// spell: when the peer has had no address for longer than [`NO_ADDRESS_WARN_AFTER`].
+    fn note(&mut self, endpoint_id: EndpointId, now: Instant) -> bool {
+        let spell = self.spells.entry(endpoint_id).or_insert(NoAddressSpell {
+            since: now,
+            warned: false,
+        });
+        let too_long = now.saturating_duration_since(spell.since) > NO_ADDRESS_WARN_AFTER;
+        let warn_now = too_long && !spell.warned;
+        spell.warned |= too_long;
+        warn_now
+    }
+
+    /// Notes that a dial of the peer ended in another way, so the spell without an address ends.
+    fn forget(&mut self, endpoint_id: EndpointId) {
+        self.spells.remove(&endpoint_id);
+    }
+}
+
 /// The end of a dial: the connection or the error, or nothing if the dial was dropped.
 type DialOutcome = Option<Result<Connection, iroh::endpoint::ConnectError>>;
 
@@ -1459,6 +1513,7 @@ struct Dialer {
     pending: JoinSet<(EndpointId, u64, DialOutcome)>,
     pending_dials: HashMap<EndpointId, PendingDial>,
     next_generation: u64,
+    no_address: NoAddressWatch,
 }
 
 impl Dialer {
@@ -1469,6 +1524,7 @@ impl Dialer {
             pending: Default::default(),
             pending_dials: Default::default(),
             next_generation: 0,
+            no_address: Default::default(),
         }
     }
 
@@ -2403,12 +2459,98 @@ pub(crate) mod tests {
     }
 
     /// A peer that the gossip learned by id, before anyone told the endpoint its address, cannot
-    /// be dialed yet. The actor dials again when the address is known, so this is not a fault.
+    /// be dialed yet. The dial repeats with the next message to the peer, so a short gap is not a
+    /// fault.
     #[tokio::test]
     async fn a_dial_to_a_peer_without_an_address_is_not_a_warning() -> Result {
         assert_eq!(
             warnings_of_a_failed_dial(FailedDial::NoAddress).await?,
             Vec::<String>::new()
+        );
+        Ok(())
+    }
+
+    fn peer_id_of(seed: u8) -> EndpointId {
+        SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    /// A peer that stays without an address is a fault to see in the log: one warning once the
+    /// spell is longer than the bound, and no more for the same spell.
+    #[test]
+    fn a_peer_that_never_gets_an_address_is_noted_once_after_the_bound() {
+        let mut watch = NoAddressWatch::default();
+        let peer = peer_id_of(1);
+        let start = Instant::now();
+        assert!(!watch.note(peer, start));
+        assert!(!watch.note(peer, start + NO_ADDRESS_WARN_AFTER / 2));
+        assert!(watch.note(
+            peer,
+            start + NO_ADDRESS_WARN_AFTER + Duration::from_millis(1)
+        ));
+        assert!(!watch.note(peer, start + NO_ADDRESS_WARN_AFTER * 2));
+    }
+
+    /// A peer whose address comes in time never reaches the bound: the dial that works ends the
+    /// spell, and the next gap without an address starts a new one.
+    #[test]
+    fn a_peer_that_gets_its_address_in_time_is_not_noted() {
+        let mut watch = NoAddressWatch::default();
+        let peer = peer_id_of(2);
+        let start = Instant::now();
+        assert!(!watch.note(peer, start));
+        watch.forget(peer);
+        assert!(!watch.note(peer, start + NO_ADDRESS_WARN_AFTER * 2));
+    }
+
+    /// The spells of two peers do not mix.
+    #[test]
+    fn the_spell_of_a_peer_is_its_own() {
+        let mut watch = NoAddressWatch::default();
+        let start = Instant::now();
+        assert!(!watch.note(peer_id_of(3), start));
+        assert!(!watch.note(peer_id_of(4), start + NO_ADDRESS_WARN_AFTER * 2));
+    }
+
+    /// The actor warns once for a peer that has no address for longer than the bound, and the
+    /// dials before that stay at debug.
+    #[tokio::test]
+    async fn a_peer_that_stays_without_an_address_gets_one_warning() -> Result {
+        let warnings = Arc::new(Mutex::new(Vec::new()));
+        let _log = tracing::subscriber::set_default(KeepsNetWarnings(Arc::clone(&warnings)));
+        let rng = &mut rand::rngs::ChaCha12Rng::seed_from_u64(1);
+        let ct = CancellationToken::new();
+        let (relay_map, _relay_url, _guard) = iroh::test_utils::run_relay_server().await.unwrap();
+        let (go1, _ep1, ep1_handle, _test_actor_handle1) =
+            Gossip::t_new(rng, Default::default(), relay_map, &ct).await?;
+        let peer_id = SecretKey::from_bytes(&rng.random()).public();
+        let topic: TopicId = blake3::hash(b"a_peer_that_stays_without_an_address").into();
+        let (sender, _receiver) = go1.subscribe(topic, Vec::new()).await?.split();
+        let metrics = go1.metrics().clone();
+
+        // One dial every 300 ms for 3 s: the bound of a test is 1 s.
+        for _ in 0..10 {
+            sender.join_peers(vec![peer_id]).await?;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        assert!(
+            metrics.actor_tick_dialer_failure.get() >= 5,
+            "the peer was dialed {} times",
+            metrics.actor_tick_dialer_failure.get()
+        );
+
+        ct.cancel();
+        timeout(Duration::from_secs(2), ep1_handle)
+            .await
+            .std_context("wait endpoint1 task")?
+            .std_context("join endpoint1 task")??;
+        let warnings = warnings.lock().expect("warnings mutex poisoned").clone();
+        assert_eq!(
+            warnings
+                .iter()
+                .filter(|event| event.contains("dial without an address"))
+                .count(),
+            1,
+            "{warnings:?}"
         );
         Ok(())
     }

@@ -18,26 +18,22 @@ not a fault, and the caller already retries or gives up. Every other dial failur
 
 If upstream changes the `dial failed` log, keep the split in `dial_was_refused`.
 
-## A dial to a peer without an address is logged at debug
+## A dial to a peer without an address is logged at debug, then at warn once
 
 `net.rs`: a dial that fails with iroh's `ConnectWithOptsError::NoAddress` ("No addressing
-information available") is logged at debug, not warn. The gossip learns a peer by id, often before
-anyone told the endpoint where to reach it, and the actor dials again when the address is known.
-Every other dial failure stays a warn.
+information available") is logged at debug, not warn. The gossip learns a peer by id from the
+overlay (a forward-join), often before the app told the endpoint where to reach it. In a mesh
+where the app brings the address (WebRTC only) the gap was 90 ms to 400 ms in the loopback tests.
 
-If upstream changes the `dial failed` log, keep the split in `dial_had_no_address`.
+The dial is not retried by a timer. It repeats with the next message that the gossip sends to the
+peer (`queue_dial` on every send in `PeerState::Pending`), so the retry is bounded by the rate of
+the hyparview messages to that peer. A peer that never gets an address is dialed once per message,
+each at debug. So that a real missing address stays visible, the log says it once at warn: when the
+dials of a peer have failed for want of an address for longer than `NO_ADDRESS_WARN_AFTER` (30 s).
+A dial that works, or fails in another way, ends the spell. Every other dial failure stays a warn.
 
-## A dial that is older than five seconds is replaced when its caller asks again
-
-`net.rs`: `Dialer` drops a pending dial and starts a new one when `Command::JoinPeers` names the
-same peer and the dial is older than `DIAL_REPLACED_AFTER` (5 s). Upstream skips every later request
-while a dial is in flight. A dial that began while nobody served the peer then misses the peer for
-up to the 30 s idle timeout after the peer is served, because the handshake backs off its
-retransmits. Nothing replaces a dial by itself, and a dial that nobody asks for again still runs to
-its timeout and logs `dial failed`. The replaced dial ends without a log line above debug (a
-`generation` tells it from its successor).
-
-If upstream changes `Dialer`, keep `replace_old_dial` and the `generation` check in `next_conn`.
+If upstream changes the `dial failed` log, keep the split in `dial_had_no_address` and the
+`NoAddressWatch` that counts the spell.
 
 ## A send on a connection that was closed in order is logged at debug
 
