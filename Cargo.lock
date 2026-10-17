@@ -1687,7 +1687,7 @@ dependencies = [
 [[package]]
 name = "iroh"
 version = "1.0.3"
-source = "git+https://github.com/agent-habilis/iroh?rev=0e7cdb4cd73952c49699cd7ae971a1fc2982b866#0e7cdb4cd73952c49699cd7ae971a1fc2982b866"
+source = "git+https://github.com/agent-habilis/iroh?rev=ac2f71f19cc1fb1b4612a5989721855ad7960192#ac2f71f19cc1fb1b4612a5989721855ad7960192"
 dependencies = [
  "axum",
  "backon",
@@ -1711,8 +1711,8 @@ dependencies = [
  "n0-future",
  "n0-watcher",
  "netwatch",
- "noq",
- "noq-proto",
+ "noq 1.1.0",
+ "noq-proto 1.1.0",
  "noq-udp",
  "papaya",
  "pin-project",
@@ -1737,7 +1737,7 @@ dependencies = [
 [[package]]
 name = "iroh-base"
 version = "1.0.3"
-source = "git+https://github.com/agent-habilis/iroh?rev=0e7cdb4cd73952c49699cd7ae971a1fc2982b866#0e7cdb4cd73952c49699cd7ae971a1fc2982b866"
+source = "git+https://github.com/agent-habilis/iroh?rev=ac2f71f19cc1fb1b4612a5989721855ad7960192#ac2f71f19cc1fb1b4612a5989721855ad7960192"
 dependencies = [
  "curve25519-dalek",
  "data-encoding",
@@ -1755,7 +1755,7 @@ dependencies = [
 [[package]]
 name = "iroh-dns"
 version = "1.0.3"
-source = "git+https://github.com/agent-habilis/iroh?rev=0e7cdb4cd73952c49699cd7ae971a1fc2982b866#0e7cdb4cd73952c49699cd7ae971a1fc2982b866"
+source = "git+https://github.com/agent-habilis/iroh?rev=ac2f71f19cc1fb1b4612a5989721855ad7960192#ac2f71f19cc1fb1b4612a5989721855ad7960192"
 dependencies = [
  "arc-swap",
  "cfg_aliases",
@@ -1796,7 +1796,7 @@ dependencies = [
  "n0-error",
  "n0-future",
  "n0-tracing-test",
- "noq",
+ "noq 1.1.1",
  "postcard",
  "rand",
  "rayon",
@@ -1850,7 +1850,7 @@ dependencies = [
 [[package]]
 name = "iroh-relay"
 version = "1.0.3"
-source = "git+https://github.com/agent-habilis/iroh?rev=0e7cdb4cd73952c49699cd7ae971a1fc2982b866#0e7cdb4cd73952c49699cd7ae971a1fc2982b866"
+source = "git+https://github.com/agent-habilis/iroh?rev=ac2f71f19cc1fb1b4612a5989721855ad7960192#ac2f71f19cc1fb1b4612a5989721855ad7960192"
 dependencies = [
  "blake3",
  "bytes",
@@ -1871,8 +1871,8 @@ dependencies = [
  "lru",
  "n0-error",
  "n0-future",
- "noq",
- "noq-proto",
+ "noq 1.1.0",
+ "noq-proto 1.1.0",
  "num_enum",
  "pin-project",
  "postcard",
@@ -1915,7 +1915,7 @@ dependencies = [
  "irpc-derive",
  "n0-error",
  "n0-future",
- "noq",
+ "noq 1.1.1",
  "postcard",
  "rcgen",
  "rustls",
@@ -2394,14 +2394,13 @@ dependencies = [
 
 [[package]]
 name = "noq"
-version = "1.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09e4bb6601fa543c110d8957813267d5a8d775a0f8fbaccf1f615d06ba9b10da"
+version = "1.1.0"
+source = "git+https://github.com/agent-habilis/noq?rev=2e00fd44725672250ac736db73d08c7e047e1736#2e00fd44725672250ac736db73d08c7e047e1736"
 dependencies = [
  "bytes",
  "cfg_aliases",
  "derive_more",
- "noq-proto",
+ "noq-proto 1.1.0",
  "noq-udp",
  "pin-project-lite",
  "rustc-hash",
@@ -2410,6 +2409,55 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
+ "tracing",
+ "web-time",
+]
+
+[[package]]
+name = "noq"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09e4bb6601fa543c110d8957813267d5a8d775a0f8fbaccf1f615d06ba9b10da"
+dependencies = [
+ "bytes",
+ "cfg_aliases",
+ "derive_more",
+ "noq-proto 1.1.1",
+ "noq-udp",
+ "pin-project-lite",
+ "rustc-hash",
+ "rustls",
+ "socket2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "web-time",
+]
+
+[[package]]
+name = "noq-proto"
+version = "1.1.0"
+source = "git+https://github.com/agent-habilis/noq?rev=2e00fd44725672250ac736db73d08c7e047e1736#2e00fd44725672250ac736db73d08c7e047e1736"
+dependencies = [
+ "aes-gcm",
+ "bytes",
+ "derive_more",
+ "enum-assoc",
+ "getrandom 0.4.2",
+ "identity-hash",
+ "lru-slab",
+ "rand",
+ "rand_pcg",
+ "ring",
+ "rustc-hash",
+ "rustls",
+ "rustls-pki-types",
+ "rustls-platform-verifier",
+ "slab",
+ "sorted-index-buffer",
+ "thiserror 2.0.18",
+ "tinyvec",
  "tracing",
  "web-time",
 ]
@@ -2434,7 +2482,6 @@ dependencies = [
  "rustc-hash",
  "rustls",
  "rustls-pki-types",
- "rustls-platform-verifier",
  "slab",
  "sorted-index-buffer",
  "thiserror 2.0.18",
@@ -3113,9 +3160,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "aws-lc-rs",
  "log",

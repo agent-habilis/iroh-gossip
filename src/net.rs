@@ -467,12 +467,29 @@ impl Actor {
                 self.metrics.actor_tick_dialer.inc();
                 match res {
                     Some(Ok(conn)) => {
+                        self.dialer.no_address.forget(peer_id);
                         debug!(peer = %peer_id.fmt_short(), "dial successful");
                         self.metrics.actor_tick_dialer_success.inc();
                         self.handle_connection(peer_id, ConnOrigin::Dial, conn);
                     }
                     Some(Err(err)) => {
-                        warn!(peer = %peer_id.fmt_short(), "dial failed: {err}");
+                        if dial_had_no_address(&err) {
+                            if self.dialer.no_address.note(peer_id, Instant::now()) {
+                                warn!(
+                                    peer = %peer_id.fmt_short(),
+                                    "dial without an address for over {NO_ADDRESS_WARN_AFTER:?}: {err}"
+                                );
+                            } else {
+                                debug!(peer = %peer_id.fmt_short(), "dial without an address: {err}");
+                            }
+                        } else {
+                            self.dialer.no_address.forget(peer_id);
+                            if dial_was_refused(&err) {
+                                debug!(peer = %peer_id.fmt_short(), "dial refused: {err}");
+                            } else {
+                                warn!(peer = %peer_id.fmt_short(), "dial failed: {err}");
+                            }
+                        }
                         self.metrics.actor_tick_dialer_failure.inc();
                         let peer_state = self.peers.get(&peer_id);
                         let is_active = matches!(peer_state, Some(PeerState::Active { .. }));
@@ -553,7 +570,13 @@ impl Actor {
                     Command::BroadcastNeighbors(message) => {
                         ProtoCommand::Broadcast(message, Scope::Neighbors)
                     }
-                    Command::JoinPeers(peers) => ProtoCommand::Join(peers),
+                    Command::JoinPeers(peers) => {
+                        let now = Instant::now();
+                        for peer in &peers {
+                            self.dialer.replace_old_dial(*peer, now);
+                        }
+                        ProtoCommand::Join(peers)
+                    }
                     Command::LeavePeers(peers) => ProtoCommand::LeavePeers(peers),
                     Command::NeighborPeers(peers) => ProtoCommand::NeighborPeers(peers),
                 };
@@ -927,11 +950,19 @@ impl Actor {
                                     Some(conn_id) => {
                                         if !self.dead_conns.contains(&(peer_id, conn_id)) {
                                             self.dead_conns.push_back((peer_id, conn_id));
-                                            warn!(
-                                                peer = %peer_id.fmt_short(),
-                                                conn_id,
-                                                "failed to send: connection task send loop terminated",
-                                            );
+                                            if closed_in_order(conns.chosen()) {
+                                                debug!(
+                                                    peer = %peer_id.fmt_short(),
+                                                    conn_id,
+                                                    "send on a connection that was closed in order",
+                                                );
+                                            } else {
+                                                warn!(
+                                                    peer = %peer_id.fmt_short(),
+                                                    conn_id,
+                                                    "failed to send: connection task send loop terminated",
+                                                );
+                                            }
                                         }
                                     }
                                     None => warn!(
@@ -1373,14 +1404,146 @@ impl Stream for TopicCommandStream {
     }
 }
 
+/// Whether the connection was closed in order, by its peer or by us: an application closed it.
+/// A peer that leaves does so, and the next send finds the send loop ended. A reset, a timeout, a
+/// transport error, a connection that is still open and a missing connection are not.
+fn closed_in_order(conn: Option<&conns::Conn<ConnHandle>>) -> bool {
+    use iroh::endpoint::ConnectionError;
+    matches!(
+        conn.and_then(|conn| conn.handle.conn.as_ref())
+            .and_then(Connection::close_reason),
+        Some(ConnectionError::ApplicationClosed(_) | ConnectionError::LocallyClosed)
+    )
+}
+
+/// Whether the peer answered the dial with a refusal, as an endpoint that is closing does.
+/// That is a clear answer, and the caller retries or gives up, so it is not a fault to warn about.
+fn dial_was_refused(err: &iroh::endpoint::ConnectError) -> bool {
+    use iroh::endpoint::{ConnectError, ConnectingError, ConnectionError, TransportErrorCode};
+    let (ConnectError::Connection { source, .. }
+    | ConnectError::Connecting {
+        source: ConnectingError::ConnectionError { source, .. },
+        ..
+    }) = err
+    else {
+        return false;
+    };
+    matches!(
+        source,
+        ConnectionError::ConnectionClosed(close)
+            if close.error_code == TransportErrorCode::CONNECTION_REFUSED
+    )
+}
+
+/// Whether the dialer knows no address of the peer. The gossip learns a peer by id, often before
+/// anyone told the endpoint where to reach it, and the actor dials again when it knows.
+fn dial_had_no_address(err: &iroh::endpoint::ConnectError) -> bool {
+    use iroh::endpoint::{ConnectError, ConnectWithOptsError};
+    matches!(
+        err,
+        ConnectError::Connect {
+            source: ConnectWithOptsError::NoAddress { .. },
+            ..
+        }
+    )
+}
+
+/// A dial that is older than this is replaced when its caller asks for the same peer again. The
+/// handshake backs off its retransmits, so a dial that began while nobody served the peer misses
+/// the peer for up to the idle timeout after the peer is served.
+const DIAL_REPLACED_AFTER: Duration = Duration::from_secs(5);
+
+/// How long a peer may fail the dial for want of an address before the log says so at warn.
+/// The dial repeats with each message to the peer, and the address of a peer that the gossip
+/// learned from the overlay comes from the app a few hundred ms later, so a short gap is the
+/// normal case and stays at debug. Tests use a short bound.
+const NO_ADDRESS_WARN_AFTER: Duration = if cfg!(test) {
+    Duration::from_secs(1)
+} else {
+    Duration::from_secs(30)
+};
+
+/// A run of failed dials for want of an address ends when the peer is not dialed for this long,
+/// so the entry of a peer that is gone does not stay. The disconnect of the peer cannot end it:
+/// each failed dial is followed by one. Twice the bound of the warning, so that a peer that
+/// is dialed with each message is not cut short. Tests use a short time.
+const NO_ADDRESS_SPELL_ENDS_AFTER: Duration = if cfg!(test) {
+    Duration::from_secs(2)
+} else {
+    Duration::from_secs(60)
+};
+
+/// How many peers [`NoAddressWatch`] keeps. The oldest one goes out when a new one comes in.
+const MAX_NO_ADDRESS_SPELLS: usize = 1024;
+
+/// Since when the dials of a peer fail for want of an address, and whether the log said so.
+#[derive(Debug)]
+struct NoAddressSpell {
+    since: Instant,
+    /// The last failed dial.
+    last: Instant,
+    warned: bool,
+}
+
+/// The peers whose last dial failed for want of an address.
+#[derive(Debug, Default)]
+struct NoAddressWatch {
+    spells: HashMap<EndpointId, NoAddressSpell>,
+}
+
+impl NoAddressWatch {
+    /// Notes that a dial of the peer failed for want of an address. Returns `true` once per
+    /// spell: when the peer has had no address for longer than [`NO_ADDRESS_WARN_AFTER`].
+    fn note(&mut self, endpoint_id: EndpointId, now: Instant) -> bool {
+        self.spells.retain(|_, spell| {
+            now.saturating_duration_since(spell.last) <= NO_ADDRESS_SPELL_ENDS_AFTER
+        });
+        if self.spells.len() >= MAX_NO_ADDRESS_SPELLS && !self.spells.contains_key(&endpoint_id) {
+            let oldest = self
+                .spells
+                .iter()
+                .min_by_key(|(_, spell)| spell.last)
+                .map(|(id, _)| *id);
+            if let Some(oldest) = oldest {
+                self.spells.remove(&oldest);
+            }
+        }
+        let spell = self.spells.entry(endpoint_id).or_insert(NoAddressSpell {
+            since: now,
+            last: now,
+            warned: false,
+        });
+        spell.last = now;
+        let too_long = now.saturating_duration_since(spell.since) > NO_ADDRESS_WARN_AFTER;
+        let warn_now = too_long && !spell.warned;
+        spell.warned |= too_long;
+        warn_now
+    }
+
+    /// Notes that a dial of the peer ended in another way, so the spell without an address ends.
+    fn forget(&mut self, endpoint_id: EndpointId) {
+        self.spells.remove(&endpoint_id);
+    }
+}
+
+/// The end of a dial: the connection or the error, or nothing if the dial was dropped.
+type DialOutcome = Option<Result<Connection, iroh::endpoint::ConnectError>>;
+
+#[derive(Debug)]
+struct PendingDial {
+    cancel: CancellationToken,
+    started: Instant,
+    /// Tells the dial of the peer from a dial that replaced it, when the old one ends.
+    generation: u64,
+}
+
 #[derive(Debug)]
 struct Dialer {
     endpoint: Endpoint,
-    pending: JoinSet<(
-        EndpointId,
-        Option<Result<Connection, iroh::endpoint::ConnectError>>,
-    )>,
-    pending_dials: HashMap<EndpointId, CancellationToken>,
+    pending: JoinSet<(EndpointId, u64, DialOutcome)>,
+    pending_dials: HashMap<EndpointId, PendingDial>,
+    next_generation: u64,
+    no_address: NoAddressWatch,
 }
 
 impl Dialer {
@@ -1390,6 +1553,8 @@ impl Dialer {
             endpoint,
             pending: Default::default(),
             pending_dials: Default::default(),
+            next_generation: 0,
+            no_address: Default::default(),
         }
     }
 
@@ -1399,7 +1564,16 @@ impl Dialer {
             return;
         }
         let cancel = CancellationToken::new();
-        self.pending_dials.insert(endpoint_id, cancel.clone());
+        let generation = self.next_generation;
+        self.next_generation += 1;
+        self.pending_dials.insert(
+            endpoint_id,
+            PendingDial {
+                cancel: cancel.clone(),
+                started: Instant::now(),
+                generation,
+            },
+        );
         let endpoint = self.endpoint.clone();
         self.pending.spawn(
             async move {
@@ -1408,10 +1582,25 @@ impl Dialer {
                     _ = cancel.cancelled() => None,
                     res = endpoint.connect(endpoint_id, &alpn) => Some(res),
                 };
-                (endpoint_id, res)
+                (endpoint_id, generation, res)
             }
             .instrument(tracing::Span::current()),
         );
+    }
+
+    /// Drops the dial of a peer that its caller asks for again, if the dial is older than
+    /// [`DIAL_REPLACED_AFTER`]. The next [`Self::queue_dial`] for the peer starts a new dial. The
+    /// dropped dial ends without a result.
+    fn replace_old_dial(&mut self, endpoint_id: EndpointId, now: Instant) {
+        let Some(dial) = self.pending_dials.get(&endpoint_id) else {
+            return;
+        };
+        if now.saturating_duration_since(dial.started) < DIAL_REPLACED_AFTER {
+            return;
+        }
+        debug!(peer = %endpoint_id.fmt_short(), "replace a dial that is still pending");
+        dial.cancel.cancel();
+        self.pending_dials.remove(&endpoint_id);
     }
 
     /// Checks if a endpoint is currently being dialed.
@@ -1421,19 +1610,20 @@ impl Dialer {
 
     /// Waits for the next dial operation to complete.
     /// `None` means disconnected
-    async fn next_conn(
-        &mut self,
-    ) -> (
-        EndpointId,
-        Option<Result<Connection, iroh::endpoint::ConnectError>>,
-    ) {
+    async fn next_conn(&mut self) -> (EndpointId, DialOutcome) {
         match self.pending_dials.is_empty() {
             false => {
                 let (endpoint_id, res) = loop {
                     match self.pending.join_next().await {
-                        Some(Ok((endpoint_id, res))) => {
-                            self.pending_dials.remove(&endpoint_id);
-                            break (endpoint_id, res);
+                        Some(Ok((endpoint_id, generation, res))) => {
+                            let current = self
+                                .pending_dials
+                                .get(&endpoint_id)
+                                .is_some_and(|dial| dial.generation == generation);
+                            if current {
+                                self.pending_dials.remove(&endpoint_id);
+                                break (endpoint_id, res);
+                            }
                         }
                         Some(Err(e)) => {
                             error!("next conn error: {:?}", e);
@@ -1460,7 +1650,7 @@ pub(crate) mod tests {
     use futures_concurrency::future::TryJoin;
     use iroh::{
         address_lookup::memory::MemoryLookup,
-        endpoint::{presets, BindError},
+        endpoint::{presets, BindError, QuicTransportConfig},
         protocol::Router,
         tls::CaTlsConfig,
         RelayMap, RelayMode, RelayUrl, SecretKey,
@@ -1538,6 +1728,15 @@ pub(crate) mod tests {
             cancel: &CancellationToken,
         ) -> Result<(Self, Actor, EndpointHandle), BindError> {
             let endpoint = create_endpoint(rng, relay_map, None).await?;
+            Ok(Self::t_new_with_actor_on(endpoint, config, cancel))
+        }
+
+        /// [`Self::t_new_with_actor`] on an endpoint that the test built.
+        fn t_new_with_actor_on(
+            endpoint: Endpoint,
+            config: proto::Config,
+            cancel: &CancellationToken,
+        ) -> (Self, Actor, EndpointHandle) {
             let metrics = Arc::new(Metrics::default());
             let address_lookup = GossipAddressLookup::default();
             endpoint
@@ -1567,7 +1766,7 @@ pub(crate) mod tests {
                 cancel.child_token(),
             ));
 
-            Ok((gossip, actor, endpoint_task))
+            (gossip, actor, endpoint_task)
         }
 
         /// Crates a new testing gossip instance with the normal actor loop.
@@ -1577,13 +1776,22 @@ pub(crate) mod tests {
             relay_map: RelayMap,
             cancel: &CancellationToken,
         ) -> Result<(Self, Endpoint, EndpointHandle, impl Drop + use<>), BindError> {
-            let (g, actor, ep_handle) =
-                Gossip::t_new_with_actor(rng, config, relay_map, cancel).await?;
+            let endpoint = create_endpoint(rng, relay_map, None).await?;
+            Ok(Gossip::t_new_on(endpoint, config, cancel))
+        }
+
+        /// [`Self::t_new`] on an endpoint that the test built.
+        fn t_new_on(
+            endpoint: Endpoint,
+            config: proto::Config,
+            cancel: &CancellationToken,
+        ) -> (Self, Endpoint, EndpointHandle, impl Drop + use<>) {
+            let (g, actor, ep_handle) = Gossip::t_new_with_actor_on(endpoint, config, cancel);
             let ep = actor.endpoint.clone();
             let me = ep.id().fmt_short();
             let actor_handle =
                 task::spawn(actor.run().instrument(tracing::error_span!("gossip", %me)));
-            Ok((g, ep, ep_handle, AbortOnDropHandle::new(actor_handle)))
+            (g, ep, ep_handle, AbortOnDropHandle::new(actor_handle))
         }
     }
 
@@ -2128,6 +2336,402 @@ pub(crate) mod tests {
             .std_context("wait endpoint2 task")?
             .std_context("join endpoint2 task")??;
 
+        Result::Ok(())
+    }
+
+    /// Keeps the WARN and ERROR events of `iroh_gossip::net` that the thread of the test logs.
+    /// A test on the current-thread runtime runs every task on that thread, the actor included.
+    struct KeepsNetWarnings(Arc<Mutex<Vec<String>>>);
+
+    impl tracing::Subscriber for KeepsNetWarnings {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let meta = event.metadata();
+            if *meta.level() <= tracing::Level::WARN && meta.target() == "iroh_gossip::net" {
+                self.0
+                    .lock()
+                    .expect("warnings mutex poisoned")
+                    .push(format!("{event:?}"));
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// How the peer of `warnings_of_a_failed_dial` makes the dial fail.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum FailedDial {
+        /// The peer refuses every connection, as a closing endpoint does.
+        Refused,
+        /// The dialer knows no address of the peer.
+        NoAddress,
+        /// The peer speaks another protocol, so the handshake ends in an error.
+        WrongProtocol,
+        /// The address of the peer leads to a socket that never answers.
+        TimesOut,
+    }
+
+    /// Dials a peer that fails the dial once, and returns the WARN and ERROR events of
+    /// `iroh_gossip::net`. The dialer gives up on a silent peer after one second.
+    async fn warnings_of_a_failed_dial(failed_dial: FailedDial) -> Result<Vec<String>> {
+        let warnings = Arc::new(Mutex::new(Vec::new()));
+        let _log = tracing::subscriber::set_default(KeepsNetWarnings(Arc::clone(&warnings)));
+        let rng = &mut rand::rngs::ChaCha12Rng::seed_from_u64(1);
+        let ct = CancellationToken::new();
+        let (relay_map, relay_url, _guard) = iroh::test_utils::run_relay_server().await.unwrap();
+        let idle_timeout = Duration::from_secs(1)
+            .try_into()
+            .expect("1 s is an idle timeout");
+        let dialer = Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Custom(relay_map.clone()))
+            .secret_key(SecretKey::from_bytes(&rng.random()))
+            .alpns(vec![GOSSIP_ALPN.to_vec()])
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+            .transport_config(
+                QuicTransportConfig::builder()
+                    .max_idle_timeout(Some(idle_timeout))
+                    .build(),
+            )
+            .bind()
+            .await?;
+        dialer.online().await;
+        let (go1, ep1, ep1_handle, _test_actor_handle1) =
+            Gossip::t_new_on(dialer, Default::default(), &ct);
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").std_context("bind silent socket")?;
+        let peer = match failed_dial {
+            FailedDial::WrongProtocol => {
+                let peer = Endpoint::builder(presets::Minimal)
+                    .relay_mode(RelayMode::Custom(relay_map))
+                    .secret_key(SecretKey::from_bytes(&rng.random()))
+                    .alpns(vec![b"not-gossip".to_vec()])
+                    .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+                    .bind()
+                    .await?;
+                peer.online().await;
+                Some(peer)
+            }
+            FailedDial::Refused => Some(create_endpoint(rng, relay_map, None).await?),
+            FailedDial::NoAddress | FailedDial::TimesOut => None,
+        };
+        let peer_id = match &peer {
+            Some(peer) => peer.id(),
+            None => SecretKey::from_bytes(&rng.random()).public(),
+        };
+        let answerer = peer.clone().map(|accepting| {
+            spawn(async move {
+                while let Some(incoming) = accepting.accept().await {
+                    if failed_dial == FailedDial::Refused {
+                        incoming.refuse();
+                    } else if let Ok(connecting) = incoming.accept() {
+                        let _ = connecting.await;
+                    }
+                }
+            })
+        });
+        let addr = match failed_dial {
+            FailedDial::NoAddress => None,
+            FailedDial::TimesOut => Some(
+                EndpointAddr::new(peer_id).with_ip_addr(
+                    silent
+                        .local_addr()
+                        .std_context("address of silent socket")?,
+                ),
+            ),
+            FailedDial::Refused | FailedDial::WrongProtocol => {
+                Some(EndpointAddr::new(peer_id).with_relay_url(relay_url))
+            }
+        };
+        if let Some(addr) = addr {
+            let memory_lookup = MemoryLookup::new();
+            memory_lookup.add_endpoint_info(addr);
+            ep1.address_lookup()?.add(memory_lookup);
+        }
+
+        let topic: TopicId = blake3::hash(b"a_failed_dial_and_the_level_of_its_log").into();
+        let _sub1 = go1.subscribe(topic, vec![peer_id]).await?;
+        let metrics = go1.metrics().clone();
+        timeout(Duration::from_secs(20), async {
+            while metrics.actor_tick_dialer_failure.get() == 0 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .std_context("wait dial failure")?;
+
+        ct.cancel();
+        if let Some(answerer) = answerer {
+            answerer.abort();
+        }
+        timeout(Duration::from_secs(2), ep1_handle)
+            .await
+            .std_context("wait endpoint1 task")?
+            .std_context("join endpoint1 task")??;
+        let warnings = warnings.lock().expect("warnings mutex poisoned").clone();
+        Ok(warnings)
+    }
+
+    /// A peer that is closing refuses a new connection. That is a clear answer, and the caller
+    /// retries or gives up, so it is not a fault to warn about.
+    #[tokio::test]
+    async fn a_dial_that_a_closing_peer_refuses_is_not_a_warning() -> Result {
+        assert_eq!(
+            warnings_of_a_failed_dial(FailedDial::Refused).await?,
+            Vec::<String>::new()
+        );
+        Ok(())
+    }
+
+    /// A peer that the gossip learned by id, before anyone told the endpoint its address, cannot
+    /// be dialed yet. The dial repeats with the next message to the peer, so a short gap is not a
+    /// fault.
+    #[tokio::test]
+    async fn a_dial_to_a_peer_without_an_address_is_not_a_warning() -> Result {
+        assert_eq!(
+            warnings_of_a_failed_dial(FailedDial::NoAddress).await?,
+            Vec::<String>::new()
+        );
+        Ok(())
+    }
+
+    fn peer_id_of(seed: u8) -> EndpointId {
+        SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    /// A peer that stays without an address is a fault to see in the log: one warning once the
+    /// spell is longer than the bound, and no more for the same spell.
+    #[test]
+    fn a_peer_that_never_gets_an_address_is_noted_once_after_the_bound() {
+        let mut watch = NoAddressWatch::default();
+        let peer = peer_id_of(1);
+        let start = Instant::now();
+        assert!(!watch.note(peer, start));
+        assert!(!watch.note(peer, start + NO_ADDRESS_WARN_AFTER / 2));
+        assert!(watch.note(
+            peer,
+            start + NO_ADDRESS_WARN_AFTER + Duration::from_millis(1)
+        ));
+        assert!(!watch.note(peer, start + NO_ADDRESS_WARN_AFTER * 2));
+    }
+
+    /// A peer whose address comes in time never reaches the bound: the dial that works ends the
+    /// spell, and the next gap without an address starts a new one.
+    #[test]
+    fn a_peer_that_gets_its_address_in_time_is_not_noted() {
+        let mut watch = NoAddressWatch::default();
+        let peer = peer_id_of(2);
+        let start = Instant::now();
+        assert!(!watch.note(peer, start));
+        watch.forget(peer);
+        assert!(!watch.note(peer, start + NO_ADDRESS_WARN_AFTER * 2));
+    }
+
+    /// A spell is a run of failed dials. When the peer is not dialed for a long gap, the run is
+    /// over: the next failure starts a new spell, and the old entry cannot stay for ever.
+    #[test]
+    fn a_spell_ends_when_the_peer_is_not_dialed_for_a_long_gap() {
+        let mut watch = NoAddressWatch::default();
+        let peer = peer_id_of(5);
+        let start = Instant::now();
+        assert!(!watch.note(peer, start));
+        let later = start + NO_ADDRESS_SPELL_ENDS_AFTER + Duration::from_millis(1);
+        assert!(!watch.note(peer, later), "the gap ended the spell");
+        assert!(watch.note(
+            peer,
+            later + NO_ADDRESS_WARN_AFTER + Duration::from_millis(1)
+        ));
+    }
+
+    /// The map of spells has a cap: the oldest one goes out first.
+    #[test]
+    fn the_spells_are_capped_and_the_oldest_goes_out_first() {
+        let mut watch = NoAddressWatch::default();
+        let start = Instant::now();
+        let peer_of = |i: usize| {
+            let mut bytes = [7u8; 32];
+            bytes[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            SecretKey::from_bytes(&bytes).public()
+        };
+        for i in 0..=MAX_NO_ADDRESS_SPELLS {
+            watch.note(peer_of(i), start + Duration::from_micros(i as u64));
+        }
+        assert_eq!(watch.spells.len(), MAX_NO_ADDRESS_SPELLS);
+        assert!(!watch.spells.contains_key(&peer_of(0)), "the oldest stayed");
+        assert!(watch.spells.contains_key(&peer_of(MAX_NO_ADDRESS_SPELLS)));
+    }
+
+    /// The spells of two peers do not mix.
+    #[test]
+    fn the_spell_of_a_peer_is_its_own() {
+        let mut watch = NoAddressWatch::default();
+        let start = Instant::now();
+        assert!(!watch.note(peer_id_of(3), start));
+        assert!(!watch.note(peer_id_of(4), start + NO_ADDRESS_WARN_AFTER * 2));
+    }
+
+    /// The actor warns once for a peer that has no address for longer than the bound, and the
+    /// dials before that stay at debug.
+    #[tokio::test]
+    async fn a_peer_that_stays_without_an_address_gets_one_warning() -> Result {
+        let warnings = Arc::new(Mutex::new(Vec::new()));
+        let _log = tracing::subscriber::set_default(KeepsNetWarnings(Arc::clone(&warnings)));
+        let rng = &mut rand::rngs::ChaCha12Rng::seed_from_u64(1);
+        let ct = CancellationToken::new();
+        let (relay_map, _relay_url, _guard) = iroh::test_utils::run_relay_server().await.unwrap();
+        let (go1, _ep1, ep1_handle, _test_actor_handle1) =
+            Gossip::t_new(rng, Default::default(), relay_map, &ct).await?;
+        let peer_id = SecretKey::from_bytes(&rng.random()).public();
+        let topic: TopicId = blake3::hash(b"a_peer_that_stays_without_an_address").into();
+        let (sender, _receiver) = go1.subscribe(topic, Vec::new()).await?.split();
+        let metrics = go1.metrics().clone();
+
+        // One dial every 300 ms for 3 s: the bound of a test is 1 s.
+        for _ in 0..10 {
+            sender.join_peers(vec![peer_id]).await?;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        assert!(
+            metrics.actor_tick_dialer_failure.get() >= 5,
+            "the peer was dialed {} times",
+            metrics.actor_tick_dialer_failure.get()
+        );
+
+        ct.cancel();
+        timeout(Duration::from_secs(2), ep1_handle)
+            .await
+            .std_context("wait endpoint1 task")?
+            .std_context("join endpoint1 task")??;
+        let warnings = warnings.lock().expect("warnings mutex poisoned").clone();
+        assert_eq!(
+            warnings
+                .iter()
+                .filter(|event| event.contains("dial without an address"))
+                .count(),
+            1,
+            "{warnings:?}"
+        );
+        Ok(())
+    }
+
+    /// A dial that nobody asks for again runs to its own timeout and logs the warning. Only a new
+    /// request for the same peer replaces a dial, and a replaced dial logs nothing.
+    #[tokio::test]
+    async fn a_dial_that_is_not_asked_again_times_out_with_a_warning() -> Result {
+        let warnings = warnings_of_a_failed_dial(FailedDial::TimesOut).await?;
+        assert!(
+            warnings
+                .iter()
+                .any(|event| event.contains("dial failed: timed out")),
+            "{warnings:?}"
+        );
+        Ok(())
+    }
+
+    /// Every other dial failure stays a warning: here the handshake fails with another code.
+    #[tokio::test]
+    async fn a_dial_that_fails_for_another_reason_is_a_warning() -> Result {
+        let warnings = warnings_of_a_failed_dial(FailedDial::WrongProtocol).await?;
+        assert!(
+            warnings.iter().any(|event| event.contains("dial failed")),
+            "{warnings:?}"
+        );
+        Ok(())
+    }
+
+    /// A dial that starts while nobody serves the key stays in flight until its idle timeout: the
+    /// handshake backs off its retransmits, and the last one before the timeout is long past when
+    /// the key gets served. A caller that asks for the peer again, as the healer of the app does,
+    /// must get a new dial, so that the link comes soon after the key is served, not at the timeout.
+    #[tokio::test]
+    async fn a_dial_to_a_key_that_is_served_late_links_soon_after() -> Result {
+        const SERVED_AFTER: Duration = Duration::from_secs(22);
+        let warnings = Arc::new(Mutex::new(Vec::new()));
+        let _log = tracing::subscriber::set_default(KeepsNetWarnings(Arc::clone(&warnings)));
+        let rng = &mut rand::rngs::ChaCha12Rng::seed_from_u64(1);
+        let ct = CancellationToken::new();
+        let (relay_map, relay_url, _guard) = iroh::test_utils::run_relay_server().await.unwrap();
+        let (go1, ep1, ep1_handle, _test_actor_handle1) =
+            Gossip::t_new(rng, Default::default(), relay_map.clone(), &ct).await?;
+        let secret_key = SecretKey::from_bytes(&rng.random());
+        let peer_id = secret_key.public();
+        let memory_lookup = MemoryLookup::new();
+        memory_lookup.add_endpoint_info(EndpointAddr::new(peer_id).with_relay_url(relay_url));
+        ep1.address_lookup()?.add(memory_lookup);
+
+        let topic: TopicId = blake3::hash(b"a_dial_to_a_key_that_is_served_late").into();
+        let (sender1, mut receiver1) = go1.subscribe(topic, vec![peer_id]).await?.split();
+
+        let served_at = Arc::new(Mutex::new(None));
+        let server = spawn({
+            let served_at = Arc::clone(&served_at);
+            let ct = ct.clone();
+            async move {
+                tokio::time::sleep(SERVED_AFTER).await;
+                let peer = Endpoint::builder(presets::Minimal)
+                    .relay_mode(RelayMode::Custom(relay_map))
+                    .secret_key(secret_key)
+                    .alpns(vec![GOSSIP_ALPN.to_vec()])
+                    .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+                    .bind()
+                    .await?;
+                peer.online().await;
+                *served_at.lock().expect("served_at mutex poisoned") =
+                    Some(std::time::Instant::now());
+                let (go2, _ep2, ep2_handle, _test_actor_handle2) =
+                    Gossip::t_new_on(peer, Default::default(), &ct);
+                let _sub2 = go2.subscribe(topic, Vec::new()).await?;
+                ep2_handle.await.std_context("join endpoint2 task")??;
+                Ok::<(), AnyError>(())
+            }
+        });
+
+        // Ask for the peer every 400 ms until it links, as the healer of the app does.
+        timeout(Duration::from_secs(50), async {
+            let mut tick = tokio::time::interval(Duration::from_millis(400));
+            loop {
+                tokio::select! {
+                    _ = tick.tick() => sender1.join_peers(vec![peer_id]).await?,
+                    event = receiver1.try_next() => {
+                        if event? == Some(Event::NeighborUp(peer_id)) {
+                            return Ok::<(), AnyError>(());
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .std_context("wait for the link")??;
+        let served_at = served_at
+            .lock()
+            .expect("served_at mutex poisoned")
+            .expect("the key is served before the link");
+        let late_by = served_at.elapsed();
+        assert!(
+            late_by < Duration::from_secs(6),
+            "the link came {late_by:?} after the key was served"
+        );
+        // The dials that were replaced were not faults.
+        assert_eq!(
+            *warnings.lock().expect("warnings mutex poisoned"),
+            Vec::<String>::new()
+        );
+
+        ct.cancel();
+        let wait = Duration::from_secs(2);
+        timeout(wait, ep1_handle)
+            .await
+            .std_context("wait endpoint1 task")?
+            .std_context("join endpoint1 task")??;
+        timeout(wait, server)
+            .await
+            .std_context("wait the server task")?
+            .std_context("join the server task")??;
         Result::Ok(())
     }
 
@@ -2940,6 +3544,95 @@ pub(crate) mod tests {
         );
         assert_eq!(rig.neighbor_downs(), vec![gone]);
         assert_eq!(rig.drain_data(1), 2, "the other peer got both broadcasts");
+        Ok(())
+    }
+
+    /// A connection of `endpoint` to a peer, closed with an application code by the peer
+    /// (`close_reason()` is `ApplicationClosed`) or by `endpoint` (`LocallyClosed`).
+    async fn connection_closed_in_order(
+        endpoint: &Endpoint,
+        by_the_peer: bool,
+    ) -> Result<Connection> {
+        let peer = Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Disabled)
+            .alpns(vec![GOSSIP_ALPN.to_vec()])
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+            .bind()
+            .await?;
+        let port = peer.bound_sockets()[0].port();
+        let addr = EndpointAddr::new(peer.id()).with_ip_addr(std::net::SocketAddr::from((
+            std::net::Ipv4Addr::LOCALHOST,
+            port,
+        )));
+        let accepting = peer.clone();
+        let closer = spawn(async move {
+            let incoming = accepting.accept().await.expect("an incoming connection");
+            let conn = incoming
+                .accept()
+                .expect("accept the connection")
+                .await
+                .expect("finish the handshake");
+            if by_the_peer {
+                conn.close(7u32.into(), b"the peer closed it");
+            }
+            conn.closed().await;
+        });
+        let conn = endpoint.connect(addr, GOSSIP_ALPN).await?;
+        if !by_the_peer {
+            conn.close(8u32.into(), b"we closed it");
+        }
+        conn.closed().await;
+        closer.await.std_context("join the closing peer")?;
+        Ok(conn)
+    }
+
+    /// The actor sends to a peer whose connection was closed in order, by the peer or by us, so
+    /// the send loop ended: that is the race of a leaving peer, not a fault to warn about. The
+    /// reason of the close is on the connection, and the connection task logs it when it finishes.
+    #[tokio::test]
+    async fn a_send_on_a_connection_that_was_closed_in_order_is_not_a_warning() -> Result {
+        for by_the_peer in [true, false] {
+            let warnings = Arc::new(Mutex::new(Vec::new()));
+            let _log = tracing::subscriber::set_default(KeepsNetWarnings(Arc::clone(&warnings)));
+            let mut rig = Rig::new(14, 2).await?;
+            let closed = connection_closed_in_order(&rig.actor.endpoint, by_the_peer).await?;
+            let peer = rig.peers[0].id;
+            let Some(PeerState::Active { conns, .. }) = rig.actor.peers.get_mut(&peer) else {
+                panic!("the peer is active");
+            };
+            conns.get_mut(0).expect("the first connection").handle.conn = Some(closed);
+            rig.end_send_loop(0);
+
+            rig.broadcast("after the connection was closed").await;
+
+            let warnings = warnings.lock().expect("warnings mutex poisoned").clone();
+            assert_eq!(
+                warnings,
+                Vec::<String>::new(),
+                "closed by the peer: {by_the_peer}"
+            );
+            assert!(!rig.actor.peers.contains_key(&peer), "the peer is dropped");
+        }
+        Ok(())
+    }
+
+    /// A peer with no connection to read a reason from keeps the warning.
+    #[tokio::test]
+    async fn a_send_on_a_connection_without_a_close_reason_is_a_warning() -> Result {
+        let warnings = Arc::new(Mutex::new(Vec::new()));
+        let _log = tracing::subscriber::set_default(KeepsNetWarnings(Arc::clone(&warnings)));
+        let mut rig = Rig::new(15, 2).await?;
+        rig.end_send_loop(0);
+
+        rig.broadcast("after the send loop ended").await;
+
+        let warnings = warnings.lock().expect("warnings mutex poisoned").clone();
+        assert!(
+            warnings
+                .iter()
+                .any(|event| event.contains("failed to send")),
+            "{warnings:?}"
+        );
         Ok(())
     }
 
