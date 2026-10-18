@@ -486,6 +486,8 @@ impl Actor {
                             self.dialer.no_address.forget(peer_id);
                             if dial_was_refused(&err) {
                                 debug!(peer = %peer_id.fmt_short(), "dial refused: {err}");
+                            } else if dial_timed_out(&err) && !self.a_topic_is_isolated() {
+                                debug!(peer = %peer_id.fmt_short(), "dial failed: {err}");
                             } else {
                                 warn!(peer = %peer_id.fmt_short(), "dial failed: {err}");
                             }
@@ -776,6 +778,7 @@ impl Actor {
                     neighbors,
                     event_sender,
                     command_rx_keys,
+                    ..
                 } = self.topics.entry(topic_id).or_default();
                 let mut sender_dead = false;
                 if !neighbors.is_empty() {
@@ -810,6 +813,16 @@ impl Actor {
                 .await;
             }
         }
+    }
+
+    /// Whether a topic has had no neighbor for longer than [`ISOLATED_WARN_AFTER`]. It answers
+    /// `true` once per topic and spell. The dial does not tell its topic, so any isolated topic
+    /// lets the warning through.
+    fn a_topic_is_isolated(&mut self) -> bool {
+        let now = Instant::now();
+        self.topics
+            .values_mut()
+            .any(|topic| topic.isolation.warn_due(now))
     }
 
     async fn handle_in_event(&mut self, event: InEvent, now: Instant) {
@@ -1001,14 +1014,17 @@ impl Actor {
                     let TopicState {
                         neighbors,
                         event_sender,
+                        isolation,
                         ..
                     } = state;
                     match &event {
                         ProtoEvent::NeighborUp(neighbor) => {
                             neighbors.insert(*neighbor);
+                            isolation.neighbors_changed(true, now);
                         }
                         ProtoEvent::NeighborDown(neighbor) => {
                             neighbors.remove(neighbor);
+                            isolation.neighbors_changed(!neighbors.is_empty(), now);
                         }
                         _ => {}
                     }
@@ -1202,6 +1218,7 @@ impl Default for PeerState {
 #[derive(Debug)]
 struct TopicState {
     neighbors: BTreeSet<EndpointId>,
+    isolation: Isolation,
     event_sender: broadcast::Sender<ProtoEvent>,
     /// Keys identifying command receivers in [`Actor::command_rx`].
     ///
@@ -1214,6 +1231,7 @@ impl Default for TopicState {
         let (event_sender, _) = broadcast::channel(TOPIC_EVENT_CAP);
         Self {
             neighbors: Default::default(),
+            isolation: Isolation::new(Instant::now()),
             command_rx_keys: Default::default(),
             event_sender,
         }
@@ -1435,6 +1453,24 @@ fn dial_was_refused(err: &iroh::endpoint::ConnectError) -> bool {
     )
 }
 
+/// Whether the dial ended because the peer never answered.
+fn dial_timed_out(err: &iroh::endpoint::ConnectError) -> bool {
+    use iroh::endpoint::{ConnectError, ConnectingError, ConnectionError};
+    matches!(
+        err,
+        ConnectError::Connection {
+            source: ConnectionError::TimedOut,
+            ..
+        } | ConnectError::Connecting {
+            source: ConnectingError::ConnectionError {
+                source: ConnectionError::TimedOut,
+                ..
+            },
+            ..
+        }
+    )
+}
+
 /// Whether the dialer knows no address of the peer. The gossip learns a peer by id, often before
 /// anyone told the endpoint where to reach it, and the actor dials again when it knows.
 fn dial_had_no_address(err: &iroh::endpoint::ConnectError) -> bool {
@@ -1462,6 +1498,56 @@ const NO_ADDRESS_WARN_AFTER: Duration = if cfg!(test) {
 } else {
     Duration::from_secs(30)
 };
+
+/// How long a topic may have no neighbor before a dial that times out is a warning. A peer in the
+/// passive view of a topic that still has a neighbor is gone as a matter of course, and its dial
+/// times out. A topic that has no neighbor at all and still fails its dials has lost the swarm,
+/// and the log must say so. Tests use a short bound.
+const ISOLATED_WARN_AFTER: Duration = if cfg!(test) {
+    Duration::from_millis(500)
+} else {
+    Duration::from_secs(30)
+};
+
+/// Since when a topic has no neighbor, and whether the log said so.
+#[derive(Debug)]
+struct Isolation {
+    since: Option<Instant>,
+    warned: bool,
+}
+
+impl Isolation {
+    /// A topic starts alone.
+    fn new(now: Instant) -> Self {
+        Self {
+            since: Some(now),
+            warned: false,
+        }
+    }
+
+    /// Notes that the neighbors of the topic changed. A neighbor ends the spell.
+    fn neighbors_changed(&mut self, has_neighbors: bool, now: Instant) {
+        if has_neighbors {
+            *self = Self {
+                since: None,
+                warned: false,
+            };
+        } else if self.since.is_none() {
+            *self = Self::new(now);
+        }
+    }
+
+    /// Returns `true` once per spell: when the topic has had no neighbor for longer than
+    /// [`ISOLATED_WARN_AFTER`].
+    fn warn_due(&mut self, now: Instant) -> bool {
+        let Some(since) = self.since else {
+            return false;
+        };
+        let due = !self.warned && now.saturating_duration_since(since) > ISOLATED_WARN_AFTER;
+        self.warned |= due;
+        due
+    }
+}
 
 /// A run of failed dials for want of an address ends when the peer is not dialed for this long,
 /// so the entry of a peer that is gone does not stay. The disconnect of the peer cannot end it:
@@ -2376,6 +2462,8 @@ pub(crate) mod tests {
         WrongProtocol,
         /// The address of the peer leads to a socket that never answers.
         TimesOut,
+        /// As `TimesOut`, while the dialer holds a live neighbor in the topic.
+        TimesOutBesideANeighbor,
     }
 
     /// Dials a peer that fails the dial once, and returns the WARN and ERROR events of
@@ -2397,6 +2485,8 @@ pub(crate) mod tests {
             .transport_config(
                 QuicTransportConfig::builder()
                     .max_idle_timeout(Some(idle_timeout))
+                    // The link to the neighbor must outlive the idle timeout of the dial.
+                    .keep_alive_interval(Duration::from_millis(200))
                     .build(),
             )
             .bind()
@@ -2405,6 +2495,7 @@ pub(crate) mod tests {
         let (go1, ep1, ep1_handle, _test_actor_handle1) =
             Gossip::t_new_on(dialer, Default::default(), &ct);
         let silent = std::net::UdpSocket::bind("127.0.0.1:0").std_context("bind silent socket")?;
+        let (relay_map_of_neighbor, relay_url_of_neighbor) = (relay_map.clone(), relay_url.clone());
         let peer = match failed_dial {
             FailedDial::WrongProtocol => {
                 let peer = Endpoint::builder(presets::Minimal)
@@ -2418,7 +2509,9 @@ pub(crate) mod tests {
                 Some(peer)
             }
             FailedDial::Refused => Some(create_endpoint(rng, relay_map, None).await?),
-            FailedDial::NoAddress | FailedDial::TimesOut => None,
+            FailedDial::NoAddress | FailedDial::TimesOut | FailedDial::TimesOutBesideANeighbor => {
+                None
+            }
         };
         let peer_id = match &peer {
             Some(peer) => peer.id(),
@@ -2437,7 +2530,7 @@ pub(crate) mod tests {
         });
         let addr = match failed_dial {
             FailedDial::NoAddress => None,
-            FailedDial::TimesOut => Some(
+            FailedDial::TimesOut | FailedDial::TimesOutBesideANeighbor => Some(
                 EndpointAddr::new(peer_id).with_ip_addr(
                     silent
                         .local_addr()
@@ -2455,6 +2548,27 @@ pub(crate) mod tests {
         }
 
         let topic: TopicId = blake3::hash(b"a_failed_dial_and_the_level_of_its_log").into();
+        let _neighbor = if failed_dial == FailedDial::TimesOutBesideANeighbor {
+            let (go2, ep2, ep2_handle, actor2) =
+                Gossip::t_new(rng, Default::default(), relay_map_of_neighbor, &ct).await?;
+            // The neighbor must have an address for the dialer too, but only the dialer dials.
+            ep1.address_lookup()?.add({
+                let lookup = MemoryLookup::new();
+                lookup.add_endpoint_info(
+                    EndpointAddr::new(ep2.id()).with_relay_url(relay_url_of_neighbor),
+                );
+                lookup
+            });
+            let _sub2 = go2.subscribe(topic, Vec::new()).await?;
+            let (_sender1, mut receiver1) = go1.subscribe(topic, vec![ep2.id()]).await?.split();
+            let up = timeout(Duration::from_secs(10), receiver1.try_next())
+                .await
+                .std_context("wait neighbor up")??;
+            assert_eq!(up, Some(Event::NeighborUp(ep2.id())));
+            Some((go2, ep2_handle, actor2, _sub2, _sender1, receiver1))
+        } else {
+            None
+        };
         let _sub1 = go1.subscribe(topic, vec![peer_id]).await?;
         let metrics = go1.metrics().clone();
         timeout(Duration::from_secs(20), async {
@@ -2498,6 +2612,36 @@ pub(crate) mod tests {
             Vec::<String>::new()
         );
         Ok(())
+    }
+
+    /// A topic that still has a neighbor keeps its members. A peer in the passive view that is
+    /// gone times out the dial as a matter of course, so the timeout is not a fault to warn about.
+    #[tokio::test]
+    async fn a_timed_out_dial_beside_an_active_neighbor_is_not_a_warning() -> Result {
+        assert_eq!(
+            warnings_of_a_failed_dial(FailedDial::TimesOutBesideANeighbor).await?,
+            Vec::<String>::new()
+        );
+        Ok(())
+    }
+
+    /// A topic with no neighbor is a fault to see in the log: one warning once the spell is longer
+    /// than the bound, none in the same spell, and none while a neighbor is there.
+    #[test]
+    fn a_topic_without_a_neighbor_is_isolated_once_after_the_bound() {
+        let start = Instant::now();
+        let mut isolation = Isolation::new(start);
+        assert!(!isolation.warn_due(start + ISOLATED_WARN_AFTER / 2));
+        assert!(isolation.warn_due(start + ISOLATED_WARN_AFTER * 2));
+        assert!(!isolation.warn_due(start + ISOLATED_WARN_AFTER * 3));
+
+        isolation.neighbors_changed(true, start + ISOLATED_WARN_AFTER * 4);
+        assert!(!isolation.warn_due(start + ISOLATED_WARN_AFTER * 9));
+
+        let lost = start + ISOLATED_WARN_AFTER * 10;
+        isolation.neighbors_changed(false, lost);
+        assert!(!isolation.warn_due(lost + ISOLATED_WARN_AFTER / 2));
+        assert!(isolation.warn_due(lost + ISOLATED_WARN_AFTER * 2));
     }
 
     fn peer_id_of(seed: u8) -> EndpointId {
