@@ -963,11 +963,11 @@ impl Actor {
                                     Some(conn_id) => {
                                         if !self.dead_conns.contains(&(peer_id, conn_id)) {
                                             self.dead_conns.push_back((peer_id, conn_id));
-                                            if closed_in_order(conns.chosen()) {
+                                            if ended_without_a_fault(conns.chosen()) {
                                                 debug!(
                                                     peer = %peer_id.fmt_short(),
                                                     conn_id,
-                                                    "send on a connection that was closed in order",
+                                                    "send on a connection that ended without a fault",
                                                 );
                                             } else {
                                                 warn!(
@@ -1422,16 +1422,27 @@ impl Stream for TopicCommandStream {
     }
 }
 
-/// Whether the connection was closed in order, by its peer or by us: an application closed it.
-/// A peer that leaves does so, and the next send finds the send loop ended. A reset, a timeout, a
-/// transport error, a connection that is still open and a missing connection are not.
-fn closed_in_order(conn: Option<&conns::Conn<ConnHandle>>) -> bool {
-    use iroh::endpoint::ConnectionError;
-    matches!(
-        conn.and_then(|conn| conn.handle.conn.as_ref())
-            .and_then(Connection::close_reason),
-        Some(ConnectionError::ApplicationClosed(_) | ConnectionError::LocallyClosed)
-    )
+/// Whether the connection of a peer ended without a fault of ours or of the peer's stack: closed
+/// in order, or lost with the peer. A peer that leaves closes in order, and one that crashes goes
+/// silent until the idle timeout, or leaves no path (`NO_VIABLE_PATH`), or comes back reset. The
+/// next send finds the send loop ended, and the protocol reports the loss as `NeighborDown`. A
+/// protocol violation, a connection that is still open and a missing connection are not that.
+fn ended_without_a_fault(conn: Option<&conns::Conn<ConnHandle>>) -> bool {
+    conn.and_then(|conn| conn.handle.conn.as_ref())
+        .and_then(Connection::close_reason)
+        .is_some_and(|reason| is_no_fault(&reason))
+}
+
+fn is_no_fault(reason: &iroh::endpoint::ConnectionError) -> bool {
+    use iroh::endpoint::{ConnectionError, TransportErrorCode};
+    match reason {
+        ConnectionError::ApplicationClosed(_)
+        | ConnectionError::LocallyClosed
+        | ConnectionError::TimedOut
+        | ConnectionError::Reset => true,
+        ConnectionError::TransportError(err) => err.code == TransportErrorCode::NO_VIABLE_PATH,
+        _ => false,
+    }
 }
 
 /// Whether the peer answered the dial with a refusal, as an endpoint that is closing does.
@@ -3758,6 +3769,133 @@ pub(crate) mod tests {
             assert!(!rig.actor.peers.contains_key(&peer), "the peer is dropped");
         }
         Ok(())
+    }
+
+    /// A connection of `endpoint` to a peer that vanishes: a relay of UDP packets carries the
+    /// handshake and then stops, as the path to a crashed peer does. `dialer` gives up after one
+    /// idle second, so `close_reason()` is `TimedOut`.
+    async fn connection_to_a_vanished_peer() -> Result<Connection> {
+        use iroh::endpoint::ConnectionError;
+        let peer = Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Disabled)
+            .alpns(vec![GOSSIP_ALPN.to_vec()])
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+            .bind()
+            .await?;
+        let peer_addr = std::net::SocketAddr::from((
+            std::net::Ipv4Addr::LOCALHOST,
+            peer.bound_sockets()[0].port(),
+        ));
+        let accepting = peer.clone();
+        spawn(async move {
+            while let Some(incoming) = accepting.accept().await {
+                if let Ok(connecting) = incoming.accept() {
+                    let _ = connecting.await;
+                }
+            }
+        });
+        let relay = Arc::new(
+            tokio::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .std_context("bind the relay of packets")?,
+        );
+        let relay_addr = relay.local_addr().std_context("address of the relay")?;
+        let cut = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (relay_task, cut_task) = (Arc::clone(&relay), Arc::clone(&cut));
+        spawn(async move {
+            let mut dialer_addr = None;
+            let mut buf = vec![0u8; 65536];
+            while let Ok((len, from)) = relay_task.recv_from(&mut buf).await {
+                if cut_task.load(std::sync::atomic::Ordering::SeqCst) {
+                    continue;
+                }
+                let to = if from == peer_addr {
+                    dialer_addr
+                } else {
+                    dialer_addr = Some(from);
+                    Some(peer_addr)
+                };
+                if let Some(to) = to {
+                    let _ = relay_task.send_to(&buf[..len], to).await;
+                }
+            }
+        });
+        let idle_timeout = Duration::from_secs(1)
+            .try_into()
+            .expect("1 s is an idle timeout");
+        let dialer = Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Disabled)
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+            .transport_config(
+                QuicTransportConfig::builder()
+                    .max_idle_timeout(Some(idle_timeout))
+                    .build(),
+            )
+            .bind()
+            .await?;
+        let addr = EndpointAddr::new(peer.id()).with_ip_addr(relay_addr);
+        let conn = dialer.connect(addr, GOSSIP_ALPN).await?;
+        cut.store(true, std::sync::atomic::Ordering::SeqCst);
+        conn.closed().await;
+        assert!(
+            matches!(conn.close_reason(), Some(ConnectionError::TimedOut)),
+            "the connection timed out: {:?}",
+            conn.close_reason()
+        );
+        Ok(conn)
+    }
+
+    /// The actor sends to a peer that vanished, as a crashed one does: its connection timed out and
+    /// the send loop ended. The protocol reports the loss as `NeighborDown`, so the send is not a
+    /// fault to warn about.
+    #[tokio::test]
+    async fn a_send_on_a_connection_to_a_vanished_peer_is_not_a_warning() -> Result {
+        let warnings = Arc::new(Mutex::new(Vec::new()));
+        let _log = tracing::subscriber::set_default(KeepsNetWarnings(Arc::clone(&warnings)));
+        let mut rig = Rig::new(16, 2).await?;
+        let lost = connection_to_a_vanished_peer().await?;
+        let peer = rig.peers[0].id;
+        let Some(PeerState::Active { conns, .. }) = rig.actor.peers.get_mut(&peer) else {
+            panic!("the peer is active");
+        };
+        conns.get_mut(0).expect("the first connection").handle.conn = Some(lost);
+        rig.end_send_loop(0);
+
+        rig.broadcast("after the peer vanished").await;
+
+        let warnings = warnings.lock().expect("warnings mutex poisoned").clone();
+        assert_eq!(warnings, Vec::<String>::new());
+        assert!(!rig.actor.peers.contains_key(&peer), "the peer is dropped");
+        Ok(())
+    }
+
+    /// Which reasons for the end of a connection are the loss of the peer, and which are a fault.
+    #[test]
+    fn only_a_lost_peer_or_an_orderly_close_ends_a_connection_without_a_fault() {
+        use iroh::endpoint::{ConnectionError, TransportError, TransportErrorCode};
+        let without_a_fault = [
+            ConnectionError::LocallyClosed,
+            ConnectionError::TimedOut,
+            ConnectionError::Reset,
+            ConnectionError::from(TransportError::new(
+                TransportErrorCode::NO_VIABLE_PATH,
+                String::new(),
+            )),
+        ];
+        for reason in without_a_fault {
+            assert!(is_no_fault(&reason), "{reason:?}");
+        }
+        let faults = [
+            ConnectionError::VersionMismatch,
+            ConnectionError::CidsExhausted,
+            ConnectionError::from(TransportError::new(
+                TransportErrorCode::PROTOCOL_VIOLATION,
+                String::new(),
+            )),
+        ];
+        for reason in faults {
+            assert!(!is_no_fault(&reason), "{reason:?}");
+        }
     }
 
     /// A peer with no connection to read a reason from keeps the warning.

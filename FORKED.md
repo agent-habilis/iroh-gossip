@@ -37,12 +37,14 @@ failure stays a warn.
 If upstream changes the `dial failed` log, keep the split in `dial_had_no_address` and the
 `NoAddressWatch` that counts the spell.
 
-## A send on a connection that was closed in order is logged at debug
+## A send on a connection that ended without a fault is logged at debug
 
-`net.rs`: when the send loop of the chosen connection has ended and the connection was closed
-with an application code, by the peer or by us (`close_reason()` is `ApplicationClosed` or
-`LocallyClosed`), the line is at debug, not warn. A peer that leaves does that, and the next send
-finds the loop ended. A reset, a timeout, a transport error, an open connection and a missing
-connection stay a warn.
+`net.rs`: when the send loop of the chosen connection has ended and the connection ended without a
+fault, the line is at debug, not warn. That is a close with an application code, by the peer or by
+us (`close_reason()` is `ApplicationClosed` or `LocallyClosed`), and the loss of the peer: `TimedOut`,
+`Reset`, or a transport error with the code `NO_VIABLE_PATH`. A peer that leaves closes in order. A
+peer that crashes goes silent, and its connection ends with one of the others. The next send finds
+the loop ended, and the protocol reports the loss as `NeighborDown`. Any other transport error, a
+version mismatch, an open connection and a missing connection stay a warn.
 
-If upstream changes the `failed to send` log, keep the split in `closed_in_order`.
+If upstream changes the `failed to send` log, keep the split in `ended_without_a_fault`.
