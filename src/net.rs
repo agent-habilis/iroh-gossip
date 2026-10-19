@@ -160,6 +160,7 @@ impl ProtocolHandler for Gossip {
 pub struct Builder {
     config: proto::Config,
     alpn: Option<Bytes>,
+    topic_event_capacity: usize,
 }
 
 impl Builder {
@@ -194,6 +195,18 @@ impl Builder {
         self
     }
 
+    /// Sets how many events of a topic the actor keeps for a subscriber that reads them late.
+    ///
+    /// The events of a topic go to every subscriber through one queue. A subscriber that is
+    /// further behind than this gets [`Event::Lagged`] and misses the oldest events. The queue has
+    /// no backpressure, so a burst of frames, for example the answers to a request for history,
+    /// can fill it while a subscriber task waits to be scheduled. A value of `0` counts as `1`.
+    /// By default this is `256`.
+    pub fn topic_event_capacity(mut self, capacity: usize) -> Self {
+        self.topic_event_capacity = capacity;
+        self
+    }
+
     /// Spawn a gossip actor and get a handle for it
     pub fn spawn(self, endpoint: Endpoint) -> Gossip {
         let metrics = Arc::new(Metrics::default());
@@ -213,6 +226,7 @@ impl Builder {
             metrics.clone(),
             self.alpn,
             address_lookup,
+            self.topic_event_capacity,
         );
         let me = actor.endpoint.id().fmt_short();
         let max_message_size = actor.state.max_message_size();
@@ -240,6 +254,7 @@ impl Gossip {
         Builder {
             config: Default::default(),
             alpn: None,
+            topic_event_capacity: TOPIC_EVENT_CAP,
         }
     }
 
@@ -334,6 +349,8 @@ struct Actor {
     dead_conns: VecDeque<(EndpointId, ConnId)>,
     /// See [`SEND_REFUSED_DEADLINE`]. A field so that a test can shorten it.
     send_refused_deadline: Duration,
+    /// The capacity of the event queue of each topic, see [`Builder::topic_event_capacity`].
+    topic_event_capacity: usize,
 }
 
 impl Actor {
@@ -343,6 +360,7 @@ impl Actor {
         metrics: Arc<Metrics>,
         alpn: Option<Bytes>,
         address_lookup: GossipAddressLookup,
+        topic_event_capacity: usize,
     ) -> (
         Self,
         mpsc::Sender<RpcMessage>,
@@ -385,9 +403,22 @@ impl Actor {
             overflow_disconnects: Default::default(),
             dead_conns: Default::default(),
             send_refused_deadline: SEND_REFUSED_DEADLINE,
+            topic_event_capacity,
         };
 
         (actor, rpc_tx, local_tx)
+    }
+
+    /// The state of a topic, made on first use with the event capacity of the actor. A function of
+    /// the fields, not of the actor, so that the caller keeps the other fields.
+    fn topic_state(
+        topics: &mut HashMap<TopicId, TopicState>,
+        capacity: usize,
+        topic_id: TopicId,
+    ) -> &mut TopicState {
+        topics
+            .entry(topic_id)
+            .or_insert_with(|| TopicState::with_event_capacity(capacity))
     }
 
     pub async fn run(mut self) {
@@ -789,7 +820,7 @@ impl Actor {
                     event_sender,
                     command_rx_keys,
                     ..
-                } = self.topics.entry(topic_id).or_default();
+                } = Self::topic_state(&mut self.topics, self.topic_event_capacity, topic_id);
                 let mut sender_dead = false;
                 if !neighbors.is_empty() {
                     for neighbor in neighbors.iter() {
@@ -1242,7 +1273,13 @@ struct TopicState {
 
 impl Default for TopicState {
     fn default() -> Self {
-        let (event_sender, _) = broadcast::channel(TOPIC_EVENT_CAP);
+        Self::with_event_capacity(TOPIC_EVENT_CAP)
+    }
+}
+
+impl TopicState {
+    fn with_event_capacity(capacity: usize) -> Self {
+        let (event_sender, _) = broadcast::channel(capacity.max(1));
         Self {
             neighbors: Default::default(),
             isolation: Isolation::new(Instant::now()),
@@ -1250,9 +1287,7 @@ impl Default for TopicState {
             event_sender,
         }
     }
-}
 
-impl TopicState {
     /// Check if the topic still has any publisher or subscriber.
     fn still_needed(&self) -> bool {
         // Keep topic alive if either senders or receivers exist.
@@ -1905,8 +1940,14 @@ pub(crate) mod tests {
                 .expect("endpoint is not closed")
                 .add(address_lookup.clone());
 
-            let (actor, to_actor_tx, conn_tx) =
-                Actor::new(endpoint, config, metrics.clone(), None, address_lookup);
+            let (actor, to_actor_tx, conn_tx) = Actor::new(
+                endpoint,
+                config,
+                metrics.clone(),
+                None,
+                address_lookup,
+                TOPIC_EVENT_CAP,
+            );
             let max_message_size = actor.state.max_message_size();
 
             let _actor_handle = AbortOnDropHandle::new(task::spawn(n0_future::future::pending()));
@@ -4847,5 +4888,56 @@ pub(crate) mod tests {
                 "round {round}: (neighbor_up, neighbor_down) of both peers"
             );
         }
+    }
+
+    /// The events that a subscriber, which has not read yet, misses after `sent` events on a topic of
+    /// an actor made with `capacity`.
+    async fn events_missed_after(capacity: usize, sent: usize) -> Result<u64> {
+        let endpoint = Endpoint::builder(presets::Minimal).bind().await?;
+        let (mut actor, _rpc_tx, _local_tx) = Actor::new(
+            endpoint,
+            Default::default(),
+            Arc::new(Metrics::default()),
+            None,
+            GossipAddressLookup::default(),
+            capacity,
+        );
+        let topic: TopicId = blake3::hash(b"topic_event_capacity").into();
+        let state = Actor::topic_state(&mut actor.topics, actor.topic_event_capacity, topic);
+        let mut events = state.event_sender.subscribe();
+        let peer = SecretKey::from_bytes(&[1; 32]).public();
+        for _ in 0..sent {
+            state.event_sender.send(ProtoEvent::NeighborUp(peer)).ok();
+        }
+        let missed = match events.recv().await {
+            Err(broadcast::error::RecvError::Lagged(missed)) => missed,
+            _ => 0,
+        };
+        actor.endpoint.close().await;
+        Ok(missed)
+    }
+
+    /// The default keeps the behavior of upstream: 256 events, and the subscriber that reads after 300
+    /// has missed the oldest 44.
+    #[tokio::test]
+    async fn a_subscriber_that_reads_late_misses_the_events_beyond_the_default_capacity() -> Result
+    {
+        assert_eq!(events_missed_after(TOPIC_EVENT_CAP, 300).await?, 44);
+        Ok(())
+    }
+
+    /// A burst of frames that is larger than the default must not reach a subscriber as a lag when
+    /// the caller set a larger capacity.
+    #[tokio::test]
+    async fn a_set_topic_event_capacity_holds_a_burst_larger_than_the_default() -> Result {
+        assert_eq!(events_missed_after(2048, 300).await?, 0);
+        Ok(())
+    }
+
+    /// The capacity is kept when it is given as `0`: the queue cannot hold zero events.
+    #[tokio::test]
+    async fn a_topic_event_capacity_of_zero_counts_as_one() -> Result {
+        assert_eq!(events_missed_after(0, 3).await?, 2);
+        Ok(())
     }
 }
