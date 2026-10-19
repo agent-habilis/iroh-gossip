@@ -182,6 +182,12 @@ pub enum Command<PI> {
     /// At most as many requests go out as the active view has free slots. On a topic
     /// that was not joined, the command is dropped.
     NeighborPeers(Vec<PI>),
+    /// Name the peers that take no slot of the active view. The set replaces the last one.
+    ///
+    /// The view holds them beside its capacity: they do not count for it, they do not stop a
+    /// [`Command::NeighborPeers`] request, and a random eviction never picks one. Use it for a
+    /// peer that serves only to let others in, so that its link costs no place for another peer.
+    UncountedPeers(Vec<PI>),
     /// Leave this topic and drop all state.
     Quit,
 }
@@ -294,6 +300,9 @@ impl<PI: PeerIdentity, R: Rng> State<PI, R> {
                 Command::LeavePeers(peers) => self.swarm.handle(SwarmIn::Leave(peers), io),
                 Command::NeighborPeers(peers) => {
                     self.swarm.handle(SwarmIn::RequestNeighbors(peers), io)
+                }
+                Command::UncountedPeers(peers) => {
+                    self.swarm.handle(SwarmIn::UncountedPeers(peers), io)
                 }
                 Command::Quit => self.swarm.handle(SwarmIn::Quit, io),
             },

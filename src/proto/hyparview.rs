@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 
 use derive_more::{From, Sub};
 use n0_future::time::Duration;
-use rand::{rngs::ThreadRng, Rng};
+use rand::{rngs::ThreadRng, seq::IndexedRandom, Rng};
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
@@ -29,6 +29,8 @@ pub enum InEvent<PI> {
     RequestJoin(PI),
     /// Ask the given peers for a link with low priority, while the active view has a free slot.
     RequestNeighbors(Vec<PI>),
+    /// Replace the set of peers that take no slot of the active view.
+    UncountedPeers(Vec<PI>),
     /// Update the peer data that is transmitted on join requests.
     UpdatePeerData(PeerData),
     /// Drop the given peers from the active view, telling each that we are not coming back.
@@ -293,6 +295,12 @@ pub struct State<PI, RG = ThreadRng> {
     /// A peer in this set is not added to the passive view and not adopted from a `ForwardJoin`.
     /// Its `Neighbor` request is refused. Only a `Join` from either side clears it.
     left: indexmap::IndexSet<PI>,
+    /// Peers that take no slot of the active view: the view holds them beside its capacity.
+    ///
+    /// They count neither for the capacity nor for a neighbor request, and a random eviction
+    /// never picks one. The application names them, for example a node that serves only to let
+    /// others in, so that its link does not cost the member that holds it a place for a peer.
+    uncounted: HashSet<PI>,
 }
 
 impl<PI, RG> State<PI, RG>
@@ -315,6 +323,7 @@ where
             peer_data: Default::default(),
             alive_disconnect_peers: Default::default(),
             left: Default::default(),
+            uncounted: Default::default(),
         }
     }
 
@@ -332,6 +341,7 @@ where
             InEvent::PeerDisconnected(peer) => self.handle_connection_closed(peer, io),
             InEvent::RequestJoin(peer) => self.handle_join(peer, io),
             InEvent::RequestNeighbors(peers) => self.handle_request_neighbors(peers, io),
+            InEvent::UncountedPeers(peers) => self.uncounted = peers.into_iter().collect(),
             InEvent::UpdatePeerData(data) => {
                 self.me_data = Some(data);
             }
@@ -388,7 +398,7 @@ where
     /// pending entry.
     fn handle_request_neighbors(&mut self, peers: Vec<PI>, io: &mut impl IO<PI>) {
         for peer in peers {
-            if self.active_view.len() + self.pending_neighbor_requests.len()
+            if self.counted_active_len() + self.pending_neighbor_requests.len()
                 >= self.config.active_view_capacity
             {
                 break;
@@ -799,7 +809,15 @@ where
     }
 
     fn active_is_full(&self) -> bool {
-        self.active_view.len() >= self.config.active_view_capacity
+        self.counted_active_len() >= self.config.active_view_capacity
+    }
+
+    /// How many peers of the active view take a slot: all but the uncounted ones.
+    fn counted_active_len(&self) -> usize {
+        self.active_view
+            .iter()
+            .filter(|peer| !self.uncounted.contains(peer))
+            .count()
     }
 
     /// Add a peer to the passive view.
@@ -833,7 +851,7 @@ where
     }
 
     fn refill_active_from_passive(&mut self, skip_peers: &[&PI], io: &mut impl IO<PI>) {
-        if self.active_view.len() + self.pending_neighbor_requests.len()
+        if self.counted_active_len() + self.pending_neighbor_requests.len()
             >= self.config.active_view_capacity
         {
             return;
@@ -916,9 +934,16 @@ where
         }
     }
 
-    /// Remove a random peer from the active view.
+    /// Remove a random peer that takes a slot from the active view.
     fn free_random_slot_in_active_view(&mut self, io: &mut impl IO<PI>) {
-        if let Some(index) = self.active_view.pick_random_index(&mut self.rng) {
+        let counted: Vec<usize> = self
+            .active_view
+            .iter()
+            .enumerate()
+            .filter(|(_, peer)| !self.uncounted.contains(peer))
+            .map(|(index, _)| index)
+            .collect();
+        if let Some(index) = counted.choose(&mut self.rng).copied() {
             self.remove_active_by_index(index, RemovalReason::Random, io);
         }
     }
@@ -946,7 +971,9 @@ where
             }
             return true;
         }
-        match (priority, self.active_is_full()) {
+        // An uncounted peer takes no slot: it makes no room and is never refused for lack of one.
+        let is_full = self.active_is_full() && !self.uncounted.contains(&peer);
+        match (priority, is_full) {
             (Priority::High, is_full) => {
                 if is_full {
                     self.free_random_slot_in_active_view(io);

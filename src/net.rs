@@ -590,6 +590,7 @@ impl Actor {
                     }
                     Command::LeavePeers(peers) => ProtoCommand::LeavePeers(peers),
                     Command::NeighborPeers(peers) => ProtoCommand::NeighborPeers(peers),
+                    Command::UncountedPeers(peers) => ProtoCommand::UncountedPeers(peers),
                 };
                 self.handle_in_event(proto::InEvent::Command(topic, command), Instant::now())
                     .await;

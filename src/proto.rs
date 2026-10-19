@@ -280,6 +280,75 @@ mod test {
 
     #[test]
     #[traced_test]
+    fn an_uncounted_peer_takes_no_slot_of_the_view() {
+        // Node 0 holds 3 beside its capacity of 2: 1 and 2 still fit, and the request of 2 is
+        // not refused for lack of a slot.
+        let (mut network, t) = small_view_network(4, 2);
+        network.command(0, t, Command::Join(vec![]));
+        network.command(0, t, Command::UncountedPeers(vec![3]));
+        network.command(3, t, Command::Join(vec![0]));
+        network.command(1, t, Command::Join(vec![0]));
+        network.command(2, t, Command::Join(vec![]));
+        network.run_trips(4);
+        let _ = network.events();
+
+        network.command(2, t, Command::NeighborPeers(vec![0]));
+        network.run_trips(4);
+
+        let mut after = network.neighbors(&0, &t).unwrap();
+        after.sort();
+        assert_eq!(
+            after,
+            vec![1, 2, 3],
+            "two counted peers and the uncounted one"
+        );
+        assert!(network.check_synchronicity());
+    }
+
+    #[test]
+    #[traced_test]
+    fn an_uncounted_peer_does_not_stop_a_request_for_a_link() {
+        let (mut network, t) = small_view_network(4, 2);
+        network.command(0, t, Command::Join(vec![]));
+        network.command(0, t, Command::UncountedPeers(vec![3]));
+        network.command(3, t, Command::Join(vec![0]));
+        network.command(1, t, Command::Join(vec![0]));
+        network.command(2, t, Command::Join(vec![]));
+        network.run_trips(4);
+        let _ = network.events();
+
+        // Node 0 holds 1 and the uncounted 3: one slot is free.
+        network.command(0, t, Command::NeighborPeers(vec![2]));
+        network.run_trips(4);
+
+        assert!(network.neighbors(&0, &t).unwrap().contains(&2));
+        assert!(network.neighbors(&2, &t).unwrap().contains(&0));
+    }
+
+    #[test]
+    #[traced_test]
+    fn a_join_to_a_full_view_never_evicts_an_uncounted_peer() {
+        let (mut network, t) = small_view_network(5, 2);
+        network.command(0, t, Command::Join(vec![]));
+        network.command(0, t, Command::UncountedPeers(vec![3]));
+        network.command(3, t, Command::Join(vec![0]));
+        network.command(1, t, Command::Join(vec![0]));
+        network.command(2, t, Command::Join(vec![0]));
+        network.run_trips(4);
+        let _ = network.events();
+
+        for joiner in [4, 4, 4] {
+            network.command(joiner, t, Command::Join(vec![0]));
+            network.run_trips(4);
+            assert!(
+                network.neighbors(&0, &t).unwrap().contains(&3),
+                "the uncounted peer stays"
+            );
+        }
+    }
+
+    #[test]
+    #[traced_test]
     fn neighbor_peers_to_a_free_slot_links_the_pair() {
         let (mut network, t) = small_view_network(3, 3);
         network.command(0, t, Command::Join(vec![]));
