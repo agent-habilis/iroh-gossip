@@ -3962,7 +3962,11 @@ pub(crate) mod tests {
         spawn(async move {
             while let Some(incoming) = accepting.accept().await {
                 if let Ok(connecting) = incoming.accept() {
-                    let _ = connecting.await;
+                    if let Ok(conn) = connecting.await {
+                        // The peer keeps the connection: a dropped handle closes it, and that
+                        // close can reach the dialer before the relay is cut.
+                        spawn(async move { conn.closed().await });
+                    }
                 }
             }
         });
