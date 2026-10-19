@@ -488,8 +488,15 @@ impl Actor {
                                 debug!(peer = %peer_id.fmt_short(), "dial refused: {err}");
                             } else if dial_was_closed_locally(&err) {
                                 debug!(peer = %peer_id.fmt_short(), "dial ended by our own close: {err}");
-                            } else if dial_timed_out(&err) && !self.a_topic_is_isolated() {
-                                debug!(peer = %peer_id.fmt_short(), "dial failed: {err}");
+                            } else if dial_timed_out(&err) {
+                                if self.a_topic_is_isolated() {
+                                    warn!(
+                                        peer = %peer_id.fmt_short(),
+                                        "dial failed: {err:#}, and a topic has had no neighbor for over {ISOLATED_WARN_AFTER:?}"
+                                    );
+                                } else {
+                                    debug!(peer = %peer_id.fmt_short(), "dial failed: {err}");
+                                }
                             } else {
                                 warn!(peer = %peer_id.fmt_short(), "dial failed: {err:#}");
                             }
