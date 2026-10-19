@@ -61,7 +61,14 @@ fault, the line is at debug, not warn. That is a close with an application code,
 us (`close_reason()` is `ApplicationClosed` or `LocallyClosed`), and the loss of the peer: `TimedOut`,
 `Reset`, or a transport error with the code `NO_VIABLE_PATH`. A peer that leaves closes in order. A
 peer that crashes goes silent, and its connection ends with one of the others. The next send finds
-the loop ended, and the protocol reports the loss as `NeighborDown`. Any other transport error, a
-version mismatch, an open connection and a missing connection stay a warn.
+the loop ended, and the protocol reports the loss as `NeighborDown`.
+
+The close of our own endpoint is the third case. While `Endpoint::close` runs, a connection ends with
+the transport error `INTERNAL_ERROR` ("endpoint driver future was dropped"), and the actor can still
+send: the quit and disconnect messages of a leaving node, and the answers to them. That code is no
+fault only while our own endpoint is closing, which `Endpoint::closed` says from the start of the
+close (`Endpoint::is_closed` comes only after the connections ended). On an open endpoint it stays a
+warn. Any other transport error, a version mismatch, an open connection and a missing connection
+stay a warn too, and the warn line logs the close reason.
 
 If upstream changes the `failed to send` log, keep the split in `ended_without_a_fault`.

@@ -965,7 +965,10 @@ impl Actor {
                                     Some(conn_id) => {
                                         if !self.dead_conns.contains(&(peer_id, conn_id)) {
                                             self.dead_conns.push_back((peer_id, conn_id));
-                                            if ended_without_a_fault(conns.chosen()) {
+                                            if ended_without_a_fault(
+                                                conns.chosen(),
+                                                endpoint_is_closing(&self.endpoint),
+                                            ) {
                                                 debug!(
                                                     peer = %peer_id.fmt_short(),
                                                     conn_id,
@@ -975,6 +978,7 @@ impl Actor {
                                                 warn!(
                                                     peer = %peer_id.fmt_short(),
                                                     conn_id,
+                                                    reason = ?close_reason(conns.chosen()),
                                                     "failed to send: connection task send loop terminated",
                                                 );
                                             }
@@ -1425,24 +1429,43 @@ impl Stream for TopicCommandStream {
 }
 
 /// Whether the connection of a peer ended without a fault of ours or of the peer's stack: closed
-/// in order, or lost with the peer. A peer that leaves closes in order, and one that crashes goes
-/// silent until the idle timeout, or leaves no path (`NO_VIABLE_PATH`), or comes back reset. The
-/// next send finds the send loop ended, and the protocol reports the loss as `NeighborDown`. A
-/// protocol violation, a connection that is still open and a missing connection are not that.
-fn ended_without_a_fault(conn: Option<&conns::Conn<ConnHandle>>) -> bool {
-    conn.and_then(|conn| conn.handle.conn.as_ref())
-        .and_then(Connection::close_reason)
-        .is_some_and(|reason| is_no_fault(&reason))
+/// in order, lost with the peer, or ended by the close of our own endpoint. A peer that leaves
+/// closes in order, and one that crashes goes silent until the idle timeout, or leaves no path
+/// (`NO_VIABLE_PATH`), or comes back reset. The next send finds the send loop ended, and the
+/// protocol reports the loss as `NeighborDown`. A protocol violation, a connection that is still
+/// open and a missing connection are not that.
+fn ended_without_a_fault(
+    conn: Option<&conns::Conn<ConnHandle>>,
+    own_endpoint_closing: bool,
+) -> bool {
+    close_reason(conn).is_some_and(|reason| is_no_fault(&reason, own_endpoint_closing))
 }
 
-fn is_no_fault(reason: &iroh::endpoint::ConnectionError) -> bool {
+fn close_reason(conn: Option<&conns::Conn<ConnHandle>>) -> Option<iroh::endpoint::ConnectionError> {
+    conn.and_then(|conn| conn.handle.conn.as_ref())
+        .and_then(Connection::close_reason)
+}
+
+/// Whether `endpoint` has started to close. `Endpoint::closed` resolves when the close starts,
+/// not when it ends, and `Endpoint::is_closed` is set only after the connections ended.
+fn endpoint_is_closing(endpoint: &Endpoint) -> bool {
+    n0_future::future::now_or_never(endpoint.closed()).is_some()
+}
+
+fn is_no_fault(reason: &iroh::endpoint::ConnectionError, own_endpoint_closing: bool) -> bool {
     use iroh::endpoint::{ConnectionError, TransportErrorCode};
     match reason {
         ConnectionError::ApplicationClosed(_)
         | ConnectionError::LocallyClosed
         | ConnectionError::TimedOut
         | ConnectionError::Reset => true,
-        ConnectionError::TransportError(err) => err.code == TransportErrorCode::NO_VIABLE_PATH,
+        // The connection driver of noq ends a connection with `INTERNAL_ERROR` when the driver of
+        // its endpoint is gone, and nothing else in noq makes that code on our side. While our own
+        // endpoint closes, that is the close ending the connection, and a send races it.
+        ConnectionError::TransportError(err) => {
+            err.code == TransportErrorCode::NO_VIABLE_PATH
+                || (err.code == TransportErrorCode::INTERNAL_ERROR && own_endpoint_closing)
+        }
         _ => false,
     }
 }
@@ -4032,8 +4055,16 @@ pub(crate) mod tests {
             )),
         ];
         for reason in without_a_fault {
-            assert!(is_no_fault(&reason), "{reason:?}");
+            assert!(is_no_fault(&reason, false), "{reason:?}");
         }
+        // A dropped endpoint driver is how a close of our own endpoint ends a connection. It is a
+        // fault when the endpoint is not closing.
+        let driver_dropped = ConnectionError::from(TransportError::new(
+            TransportErrorCode::INTERNAL_ERROR,
+            "endpoint driver future was dropped".to_owned(),
+        ));
+        assert!(is_no_fault(&driver_dropped, true), "{driver_dropped:?}");
+        assert!(!is_no_fault(&driver_dropped, false), "{driver_dropped:?}");
         let faults = [
             ConnectionError::VersionMismatch,
             ConnectionError::CidsExhausted,
@@ -4043,8 +4074,25 @@ pub(crate) mod tests {
             )),
         ];
         for reason in faults {
-            assert!(!is_no_fault(&reason), "{reason:?}");
+            assert!(!is_no_fault(&reason, false), "{reason:?}");
+            assert!(
+                !is_no_fault(&reason, true),
+                "a close of our own endpoint excuses no other fault: {reason:?}"
+            );
         }
+    }
+
+    /// The endpoint reports that it is closing from the start of its close, before it is closed.
+    #[tokio::test]
+    async fn an_endpoint_is_closing_once_its_close_started() -> Result {
+        let endpoint = Endpoint::builder(presets::Minimal)
+            .alpns(vec![GOSSIP_ALPN.to_vec()])
+            .bind()
+            .await?;
+        assert!(!endpoint_is_closing(&endpoint));
+        endpoint.close().await;
+        assert!(endpoint_is_closing(&endpoint));
+        Ok(())
     }
 
     /// A peer with no connection to read a reason from keeps the warning.
