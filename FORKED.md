@@ -37,6 +37,13 @@ failure stays a warn.
 If upstream changes the `dial failed` log, keep the split in `dial_had_no_address` and the
 `NoAddressWatch` that counts the spell.
 
+## A dial that our own close ended is logged at debug
+
+`net.rs`: a dial that fails with `ConnectionError::LocallyClosed` (the text is `closed`) is logged
+at debug, not warn. Our side closed it: the close of our endpoint ends the dials in flight. A node
+that shuts down or crashes does that, and the app chose it. If upstream changes the `dial failed`
+log, keep the split in `dial_was_closed_locally`.
+
 ## A send on a connection that ended without a fault is logged at debug
 
 `net.rs`: when the send loop of the chosen connection has ended and the connection ended without a

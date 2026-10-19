@@ -486,6 +486,8 @@ impl Actor {
                             self.dialer.no_address.forget(peer_id);
                             if dial_was_refused(&err) {
                                 debug!(peer = %peer_id.fmt_short(), "dial refused: {err}");
+                            } else if dial_was_closed_locally(&err) {
+                                debug!(peer = %peer_id.fmt_short(), "dial ended by our own close: {err}");
                             } else if dial_timed_out(&err) && !self.a_topic_is_isolated() {
                                 debug!(peer = %peer_id.fmt_short(), "dial failed: {err}");
                             } else {
@@ -1461,6 +1463,25 @@ fn dial_was_refused(err: &iroh::endpoint::ConnectError) -> bool {
         source,
         ConnectionError::ConnectionClosed(close)
             if close.error_code == TransportErrorCode::CONNECTION_REFUSED
+    )
+}
+
+/// Whether our own side closed the dial, as the close of our endpoint does to the dials in flight.
+/// A node that shuts down or crashes chose that, so the dial is not a fault.
+fn dial_was_closed_locally(err: &iroh::endpoint::ConnectError) -> bool {
+    use iroh::endpoint::{ConnectError, ConnectingError, ConnectionError};
+    matches!(
+        err,
+        ConnectError::Connection {
+            source: ConnectionError::LocallyClosed,
+            ..
+        } | ConnectError::Connecting {
+            source: ConnectingError::ConnectionError {
+                source: ConnectionError::LocallyClosed,
+                ..
+            },
+            ..
+        }
     )
 }
 
@@ -2475,6 +2496,9 @@ pub(crate) mod tests {
         TimesOut,
         /// As `TimesOut`, while the dialer holds a live neighbor in the topic.
         TimesOutBesideANeighbor,
+        /// As `TimesOut`, and the dialer closes its own endpoint while the dial is in flight, as a
+        /// node that crashes does.
+        DialerEndpointCloses,
     }
 
     /// Dials a peer that fails the dial once, and returns the WARN and ERROR events of
@@ -2520,9 +2544,10 @@ pub(crate) mod tests {
                 Some(peer)
             }
             FailedDial::Refused => Some(create_endpoint(rng, relay_map, None).await?),
-            FailedDial::NoAddress | FailedDial::TimesOut | FailedDial::TimesOutBesideANeighbor => {
-                None
-            }
+            FailedDial::NoAddress
+            | FailedDial::TimesOut
+            | FailedDial::TimesOutBesideANeighbor
+            | FailedDial::DialerEndpointCloses => None,
         };
         let peer_id = match &peer {
             Some(peer) => peer.id(),
@@ -2541,7 +2566,9 @@ pub(crate) mod tests {
         });
         let addr = match failed_dial {
             FailedDial::NoAddress => None,
-            FailedDial::TimesOut | FailedDial::TimesOutBesideANeighbor => Some(
+            FailedDial::TimesOut
+            | FailedDial::TimesOutBesideANeighbor
+            | FailedDial::DialerEndpointCloses => Some(
                 EndpointAddr::new(peer_id).with_ip_addr(
                     silent
                         .local_addr()
@@ -2582,6 +2609,10 @@ pub(crate) mod tests {
         };
         let _sub1 = go1.subscribe(topic, vec![peer_id]).await?;
         let metrics = go1.metrics().clone();
+        if failed_dial == FailedDial::DialerEndpointCloses {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            ep1.close().await;
+        }
         timeout(Duration::from_secs(20), async {
             while metrics.actor_tick_dialer_failure.get() == 0 {
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -2631,6 +2662,17 @@ pub(crate) mod tests {
     async fn a_timed_out_dial_beside_an_active_neighbor_is_not_a_warning() -> Result {
         assert_eq!(
             warnings_of_a_failed_dial(FailedDial::TimesOutBesideANeighbor).await?,
+            Vec::<String>::new()
+        );
+        Ok(())
+    }
+
+    /// A node that closes its own endpoint, as a crash does, ends the dials that are in flight
+    /// with `closed`. The node chose that, so the line is not a fault to warn about.
+    #[tokio::test]
+    async fn a_dial_that_the_closing_of_our_own_endpoint_ends_is_not_a_warning() -> Result {
+        assert_eq!(
+            warnings_of_a_failed_dial(FailedDial::DialerEndpointCloses).await?,
             Vec::<String>::new()
         );
         Ok(())
