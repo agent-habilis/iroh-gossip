@@ -44,6 +44,16 @@ at debug, not warn. Our side closed it: the close of our endpoint ends the dials
 that shuts down or crashes does that, and the app chose it. If upstream changes the `dial failed`
 log, keep the split in `dial_was_closed_locally`.
 
+## A dial that starts while our own close runs is logged at debug
+
+`net.rs`: `dial_was_closed_locally` also takes the dials that start after the close of our endpoint
+has begun. noq answers `EndpointStopping` from the first instant of the close, which iroh wraps as
+`ConnectWithOptsError::Noq` (the text is `Unable to connect to remote`, and its cause is
+`endpoint stopping`), and iroh answers `ConnectWithOptsError::EndpointClosed` once the close is
+done. Both are logged at debug. The other errors of noq stay at warn: they are faults of this node.
+The warn line of a failed dial logs the whole chain of the error (`{err:#}`), because the text of
+`ConnectWithOptsError::Noq` hides its cause.
+
 ## A send on a connection that ended without a fault is logged at debug
 
 `net.rs`: when the send loop of the chosen connection has ended and the connection ended without a

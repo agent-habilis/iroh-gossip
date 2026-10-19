@@ -491,7 +491,7 @@ impl Actor {
                             } else if dial_timed_out(&err) && !self.a_topic_is_isolated() {
                                 debug!(peer = %peer_id.fmt_short(), "dial failed: {err}");
                             } else {
-                                warn!(peer = %peer_id.fmt_short(), "dial failed: {err}");
+                                warn!(peer = %peer_id.fmt_short(), "dial failed: {err:#}");
                             }
                         }
                         self.metrics.actor_tick_dialer_failure.inc();
@@ -1466,10 +1466,16 @@ fn dial_was_refused(err: &iroh::endpoint::ConnectError) -> bool {
     )
 }
 
-/// Whether our own side closed the dial, as the close of our endpoint does to the dials in flight.
-/// A node that shuts down or crashes chose that, so the dial is not a fault.
+/// Whether our own side closed the dial, as the close of our endpoint does. A dial in flight ends
+/// with `LocallyClosed`. A dial that starts after the close has begun is refused by the endpoint:
+/// noq answers `EndpointStopping` ("Unable to connect to remote") from the first instant of the
+/// close, and iroh answers `EndpointClosed` once the close is done. A node that shuts down or
+/// crashes chose all of these, so the dial is not a fault. The other errors of noq (`CidsExhausted`,
+/// an invalid address) are faults of this node and stay out.
 fn dial_was_closed_locally(err: &iroh::endpoint::ConnectError) -> bool {
-    use iroh::endpoint::{ConnectError, ConnectingError, ConnectionError};
+    use iroh::endpoint::{
+        ConnectError, ConnectWithOptsError, ConnectingError, ConnectionError, QuicConnectError,
+    };
     matches!(
         err,
         ConnectError::Connection {
@@ -1480,6 +1486,12 @@ fn dial_was_closed_locally(err: &iroh::endpoint::ConnectError) -> bool {
                 source: ConnectionError::LocallyClosed,
                 ..
             },
+            ..
+        } | ConnectError::Connect {
+            source: ConnectWithOptsError::Noq {
+                source: QuicConnectError::EndpointStopping,
+                ..
+            } | ConnectWithOptsError::EndpointClosed { .. },
             ..
         }
     )
@@ -2675,6 +2687,101 @@ pub(crate) mod tests {
             warnings_of_a_failed_dial(FailedDial::DialerEndpointCloses).await?,
             Vec::<String>::new()
         );
+        Ok(())
+    }
+
+    /// A dial that starts after the close of our own endpoint has begun, and before it has
+    /// finished, is refused by the endpoint itself: "Unable to connect to remote" with the cause
+    /// "endpoint stopping", or "Endpoint is closed" one instant later. The node chose the close,
+    /// so the dial is not a fault. The real errors come from a real endpoint that closes.
+    #[tokio::test]
+    async fn a_dial_that_starts_while_our_own_endpoint_closes_is_ended_by_our_own_close() -> Result
+    {
+        use iroh::endpoint::{ConnectError, ConnectWithOptsError};
+
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").std_context("bind silent socket")?;
+        let peer = SecretKey::from_bytes(&[7; 32]).public();
+        let addr = EndpointAddr::new(peer).with_ip_addr(
+            silent
+                .local_addr()
+                .std_context("address of silent socket")?,
+        );
+        for round in 0..2u64 {
+            let endpoint = Endpoint::builder(presets::Minimal)
+                .alpns(vec![GOSSIP_ALPN.to_vec()])
+                .bind()
+                .await?;
+            let closing = spawn({
+                let endpoint = endpoint.clone();
+                async move {
+                    tokio::time::sleep(Duration::from_micros(round * 50)).await;
+                    endpoint.close().await;
+                }
+            });
+            let error = loop {
+                match endpoint
+                    .connect_with_opts(addr.clone(), GOSSIP_ALPN, Default::default())
+                    .await
+                {
+                    Ok(_connecting) => tokio::task::yield_now().await,
+                    Err(error) => break error,
+                }
+            };
+            closing.await.std_context("join the close")?;
+            let error = ConnectError::from(error);
+            assert!(
+                matches!(
+                    &error,
+                    ConnectError::Connect {
+                        source: ConnectWithOptsError::Noq { .. }
+                            | ConnectWithOptsError::EndpointClosed { .. },
+                        ..
+                    }
+                ),
+                "the dial of an endpoint that closes ended with {error:#}"
+            );
+            assert!(
+                dial_was_closed_locally(&error),
+                "a dial that our own close ended is not a fault: {error:#}"
+            );
+            // Once the close is done, the endpoint answers "Endpoint is closed".
+            let after = ConnectError::from(
+                endpoint
+                    .connect_with_opts(addr.clone(), GOSSIP_ALPN, Default::default())
+                    .await
+                    .expect_err("a closed endpoint dials nobody"),
+            );
+            assert!(
+                matches!(
+                    &after,
+                    ConnectError::Connect {
+                        source: ConnectWithOptsError::EndpointClosed { .. },
+                        ..
+                    }
+                ) && dial_was_closed_locally(&after),
+                "the dial of a closed endpoint ended with {after:#}"
+            );
+        }
+        Ok(())
+    }
+
+    /// A refusal that is a fault of the dialer itself stays a warning: dialing ourselves.
+    #[tokio::test]
+    async fn a_dial_that_fails_for_a_local_fault_is_not_ended_by_our_own_close() -> Result {
+        use iroh::endpoint::ConnectError;
+
+        let endpoint = Endpoint::builder(presets::Minimal)
+            .alpns(vec![GOSSIP_ALPN.to_vec()])
+            .bind()
+            .await?;
+        let error = ConnectError::from(
+            endpoint
+                .connect_with_opts(endpoint.id(), GOSSIP_ALPN, Default::default())
+                .await
+                .expect_err("a dial of ourselves fails"),
+        );
+        assert!(!dial_was_closed_locally(&error), "{error:#}");
+        endpoint.close().await;
         Ok(())
     }
 
