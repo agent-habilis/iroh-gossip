@@ -78,6 +78,9 @@ pub enum Timer<PI> {
 /// How long a request made with [`InEvent::RequestNeighbors`] stays pending without an answer.
 const NEIGHBOR_REQUEST_EXPIRY: Duration = Duration::from_secs(20);
 
+/// How many peers the application can name as uncounted. The rest of a longer list is ignored.
+pub(crate) const MAX_UNCOUNTED_PEERS: usize = 4;
+
 /// Messages that we can send and receive from peers within the topic.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub enum Message<PI> {
@@ -341,7 +344,9 @@ where
             InEvent::PeerDisconnected(peer) => self.handle_connection_closed(peer, io),
             InEvent::RequestJoin(peer) => self.handle_join(peer, io),
             InEvent::RequestNeighbors(peers) => self.handle_request_neighbors(peers, io),
-            InEvent::UncountedPeers(peers) => self.uncounted = peers.into_iter().collect(),
+            InEvent::UncountedPeers(peers) => {
+                self.uncounted = peers.into_iter().take(MAX_UNCOUNTED_PEERS).collect();
+            }
             InEvent::UpdatePeerData(data) => {
                 self.me_data = Some(data);
             }
@@ -1898,6 +1903,23 @@ mod tests {
         assert_eq!(a.left.len(), 16);
         assert!(!a.left.contains(&1));
         assert!(a.left.contains(&20));
+    }
+
+    #[test]
+    fn the_uncounted_peers_are_bounded_and_the_last_naming_replaces_the_set() {
+        let mut a = state(0);
+        let mut io = Io::new();
+        a.handle(InEvent::UncountedPeers((1..=100).collect()), &mut io);
+        assert_eq!(a.uncounted.len(), MAX_UNCOUNTED_PEERS);
+        assert!(a.uncounted.contains(&1), "the first of the list are kept");
+        assert!(!a.uncounted.contains(&100));
+
+        a.handle(InEvent::UncountedPeers(vec![7]), &mut io);
+        assert_eq!(
+            a.uncounted,
+            HashSet::from([7]),
+            "the new set replaces the old"
+        );
     }
 
     /// A `Neighbor` from B is already on its way when A leaves B.

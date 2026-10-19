@@ -349,6 +349,51 @@ mod test {
 
     #[test]
     #[traced_test]
+    fn only_a_named_peer_is_uncounted() {
+        // A peer that nobody named takes a slot, so a remote cannot make itself uncounted.
+        let (mut network, t) = small_view_network(6, 2);
+        network.command(0, t, Command::Join(vec![]));
+        network.command(0, t, Command::UncountedPeers(vec![5]));
+        for joiner in [5, 1, 2, 3, 4] {
+            network.command(joiner, t, Command::Join(vec![0]));
+            network.run_trips(4);
+        }
+
+        let held = network.neighbors(&0, &t).unwrap();
+        let counted = held.iter().filter(|peer| **peer != 5).count();
+        assert!(counted <= 2, "{counted} counted neighbors in {held:?}");
+    }
+
+    #[test]
+    #[traced_test]
+    fn an_uncounted_peer_that_leaves_frees_nothing_it_did_not_take() {
+        let (mut network, t) = small_view_network(4, 2);
+        network.command(0, t, Command::Join(vec![]));
+        network.command(0, t, Command::UncountedPeers(vec![3]));
+        network.command(3, t, Command::Join(vec![0]));
+        network.command(1, t, Command::Join(vec![0]));
+        network.command(2, t, Command::Join(vec![]));
+        network.run_trips(4);
+        network.command(2, t, Command::NeighborPeers(vec![0]));
+        network.run_trips(4);
+        let _ = network.events();
+        let mut before = network.neighbors(&0, &t).unwrap();
+        before.sort();
+        assert_eq!(before, vec![1, 2, 3]);
+
+        network.command(3, t, Command::LeavePeers(vec![0]));
+        network.run_trips(4);
+
+        let mut after = network.neighbors(&0, &t).unwrap();
+        after.sort();
+        assert_eq!(after, vec![1, 2], "only the uncounted peer went");
+        assert!(!network
+            .events()
+            .any(|(_, _, event)| matches!(event, Event::NeighborDown(1) | Event::NeighborDown(2))));
+    }
+
+    #[test]
+    #[traced_test]
     fn neighbor_peers_to_a_free_slot_links_the_pair() {
         let (mut network, t) = small_view_network(3, 3);
         network.command(0, t, Command::Join(vec![]));
