@@ -219,6 +219,17 @@ impl GossipSender {
         Ok(())
     }
 
+    /// Names the peers that take no slot of the active view. The set replaces the last one.
+    ///
+    /// The view holds them beside its capacity. They do not count for it, they do not stop a
+    /// [`neighbor_peers`](Self::neighbor_peers) request, and a random eviction never picks one.
+    /// Use it for a peer that serves only to let others in, so that its link costs no place for
+    /// another peer.
+    pub async fn uncounted_peers(&self, peers: Vec<EndpointId>) -> Result<(), ApiError> {
+        self.send(Command::UncountedPeers(peers)).await?;
+        Ok(())
+    }
+
     async fn send(&self, command: Command) -> Result<(), irpc::channel::SendError> {
         self.0.send(command).await?;
         Ok(())
@@ -261,6 +272,12 @@ impl GossipTopic {
     /// Sends a message to our direct neighbors in the swarm.
     pub async fn broadcast_neighbors(&mut self, message: Bytes) -> Result<(), ApiError> {
         self.sender.broadcast_neighbors(message).await
+    }
+
+    /// Names the peers that take no slot of the active view, see
+    /// [`GossipSender::uncounted_peers`].
+    pub async fn uncounted_peers(&self, peers: Vec<EndpointId>) -> Result<(), ApiError> {
+        self.sender.uncounted_peers(peers).await
     }
 
     /// Lists our current direct neighbors.
@@ -409,6 +426,8 @@ pub enum Command {
     LeavePeers(Vec<EndpointId>),
     /// Asks a set of peers for a link with low priority.
     NeighborPeers(Vec<EndpointId>),
+    /// Names the peers that take no slot of the active view.
+    UncountedPeers(Vec<EndpointId>),
 }
 
 /// Options for joining a gossip topic.
