@@ -1156,7 +1156,7 @@ struct ActorLink {
 /// before a dead one in the choice of the connection that sends go to (see [`conns`]): a
 /// connection that went silent for this long is a connection of a peer that restarted or lost the
 /// path, and a new one from the same peer must win at once. A connection that a gate holds is
-/// alive at the QUIC level: the peer sends keep-alives on it.
+/// alive at the QUIC level: the peer sends keep-alive packets on it.
 ///
 /// The value is two keep-alive intervals of iroh (5 s each): a live path of an idle connection
 /// receives one ping per interval, so a live connection always changes its count within it. The
@@ -3003,7 +3003,7 @@ pub(crate) mod tests {
         assert!(
             warnings
                 .iter()
-                .any(|event| event.contains("dial failed: timed out")),
+                .any(|event| event.contains("dial failed:") && event.contains("timed out")),
             "{warnings:?}"
         );
         Ok(())
