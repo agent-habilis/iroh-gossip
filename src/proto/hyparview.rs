@@ -273,6 +273,10 @@ pub struct State<PI, RG = ThreadRng> {
     pub(crate) stats: Stats,
     /// The set of neighbor requests we sent out but did not yet receive a reply for
     pending_neighbor_requests: HashSet<PI>,
+    /// How many `PendingNeighborRequest` timers are scheduled. A refusal takes the request out of
+    /// `pending_neighbor_requests` at once, but its timer is still the retry, so the refill counts
+    /// the timers too: the requests in flight and the retries to come never pass the free slots.
+    request_timers: usize,
     /// The peers we answered with a `Neighbor` and that did not send us anything since. Oldest first.
     ///
     /// A `Neighbor` message does not say whether it is a request or an answer: a node reads it as an
@@ -322,6 +326,7 @@ where
             rng,
             stats: Stats::default(),
             pending_neighbor_requests: Default::default(),
+            request_timers: 0,
             answered_neighbors: Default::default(),
             peer_data: Default::default(),
             alive_disconnect_peers: Default::default(),
@@ -862,9 +867,11 @@ where
     }
 
     fn refill_active_from_passive(&mut self, skip_peers: &[&PI], io: &mut impl IO<PI>) {
-        if self.counted_active_len() + self.pending_neighbor_requests.len()
-            >= self.config.active_view_capacity
-        {
+        let asked = self
+            .pending_neighbor_requests
+            .len()
+            .max(self.request_timers);
+        if self.counted_active_len() + asked >= self.config.active_view_capacity {
             return;
         }
         // "When a node p suspects that one of the nodes present in its active view has failed
@@ -895,10 +902,12 @@ where
                 self.config.neighbor_request_timeout,
                 Timer::PendingNeighborRequest(node),
             ));
+            self.request_timers += 1;
         };
     }
 
     fn handle_pending_neighbor_timer(&mut self, peer: PI, io: &mut impl IO<PI>) {
+        self.request_timers = self.request_timers.saturating_sub(1);
         if self.pending_neighbor_requests.remove(&peer) {
             self.passive_view.remove(&peer);
         }
@@ -1933,6 +1942,31 @@ mod tests {
         );
     }
 
+    /// Sends the messages of `asker` to the full peers in `fulls` and carries each answer back
+    /// into `asker_io`. Returns how many `Neighbor` requests were among the messages.
+    fn carry(
+        asker: &mut TestState,
+        fulls: &mut [TestState],
+        out: Vec<(u64, Message<u64>)>,
+        asker_io: &mut Io,
+    ) -> usize {
+        let mut requests = 0;
+        for (to, message) in out {
+            if matches!(message, Message::Neighbor(_)) {
+                requests += 1;
+            }
+            let Some(peer) = fulls.iter_mut().find(|peer| peer.me == to) else {
+                continue;
+            };
+            let mut peer_io = Io::new();
+            recv(peer, asker.me, message, &mut peer_io);
+            for (_, answer) in sent(&peer_io) {
+                recv(asker, to, answer, asker_io);
+            }
+        }
+        requests
+    }
+
     /// Sends the requests of `asker` to the full peers in `fulls` and carries each answer back,
     /// for at most `limit` rounds. Returns how many `Neighbor` requests `asker` sent.
     fn count_neighbor_requests(
@@ -1949,19 +1983,7 @@ mod tests {
             if out.is_empty() {
                 break;
             }
-            for (to, message) in out {
-                if matches!(message, Message::Neighbor(_)) {
-                    requests += 1;
-                }
-                let Some(peer) = fulls.iter_mut().find(|peer| peer.me == to) else {
-                    continue;
-                };
-                let mut peer_io = Io::new();
-                recv(peer, asker.me, message, &mut peer_io);
-                for (_, answer) in sent(&peer_io) {
-                    recv(asker, to, answer, &mut asker_io);
-                }
-            }
+            requests += carry(asker, fulls, out, &mut asker_io);
         }
         requests
     }
@@ -2034,7 +2056,7 @@ mod tests {
     /// the cap, so a request at once made a loop of refusals, one round trip each.
     #[test]
     fn a_refusal_does_not_start_the_next_request_at_once() {
-        let mut asker = with_slots(1, 3, &[5]);
+        let mut asker = with_slots(1, 3, &[9]);
         let mut fulls = full_peers(2, 3);
         for peer in &fulls {
             asker.passive_view.insert(peer.me);
@@ -2046,7 +2068,7 @@ mod tests {
     /// The timer of the refused request is the retry: it asks a passive peer again.
     #[test]
     fn the_timer_of_a_refused_request_asks_again() {
-        let mut asker = with_slots(1, 3, &[5]);
+        let mut asker = with_slots(1, 3, &[9]);
         let mut fulls = full_peers(2, 3);
         for peer in &fulls {
             asker.passive_view.insert(peer.me);
@@ -2071,6 +2093,51 @@ mod tests {
             matches!(asked.as_slice(), [(_, Message::Neighbor(_))]),
             "{asked:?}"
         );
+    }
+
+    fn request_timers_of(io: &Io) -> Vec<u64> {
+        io.iter()
+            .filter_map(|event| match event {
+                topic::OutEvent::ScheduleTimer(
+                    _,
+                    topic::Timer::Swarm(Timer::PendingNeighborRequest(peer)),
+                ) => Some(*peer),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every full peer refuses, and a shuffle answer of the counted neighbor comes in each tick.
+    /// Each of them can start a refill, but the requests in flight and the retries to come stay
+    /// within the free slots (3 slots, 1 counted link: 2 free).
+    #[test]
+    fn the_retries_of_refused_requests_stay_within_the_free_slots() {
+        let mut asker = with_slots(1, 3, &[9]);
+        let mut fulls = full_peers(2, 3);
+        for peer in &fulls {
+            asker.passive_view.insert(peer.me);
+        }
+        let mut asker_io = Io::new();
+        asker.refill_active_from_passive(&[], &mut asker_io);
+        let (mut most_requests, mut most_timers) = (0, 0);
+        let mut due = Vec::new();
+        for _ in 0..200 {
+            let shuffle_answer = Message::ShuffleReply(ShuffleReply { nodes: vec![] });
+            recv(&mut asker, 9, shuffle_answer, &mut asker_io);
+            due.extend(request_timers_of(&asker_io));
+            let out = sent(&asker_io);
+            asker_io.clear();
+            most_requests = most_requests.max(carry(&mut asker, &mut fulls, out, &mut asker_io));
+            most_timers = most_timers.max(asker.request_timers);
+            for peer in std::mem::take(&mut due) {
+                asker.handle(
+                    InEvent::TimerExpired(Timer::PendingNeighborRequest(peer)),
+                    &mut asker_io,
+                );
+            }
+        }
+        assert!(most_requests <= 2, "{most_requests} requests in one tick");
+        assert!(most_timers <= 2, "{most_timers} retry timers at once");
     }
 
     /// A `Neighbor` from B is already on its way when A leaves B.
