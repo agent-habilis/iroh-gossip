@@ -535,6 +535,10 @@ where
     fn on_join(&mut self, peer: PI, data: Option<PeerData>, io: &mut impl IO<PI>) {
         // A `Join` is the application of the peer asking for the link, so it ends a leave.
         self.left.shift_remove(&peer);
+        // It is also a new start of the peer. A request that we sent before and that the peer never
+        // answered (it died, or it is a restart on a new connection) would stop our answer to this
+        // `Join`, and the peer would wait for a link that does not come.
+        self.pending_neighbor_requests.remove(&peer);
         let already_active = self.active_view.contains(&peer);
         // "A node that receives a join request will start by adding the new
         // node to its active view, even if it has to drop a random node from it. (6)"
@@ -1823,6 +1827,29 @@ mod tests {
             sent(&io)
         );
         assert!(contact.active_view.contains(&1));
+    }
+
+    // The peer that a `Join` brought in dies before it answers our `Neighbor` request. The request
+    // stays pending, because only an answer or a lost connection clears it, and the connection of
+    // a peer that died with no close lasts until the idle timeout. The peer starts again and sends
+    // a new `Join` on a new connection. That `Join` must get its answer, or the restarted peer
+    // waits for a link that does not come.
+    #[test]
+    fn a_join_of_an_active_peer_with_an_unanswered_request_is_answered() {
+        let mut contact = state(0);
+        let mut io = Io::new();
+        recv(&mut contact, 1, Message::Join(None), &mut io);
+        io.clear();
+
+        recv(&mut contact, 1, Message::Join(None), &mut io);
+
+        assert!(
+            sent(&io)
+                .iter()
+                .any(|(to, message)| *to == 1 && matches!(message, Message::Neighbor(_))),
+            "the second Join gets a Neighbor message: {:?}",
+            sent(&io)
+        );
     }
 
     // The rule above must not hide the walk of a joiner that came back: once the connection of the
