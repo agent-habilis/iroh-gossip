@@ -1502,6 +1502,11 @@ fn is_no_fault(reason: &iroh::endpoint::ConnectionError, own_endpoint_closing: b
         | ConnectionError::LocallyClosed
         | ConnectionError::TimedOut
         | ConnectionError::Reset => true,
+        // An application close that comes before the handshake ends (the gate of a mesh at its
+        // ceiling) rides QUIC as `APPLICATION_ERROR`, see [`dial_was_refused`].
+        ConnectionError::ConnectionClosed(close) => {
+            close.error_code == TransportErrorCode::APPLICATION_ERROR
+        }
         // The connection driver of noq ends a connection with `INTERNAL_ERROR` when the driver of
         // its endpoint is gone, and nothing else in noq makes that code on our side. While our own
         // endpoint closes, that is the close ending the connection, and a send races it.
@@ -4160,6 +4165,55 @@ pub(crate) mod tests {
                 "a close of our own endpoint excuses no other fault: {reason:?}"
             );
         }
+    }
+
+    /// The gate of a mesh at its ceiling closes a connection before the handshake ends. QUIC sends
+    /// that close as `APPLICATION_ERROR`, and a send on the connection meets it as the reason of
+    /// its end. The peer chose the close, so it is not a fault to warn about.
+    #[tokio::test]
+    async fn a_close_in_the_handshake_ends_a_connection_without_a_fault() -> Result {
+        use iroh::endpoint::{ConnectError, ConnectingError, ConnectionError};
+        let bind = |alpns: Vec<Vec<u8>>| {
+            Endpoint::builder(presets::Minimal)
+                .relay_mode(RelayMode::Disabled)
+                .alpns(alpns)
+                .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+                .bind()
+        };
+        let gate = bind(vec![GOSSIP_ALPN.to_vec()]).await?;
+        let gate_addr = EndpointAddr::new(gate.id()).with_ip_addr(std::net::SocketAddr::from((
+            std::net::Ipv4Addr::LOCALHOST,
+            gate.bound_sockets()[0].port(),
+        )));
+        let closing = gate.clone();
+        spawn(async move {
+            while let Some(incoming) = closing.accept().await {
+                if let Ok(accepting) = incoming.accept() {
+                    accepting
+                        .into_0rtt()
+                        .close(7u32.into(), b"refused by the gate");
+                }
+            }
+        });
+        let dialer = bind(Vec::new()).await?;
+
+        let reason = match dialer.connect(gate_addr, GOSSIP_ALPN).await {
+            Err(
+                ConnectError::Connection { source, .. }
+                | ConnectError::Connecting {
+                    source: ConnectingError::ConnectionError { source, .. },
+                    ..
+                },
+            ) => source,
+            other => panic!("the gate closes the dial in the handshake: {other:?}"),
+        };
+
+        assert!(
+            matches!(reason, ConnectionError::ConnectionClosed(_)),
+            "{reason:?}"
+        );
+        assert!(is_no_fault(&reason, false), "{reason:?}");
+        Ok(())
     }
 
     /// The endpoint reports that it is closing from the start of its close, before it is closed.
