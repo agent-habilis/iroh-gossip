@@ -875,7 +875,10 @@ where
             .pick_random_without(&skip_peers, &mut self.rng)
             .copied()
         {
-            let priority = match self.active_view.is_empty() {
+            // An uncounted peer takes no slot, so a node with only such peers has no neighbor. It asks
+            // with high priority, which a full peer must accept. With low priority every full peer
+            // refuses, and each refusal makes the next request at once.
+            let priority = match self.counted_active_len() == 0 {
                 true => Priority::High,
                 false => Priority::Low,
             };
@@ -1920,6 +1923,113 @@ mod tests {
             HashSet::from([7]),
             "the new set replaces the old"
         );
+    }
+
+    /// Sends the requests of `asker` to the full peers in `fulls` and carries each answer back,
+    /// for at most `limit` rounds. Returns how many `Neighbor` requests `asker` sent.
+    fn count_neighbor_requests(
+        asker: &mut TestState,
+        fulls: &mut [TestState],
+        limit: usize,
+    ) -> usize {
+        let mut asker_io = Io::new();
+        asker.refill_active_from_passive(&[], &mut asker_io);
+        let mut requests = 0;
+        for _ in 0..limit {
+            let out = sent(&asker_io);
+            asker_io.clear();
+            if out.is_empty() {
+                break;
+            }
+            for (to, message) in out {
+                if matches!(message, Message::Neighbor(_)) {
+                    requests += 1;
+                }
+                let Some(peer) = fulls.iter_mut().find(|peer| peer.me == to) else {
+                    continue;
+                };
+                let mut peer_io = Io::new();
+                recv(peer, asker.me, message, &mut peer_io);
+                for (_, answer) in sent(&peer_io) {
+                    recv(asker, to, answer, &mut asker_io);
+                }
+            }
+        }
+        requests
+    }
+
+    /// A state with an active view of two, as a mesh of `max_peers` 2 has.
+    fn with_two_slots(me: u64, active: &[u64]) -> TestState {
+        let config = Config {
+            active_view_capacity: 2,
+            ..Config::default()
+        };
+        let mut state = State::new(me, None, config, ChaCha12Rng::seed_from_u64(me));
+        for peer in active {
+            state.active_view.insert(*peer);
+        }
+        state
+    }
+
+    /// Peers 2, 3 and 4 hold each other: with an active view of two, every one of them is full.
+    fn full_triangle() -> [TestState; 3] {
+        [
+            with_two_slots(2, &[3, 4]),
+            with_two_slots(3, &[2, 4]),
+            with_two_slots(4, &[2, 3]),
+        ]
+    }
+
+    /// A node whose only link is an uncounted peer has no neighbor. It asks with `High` priority,
+    /// so that a full peer makes room. With `Low`, every full peer refuses, and each refusal
+    /// starts the next request at once: the pair loops until a slot frees.
+    #[test]
+    fn a_node_with_only_uncounted_links_asks_for_a_neighbor_with_high_priority() {
+        let mut asker = with_active(1, &[100]);
+        asker.uncounted.insert(100);
+        asker.passive_view.insert(2);
+        let mut io = Io::new();
+        asker.refill_active_from_passive(&[], &mut io);
+        let asked = sent(&io);
+        assert!(
+            matches!(
+                asked.as_slice(),
+                [(
+                    2,
+                    Message::Neighbor(Neighbor {
+                        priority: Priority::High,
+                        ..
+                    })
+                )]
+            ),
+            "{asked:?}"
+        );
+    }
+
+    #[test]
+    fn a_node_with_only_uncounted_links_does_not_loop_against_full_peers() {
+        let mut asker = with_two_slots(1, &[100]);
+        asker.uncounted.insert(100);
+        for peer in [2, 3, 4] {
+            asker.passive_view.insert(peer);
+        }
+        let mut fulls = full_triangle();
+        let requests = count_neighbor_requests(&mut asker, &mut fulls, 100);
+        assert!(requests < 10, "{requests} requests in 100 rounds");
+        assert!(asker.counted_active_len() >= 1, "the node found a neighbor");
+    }
+
+    /// The same loop for a node that has one counted link and wants a second: every passive peer
+    /// is full and refuses, and each refusal starts the next request at once.
+    #[test]
+    fn a_refusal_does_not_start_the_next_request_at_once() {
+        let mut asker = with_two_slots(1, &[5]);
+        for peer in [2, 3, 4] {
+            asker.passive_view.insert(peer);
+        }
+        let mut fulls = full_triangle();
+        let requests = count_neighbor_requests(&mut asker, &mut fulls, 100);
+        assert!(requests < 10, "{requests} requests in 100 rounds");
     }
 
     /// A `Neighbor` from B is already on its way when A leaves B.
