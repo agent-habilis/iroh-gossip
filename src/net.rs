@@ -1513,8 +1513,11 @@ fn is_no_fault(reason: &iroh::endpoint::ConnectionError, own_endpoint_closing: b
     }
 }
 
-/// Whether the peer answered the dial with a refusal, as an endpoint that is closing does.
-/// That is a clear answer, and the caller retries or gives up, so it is not a fault to warn about.
+/// Whether the peer answered the dial with a refusal, as an endpoint that is closing does, or as
+/// an application does that closes the connection before the handshake ends (the gate of a mesh
+/// at its ceiling). QUIC sends that close as `APPLICATION_ERROR`, because an application close
+/// cannot ride a packet of the handshake. That is a clear answer, and the caller retries or gives
+/// up, so it is not a fault to warn about.
 fn dial_was_refused(err: &iroh::endpoint::ConnectError) -> bool {
     use iroh::endpoint::{ConnectError, ConnectingError, ConnectionError, TransportErrorCode};
     let (ConnectError::Connection { source, .. }
@@ -1529,6 +1532,7 @@ fn dial_was_refused(err: &iroh::endpoint::ConnectError) -> bool {
         source,
         ConnectionError::ConnectionClosed(close)
             if close.error_code == TransportErrorCode::CONNECTION_REFUSED
+                || close.error_code == TransportErrorCode::APPLICATION_ERROR
     )
 }
 
@@ -2572,6 +2576,9 @@ pub(crate) mod tests {
     enum FailedDial {
         /// The peer refuses every connection, as a closing endpoint does.
         Refused,
+        /// The peer ends the connection in its handshake, as the gate of a mesh does when it
+        /// refuses a dial at its ceiling: the dialer reads a transport error, not an application close.
+        ClosedInTheHandshake,
         /// The dialer knows no address of the peer.
         NoAddress,
         /// The peer speaks another protocol, so the handshake ends in an error.
@@ -2627,7 +2634,9 @@ pub(crate) mod tests {
                 peer.online().await;
                 Some(peer)
             }
-            FailedDial::Refused => Some(create_endpoint(rng, relay_map, None).await?),
+            FailedDial::Refused | FailedDial::ClosedInTheHandshake => {
+                Some(create_endpoint(rng, relay_map, None).await?)
+            }
             FailedDial::NoAddress
             | FailedDial::TimesOut
             | FailedDial::TimesOutBesideANeighbor
@@ -2642,6 +2651,12 @@ pub(crate) mod tests {
                 while let Some(incoming) = accepting.accept().await {
                     if failed_dial == FailedDial::Refused {
                         incoming.refuse();
+                    } else if failed_dial == FailedDial::ClosedInTheHandshake {
+                        if let Ok(accepting) = incoming.accept() {
+                            accepting
+                                .into_0rtt()
+                                .close(7u32.into(), b"refused by the gate");
+                        }
                     } else if let Ok(connecting) = incoming.accept() {
                         let _ = connecting.await;
                     }
@@ -2659,7 +2674,7 @@ pub(crate) mod tests {
                         .std_context("address of silent socket")?,
                 ),
             ),
-            FailedDial::Refused | FailedDial::WrongProtocol => {
+            FailedDial::Refused | FailedDial::WrongProtocol | FailedDial::ClosedInTheHandshake => {
                 Some(EndpointAddr::new(peer_id).with_relay_url(relay_url))
             }
         };
@@ -2723,6 +2738,18 @@ pub(crate) mod tests {
     async fn a_dial_that_a_closing_peer_refuses_is_not_a_warning() -> Result {
         assert_eq!(
             warnings_of_a_failed_dial(FailedDial::Refused).await?,
+            Vec::<String>::new()
+        );
+        Ok(())
+    }
+
+    /// A peer ends the connection in its handshake, as the gate of a mesh does at its ceiling. The
+    /// dialer reads `APPLICATION_ERROR` from the transport, not an application close. The peer
+    /// chose that, so it is a refusal, like `CONNECTION_REFUSED`.
+    #[tokio::test]
+    async fn a_dial_that_a_peer_ends_in_the_handshake_is_not_a_warning() -> Result {
+        assert_eq!(
+            warnings_of_a_failed_dial(FailedDial::ClosedInTheHandshake).await?,
             Vec::<String>::new()
         );
         Ok(())
