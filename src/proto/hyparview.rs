@@ -273,6 +273,12 @@ pub struct State<PI, RG = ThreadRng> {
     pub(crate) stats: Stats,
     /// The set of neighbor requests we sent out but did not yet receive a reply for
     pending_neighbor_requests: HashSet<PI>,
+    /// How many `PendingNeighborRequest` timers are scheduled for each peer. A refusal takes the
+    /// request out of `pending_neighbor_requests` at once, but its timer is still the retry, so
+    /// the refill counts the timers too: the requests in flight and the retries to come never
+    /// pass the free slots. A request of the application or a `ForwardJoin` request has no timer
+    /// of this kind, so it counts from `pending_neighbor_requests`.
+    request_timers: HashMap<PI, usize>,
     /// The peers we answered with a `Neighbor` and that did not send us anything since. Oldest first.
     ///
     /// A `Neighbor` message does not say whether it is a request or an answer: a node reads it as an
@@ -322,6 +328,7 @@ where
             rng,
             stats: Stats::default(),
             pending_neighbor_requests: Default::default(),
+            request_timers: Default::default(),
             answered_neighbors: Default::default(),
             peer_data: Default::default(),
             alive_disconnect_peers: Default::default(),
@@ -373,7 +380,7 @@ where
             Message::Join(data) => self.on_join(from, data, io),
             Message::ForwardJoin(details) => self.on_forward_join(from, details, io),
             Message::Shuffle(details) => self.on_shuffle(from, details, io),
-            Message::ShuffleReply(details) => self.on_shuffle_reply(details, io),
+            Message::ShuffleReply(details) => self.on_shuffle_reply(from, details, io),
             Message::Neighbor(details) => self.on_neighbor(from, details, io),
             Message::Disconnect(details) => self.on_disconnect(from, details, io),
         }
@@ -528,6 +535,10 @@ where
     fn on_join(&mut self, peer: PI, data: Option<PeerData>, io: &mut impl IO<PI>) {
         // A `Join` is the application of the peer asking for the link, so it ends a leave.
         self.left.shift_remove(&peer);
+        // It is also a new start of the peer. A request that we sent before and that the peer never
+        // answered (it died, or it is a restart on a new connection) would stop our answer to this
+        // `Join`, and the peer would wait for a link that does not come.
+        self.pending_neighbor_requests.remove(&peer);
         let already_active = self.active_view.contains(&peer);
         // "A node that receives a join request will start by adding the new
         // node to its active view, even if it has to drop a random node from it. (6)"
@@ -768,9 +779,15 @@ where
         io.push(OutEvent::SendMessage(to, message));
     }
 
-    fn on_shuffle_reply(&mut self, message: ShuffleReply<PI>, io: &mut impl IO<PI>) {
+    fn on_shuffle_reply(&mut self, from: PI, message: ShuffleReply<PI>, io: &mut impl IO<PI>) {
         for node in message.nodes {
             self.add_passive(node.id, node.data, io);
+        }
+        // A peer that refuses our `Neighbor` request sends this reply before its `Disconnect`. The
+        // next request waits for the timer of the refused one: when every passive peer is full,
+        // a request at once makes a loop of refusals, one round trip each.
+        if self.pending_neighbor_requests.contains(&from) {
+            return;
         }
         self.refill_active_from_passive(&[], io);
     }
@@ -856,9 +873,13 @@ where
     }
 
     fn refill_active_from_passive(&mut self, skip_peers: &[&PI], io: &mut impl IO<PI>) {
-        if self.counted_active_len() + self.pending_neighbor_requests.len()
-            >= self.config.active_view_capacity
-        {
+        let untimed = self
+            .pending_neighbor_requests
+            .iter()
+            .filter(|peer| !self.request_timers.contains_key(*peer))
+            .count();
+        let asked = untimed + self.request_timers.values().sum::<usize>();
+        if self.counted_active_len() + asked >= self.config.active_view_capacity {
             return;
         }
         // "When a node p suspects that one of the nodes present in its active view has failed
@@ -875,7 +896,10 @@ where
             .pick_random_without(&skip_peers, &mut self.rng)
             .copied()
         {
-            let priority = match self.active_view.is_empty() {
+            // An uncounted peer takes no slot, so a node with only such peers has no neighbor. It asks
+            // with high priority, which a full peer must accept: with low priority every full peer
+            // refuses, and the node stays alone.
+            let priority = match self.counted_active_len() == 0 {
                 true => Priority::High,
                 false => Priority::Low,
             };
@@ -886,14 +910,23 @@ where
                 self.config.neighbor_request_timeout,
                 Timer::PendingNeighborRequest(node),
             ));
+            *self.request_timers.entry(node).or_default() += 1;
         };
     }
 
     fn handle_pending_neighbor_timer(&mut self, peer: PI, io: &mut impl IO<PI>) {
+        if let Some(timers) = self.request_timers.get_mut(&peer) {
+            *timers -= 1;
+            if *timers == 0 {
+                self.request_timers.remove(&peer);
+            }
+        }
         if self.pending_neighbor_requests.remove(&peer) {
             self.passive_view.remove(&peer);
-            self.refill_active_from_passive(&[], io);
         }
+        // Also when the peer already refused: its `Disconnect` took the entry, and this timer is
+        // the retry (see `on_shuffle_reply`).
+        self.refill_active_from_passive(&[], io);
     }
 
     fn remove_active_by_index(
@@ -1796,6 +1829,29 @@ mod tests {
         assert!(contact.active_view.contains(&1));
     }
 
+    // The peer that a `Join` brought in dies before it answers our `Neighbor` request. The request
+    // stays pending, because only an answer or a lost connection clears it, and the connection of
+    // a peer that died with no close lasts until the idle timeout. The peer starts again and sends
+    // a new `Join` on a new connection. That `Join` must get its answer, or the restarted peer
+    // waits for a link that does not come.
+    #[test]
+    fn a_join_of_an_active_peer_with_an_unanswered_request_is_answered() {
+        let mut contact = state(0);
+        let mut io = Io::new();
+        recv(&mut contact, 1, Message::Join(None), &mut io);
+        io.clear();
+
+        recv(&mut contact, 1, Message::Join(None), &mut io);
+
+        assert!(
+            sent(&io)
+                .iter()
+                .any(|(to, message)| *to == 1 && matches!(message, Message::Neighbor(_))),
+            "the second Join gets a Neighbor message: {:?}",
+            sent(&io)
+        );
+    }
+
     // The rule above must not hide the walk of a joiner that came back: once the connection of the
     // peer was lost, the peer is not active, and its next `Join` is a first `Join` again.
     #[test]
@@ -1920,6 +1976,222 @@ mod tests {
             HashSet::from([7]),
             "the new set replaces the old"
         );
+    }
+
+    /// Sends the messages of `asker` to the full peers in `fulls` and carries each answer back
+    /// into `asker_io`. Returns how many `Neighbor` requests were among the messages.
+    fn carry(
+        asker: &mut TestState,
+        fulls: &mut [TestState],
+        out: Vec<(u64, Message<u64>)>,
+        asker_io: &mut Io,
+    ) -> usize {
+        let mut requests = 0;
+        for (to, message) in out {
+            if matches!(message, Message::Neighbor(_)) {
+                requests += 1;
+            }
+            let Some(peer) = fulls.iter_mut().find(|peer| peer.me == to) else {
+                continue;
+            };
+            let mut peer_io = Io::new();
+            recv(peer, asker.me, message, &mut peer_io);
+            for (dest, answer) in sent(&peer_io) {
+                if dest == asker.me {
+                    recv(asker, to, answer, asker_io);
+                }
+            }
+        }
+        requests
+    }
+
+    /// Sends the requests of `asker` to the full peers in `fulls` and carries each answer back,
+    /// for at most `limit` rounds. Returns how many `Neighbor` requests `asker` sent.
+    fn count_neighbor_requests(
+        asker: &mut TestState,
+        fulls: &mut [TestState],
+        limit: usize,
+    ) -> usize {
+        let mut asker_io = Io::new();
+        asker.refill_active_from_passive(&[], &mut asker_io);
+        let mut requests = 0;
+        for _ in 0..limit {
+            let out = sent(&asker_io);
+            asker_io.clear();
+            if out.is_empty() {
+                break;
+            }
+            requests += carry(asker, fulls, out, &mut asker_io);
+        }
+        requests
+    }
+
+    /// A state with an active view of `slots`, as a mesh of `max_peers` `slots` has.
+    fn with_slots(me: u64, slots: usize, active: &[u64]) -> TestState {
+        let config = Config {
+            active_view_capacity: slots,
+            ..Config::default()
+        };
+        let mut state = State::new(me, None, config, ChaCha12Rng::seed_from_u64(me));
+        for peer in active {
+            state.active_view.insert(*peer);
+        }
+        state
+    }
+
+    /// Peers that hold each other, so that every one of them is full: `slots` + 1 of them.
+    fn full_peers(first: u64, slots: usize) -> Vec<TestState> {
+        let ids: Vec<u64> = (first..first + slots as u64 + 1).collect();
+        ids.iter()
+            .map(|me| {
+                let others: Vec<u64> = ids.iter().copied().filter(|id| id != me).collect();
+                with_slots(*me, slots, &others)
+            })
+            .collect()
+    }
+
+    /// A node whose only link is an uncounted peer has no neighbor. It asks with `High` priority,
+    /// so that a full peer makes room. With `Low`, every full peer refuses, and each refusal
+    /// starts the next request at once: the pair loops until a slot frees.
+    #[test]
+    fn a_node_with_only_uncounted_links_asks_for_a_neighbor_with_high_priority() {
+        let mut asker = with_slots(1, 2, &[100]);
+        asker.uncounted.insert(100);
+        asker.passive_view.insert(2);
+        let mut io = Io::new();
+        asker.refill_active_from_passive(&[], &mut io);
+        let asked = sent(&io);
+        assert!(
+            matches!(
+                asked.as_slice(),
+                [(
+                    2,
+                    Message::Neighbor(Neighbor {
+                        priority: Priority::High,
+                        ..
+                    })
+                )]
+            ),
+            "{asked:?}"
+        );
+    }
+
+    #[test]
+    fn a_node_with_only_uncounted_links_does_not_loop_against_full_peers() {
+        let mut asker = with_slots(1, 2, &[100]);
+        asker.uncounted.insert(100);
+        let mut fulls = full_peers(2, 2);
+        for peer in &fulls {
+            asker.passive_view.insert(peer.me);
+        }
+        let requests = count_neighbor_requests(&mut asker, &mut fulls, 100);
+        assert!(requests < 10, "{requests} requests in 100 rounds");
+        assert!(asker.counted_active_len() >= 1, "the node found a neighbor");
+    }
+
+    /// A node with a counted link and room for more asks a full peer. The refusal does not start
+    /// the next request at once: with an active view of three, the request in flight does not fill
+    /// the cap, so a request at once made a loop of refusals, one round trip each.
+    #[test]
+    fn a_refusal_does_not_start_the_next_request_at_once() {
+        let mut asker = with_slots(1, 3, &[9]);
+        let mut fulls = full_peers(2, 3);
+        for peer in &fulls {
+            asker.passive_view.insert(peer.me);
+        }
+        let requests = count_neighbor_requests(&mut asker, &mut fulls, 100);
+        assert_eq!(requests, 1, "requests in 100 rounds");
+    }
+
+    /// The timer of the refused request is the retry: it asks a passive peer again.
+    #[test]
+    fn the_timer_of_a_refused_request_asks_again() {
+        let mut asker = with_slots(1, 3, &[9]);
+        let mut fulls = full_peers(2, 3);
+        for peer in &fulls {
+            asker.passive_view.insert(peer.me);
+        }
+        assert_eq!(count_neighbor_requests(&mut asker, &mut fulls, 100), 1);
+        let refused = *fulls
+            .iter()
+            .map(|peer| &peer.me)
+            .find(|me| {
+                !asker.pending_neighbor_requests.contains(*me)
+                    && asker.passive_view.contains(*me)
+                    && asker.alive_disconnect_peers.contains(*me)
+            })
+            .expect("the refused peer");
+        let mut io = Io::new();
+        asker.handle(
+            InEvent::TimerExpired(Timer::PendingNeighborRequest(refused)),
+            &mut io,
+        );
+        let asked = sent(&io);
+        assert!(
+            matches!(asked.as_slice(), [(_, Message::Neighbor(_))]),
+            "{asked:?}"
+        );
+    }
+
+    fn request_timers_of(io: &Io) -> Vec<u64> {
+        io.iter()
+            .filter_map(|event| match event {
+                topic::OutEvent::ScheduleTimer(
+                    _,
+                    topic::Timer::Swarm(Timer::PendingNeighborRequest(peer)),
+                ) => Some(*peer),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Requests of the application and `ForwardJoin` requests are pending without a timer. They
+    /// count beside the retry timers that refused requests leave: 1 counted link, 2 requests
+    /// without a timer, 2 retry timers and a cap of 5 leave no free slot.
+    #[test]
+    fn requests_without_a_timer_count_beside_the_retry_timers() {
+        let mut asker = with_slots(1, 5, &[9]);
+        for peer in 20..30 {
+            asker.passive_view.insert(peer);
+        }
+        asker.pending_neighbor_requests.extend([10, 11]);
+        asker.request_timers.extend([(12, 1), (13, 1)]);
+        let mut io = Io::new();
+        asker.refill_active_from_passive(&[], &mut io);
+        assert_eq!(sent(&io), vec![], "no request when no slot is free");
+    }
+
+    /// Every full peer refuses, and a shuffle answer of the counted neighbor comes in each tick.
+    /// Each of them can start a refill, but the requests in flight and the retries to come stay
+    /// within the free slots (3 slots, 1 counted link: 2 free).
+    #[test]
+    fn the_retries_of_refused_requests_stay_within_the_free_slots() {
+        let mut asker = with_slots(1, 3, &[9]);
+        let mut fulls = full_peers(2, 3);
+        for peer in &fulls {
+            asker.passive_view.insert(peer.me);
+        }
+        let mut asker_io = Io::new();
+        asker.refill_active_from_passive(&[], &mut asker_io);
+        let (mut most_requests, mut most_timers) = (0, 0);
+        let mut due = Vec::new();
+        for _ in 0..200 {
+            let shuffle_answer = Message::ShuffleReply(ShuffleReply { nodes: vec![] });
+            recv(&mut asker, 9, shuffle_answer, &mut asker_io);
+            due.extend(request_timers_of(&asker_io));
+            let out = sent(&asker_io);
+            asker_io.clear();
+            most_requests = most_requests.max(carry(&mut asker, &mut fulls, out, &mut asker_io));
+            most_timers = most_timers.max(asker.request_timers.values().sum());
+            for peer in std::mem::take(&mut due) {
+                asker.handle(
+                    InEvent::TimerExpired(Timer::PendingNeighborRequest(peer)),
+                    &mut asker_io,
+                );
+            }
+        }
+        assert!(most_requests <= 2, "{most_requests} requests in one tick");
+        assert!(most_timers <= 2, "{most_timers} retry timers at once");
     }
 
     /// A `Neighbor` from B is already on its way when A leaves B.

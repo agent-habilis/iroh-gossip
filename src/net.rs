@@ -1502,6 +1502,11 @@ fn is_no_fault(reason: &iroh::endpoint::ConnectionError, own_endpoint_closing: b
         | ConnectionError::LocallyClosed
         | ConnectionError::TimedOut
         | ConnectionError::Reset => true,
+        // An application close that comes before the handshake ends (the gate of a mesh at its
+        // ceiling) rides QUIC as `APPLICATION_ERROR`, see [`dial_was_refused`].
+        ConnectionError::ConnectionClosed(close) => {
+            close.error_code == TransportErrorCode::APPLICATION_ERROR
+        }
         // The connection driver of noq ends a connection with `INTERNAL_ERROR` when the driver of
         // its endpoint is gone, and nothing else in noq makes that code on our side. While our own
         // endpoint closes, that is the close ending the connection, and a send races it.
@@ -1513,8 +1518,11 @@ fn is_no_fault(reason: &iroh::endpoint::ConnectionError, own_endpoint_closing: b
     }
 }
 
-/// Whether the peer answered the dial with a refusal, as an endpoint that is closing does.
-/// That is a clear answer, and the caller retries or gives up, so it is not a fault to warn about.
+/// Whether the peer answered the dial with a refusal, as an endpoint that is closing does, or as
+/// an application does that closes the connection before the handshake ends (the gate of a mesh
+/// at its ceiling). QUIC sends that close as `APPLICATION_ERROR`, because an application close
+/// cannot ride a packet of the handshake. That is a clear answer, and the caller retries or gives
+/// up, so it is not a fault to warn about.
 fn dial_was_refused(err: &iroh::endpoint::ConnectError) -> bool {
     use iroh::endpoint::{ConnectError, ConnectingError, ConnectionError, TransportErrorCode};
     let (ConnectError::Connection { source, .. }
@@ -1529,6 +1537,7 @@ fn dial_was_refused(err: &iroh::endpoint::ConnectError) -> bool {
         source,
         ConnectionError::ConnectionClosed(close)
             if close.error_code == TransportErrorCode::CONNECTION_REFUSED
+                || close.error_code == TransportErrorCode::APPLICATION_ERROR
     )
 }
 
@@ -2572,6 +2581,9 @@ pub(crate) mod tests {
     enum FailedDial {
         /// The peer refuses every connection, as a closing endpoint does.
         Refused,
+        /// The peer ends the connection in its handshake, as the gate of a mesh does when it
+        /// refuses a dial at its ceiling: the dialer reads a transport error, not an application close.
+        ClosedInTheHandshake,
         /// The dialer knows no address of the peer.
         NoAddress,
         /// The peer speaks another protocol, so the handshake ends in an error.
@@ -2627,7 +2639,9 @@ pub(crate) mod tests {
                 peer.online().await;
                 Some(peer)
             }
-            FailedDial::Refused => Some(create_endpoint(rng, relay_map, None).await?),
+            FailedDial::Refused | FailedDial::ClosedInTheHandshake => {
+                Some(create_endpoint(rng, relay_map, None).await?)
+            }
             FailedDial::NoAddress
             | FailedDial::TimesOut
             | FailedDial::TimesOutBesideANeighbor
@@ -2642,6 +2656,12 @@ pub(crate) mod tests {
                 while let Some(incoming) = accepting.accept().await {
                     if failed_dial == FailedDial::Refused {
                         incoming.refuse();
+                    } else if failed_dial == FailedDial::ClosedInTheHandshake {
+                        if let Ok(accepting) = incoming.accept() {
+                            accepting
+                                .into_0rtt()
+                                .close(7u32.into(), b"refused by the gate");
+                        }
                     } else if let Ok(connecting) = incoming.accept() {
                         let _ = connecting.await;
                     }
@@ -2659,7 +2679,7 @@ pub(crate) mod tests {
                         .std_context("address of silent socket")?,
                 ),
             ),
-            FailedDial::Refused | FailedDial::WrongProtocol => {
+            FailedDial::Refused | FailedDial::WrongProtocol | FailedDial::ClosedInTheHandshake => {
                 Some(EndpointAddr::new(peer_id).with_relay_url(relay_url))
             }
         };
@@ -2723,6 +2743,18 @@ pub(crate) mod tests {
     async fn a_dial_that_a_closing_peer_refuses_is_not_a_warning() -> Result {
         assert_eq!(
             warnings_of_a_failed_dial(FailedDial::Refused).await?,
+            Vec::<String>::new()
+        );
+        Ok(())
+    }
+
+    /// A peer ends the connection in its handshake, as the gate of a mesh does at its ceiling. The
+    /// dialer reads `APPLICATION_ERROR` from the transport, not an application close. The peer
+    /// chose that, so it is a refusal, like `CONNECTION_REFUSED`.
+    #[tokio::test]
+    async fn a_dial_that_a_peer_ends_in_the_handshake_is_not_a_warning() -> Result {
+        assert_eq!(
+            warnings_of_a_failed_dial(FailedDial::ClosedInTheHandshake).await?,
             Vec::<String>::new()
         );
         Ok(())
@@ -4133,6 +4165,55 @@ pub(crate) mod tests {
                 "a close of our own endpoint excuses no other fault: {reason:?}"
             );
         }
+    }
+
+    /// The gate of a mesh at its ceiling closes a connection before the handshake ends. QUIC sends
+    /// that close as `APPLICATION_ERROR`, and a send on the connection meets it as the reason of
+    /// its end. The peer chose the close, so it is not a fault to warn about.
+    #[tokio::test]
+    async fn a_close_in_the_handshake_ends_a_connection_without_a_fault() -> Result {
+        use iroh::endpoint::{ConnectError, ConnectingError, ConnectionError};
+        let bind = |alpns: Vec<Vec<u8>>| {
+            Endpoint::builder(presets::Minimal)
+                .relay_mode(RelayMode::Disabled)
+                .alpns(alpns)
+                .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+                .bind()
+        };
+        let gate = bind(vec![GOSSIP_ALPN.to_vec()]).await?;
+        let gate_addr = EndpointAddr::new(gate.id()).with_ip_addr(std::net::SocketAddr::from((
+            std::net::Ipv4Addr::LOCALHOST,
+            gate.bound_sockets()[0].port(),
+        )));
+        let closing = gate.clone();
+        spawn(async move {
+            while let Some(incoming) = closing.accept().await {
+                if let Ok(accepting) = incoming.accept() {
+                    accepting
+                        .into_0rtt()
+                        .close(7u32.into(), b"refused by the gate");
+                }
+            }
+        });
+        let dialer = bind(Vec::new()).await?;
+
+        let reason = match dialer.connect(gate_addr, GOSSIP_ALPN).await {
+            Err(
+                ConnectError::Connection { source, .. }
+                | ConnectError::Connecting {
+                    source: ConnectingError::ConnectionError { source, .. },
+                    ..
+                },
+            ) => source,
+            other => panic!("the gate closes the dial in the handshake: {other:?}"),
+        };
+
+        assert!(
+            matches!(reason, ConnectionError::ConnectionClosed(_)),
+            "{reason:?}"
+        );
+        assert!(is_no_fault(&reason, false), "{reason:?}");
+        Ok(())
     }
 
     /// The endpoint reports that it is closing from the start of its close, before it is closed.
