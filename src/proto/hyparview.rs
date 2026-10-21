@@ -273,10 +273,12 @@ pub struct State<PI, RG = ThreadRng> {
     pub(crate) stats: Stats,
     /// The set of neighbor requests we sent out but did not yet receive a reply for
     pending_neighbor_requests: HashSet<PI>,
-    /// How many `PendingNeighborRequest` timers are scheduled. A refusal takes the request out of
-    /// `pending_neighbor_requests` at once, but its timer is still the retry, so the refill counts
-    /// the timers too: the requests in flight and the retries to come never pass the free slots.
-    request_timers: usize,
+    /// How many `PendingNeighborRequest` timers are scheduled for each peer. A refusal takes the
+    /// request out of `pending_neighbor_requests` at once, but its timer is still the retry, so
+    /// the refill counts the timers too: the requests in flight and the retries to come never
+    /// pass the free slots. A request of the application or a `ForwardJoin` request has no timer
+    /// of this kind, so it counts from `pending_neighbor_requests`.
+    request_timers: HashMap<PI, usize>,
     /// The peers we answered with a `Neighbor` and that did not send us anything since. Oldest first.
     ///
     /// A `Neighbor` message does not say whether it is a request or an answer: a node reads it as an
@@ -326,7 +328,7 @@ where
             rng,
             stats: Stats::default(),
             pending_neighbor_requests: Default::default(),
-            request_timers: 0,
+            request_timers: Default::default(),
             answered_neighbors: Default::default(),
             peer_data: Default::default(),
             alive_disconnect_peers: Default::default(),
@@ -867,10 +869,12 @@ where
     }
 
     fn refill_active_from_passive(&mut self, skip_peers: &[&PI], io: &mut impl IO<PI>) {
-        let asked = self
+        let untimed = self
             .pending_neighbor_requests
-            .len()
-            .max(self.request_timers);
+            .iter()
+            .filter(|peer| !self.request_timers.contains_key(*peer))
+            .count();
+        let asked = untimed + self.request_timers.values().sum::<usize>();
         if self.counted_active_len() + asked >= self.config.active_view_capacity {
             return;
         }
@@ -902,12 +906,17 @@ where
                 self.config.neighbor_request_timeout,
                 Timer::PendingNeighborRequest(node),
             ));
-            self.request_timers += 1;
+            *self.request_timers.entry(node).or_default() += 1;
         };
     }
 
     fn handle_pending_neighbor_timer(&mut self, peer: PI, io: &mut impl IO<PI>) {
-        self.request_timers = self.request_timers.saturating_sub(1);
+        if let Some(timers) = self.request_timers.get_mut(&peer) {
+            *timers -= 1;
+            if *timers == 0 {
+                self.request_timers.remove(&peer);
+            }
+        }
         if self.pending_neighbor_requests.remove(&peer) {
             self.passive_view.remove(&peer);
         }
@@ -1960,8 +1969,10 @@ mod tests {
             };
             let mut peer_io = Io::new();
             recv(peer, asker.me, message, &mut peer_io);
-            for (_, answer) in sent(&peer_io) {
-                recv(asker, to, answer, asker_io);
+            for (dest, answer) in sent(&peer_io) {
+                if dest == asker.me {
+                    recv(asker, to, answer, asker_io);
+                }
             }
         }
         requests
@@ -2107,6 +2118,22 @@ mod tests {
             .collect()
     }
 
+    /// Requests of the application and `ForwardJoin` requests are pending without a timer. They
+    /// count beside the retry timers that refused requests leave: 1 counted link, 2 requests
+    /// without a timer, 2 retry timers and a cap of 5 leave no free slot.
+    #[test]
+    fn requests_without_a_timer_count_beside_the_retry_timers() {
+        let mut asker = with_slots(1, 5, &[9]);
+        for peer in 20..30 {
+            asker.passive_view.insert(peer);
+        }
+        asker.pending_neighbor_requests.extend([10, 11]);
+        asker.request_timers.extend([(12, 1), (13, 1)]);
+        let mut io = Io::new();
+        asker.refill_active_from_passive(&[], &mut io);
+        assert_eq!(sent(&io), vec![], "no request when no slot is free");
+    }
+
     /// Every full peer refuses, and a shuffle answer of the counted neighbor comes in each tick.
     /// Each of them can start a refill, but the requests in flight and the retries to come stay
     /// within the free slots (3 slots, 1 counted link: 2 free).
@@ -2128,7 +2155,7 @@ mod tests {
             let out = sent(&asker_io);
             asker_io.clear();
             most_requests = most_requests.max(carry(&mut asker, &mut fulls, out, &mut asker_io));
-            most_timers = most_timers.max(asker.request_timers);
+            most_timers = most_timers.max(asker.request_timers.values().sum());
             for peer in std::mem::take(&mut due) {
                 asker.handle(
                     InEvent::TimerExpired(Timer::PendingNeighborRequest(peer)),
