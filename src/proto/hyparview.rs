@@ -78,6 +78,11 @@ pub enum Timer<PI> {
 /// How long a request made with [`InEvent::RequestNeighbors`] stays pending without an answer.
 const NEIGHBOR_REQUEST_EXPIRY: Duration = Duration::from_secs(20);
 
+/// The longest wait of a refill retry. The wait doubles from `Config::neighbor_request_timeout`
+/// at each retry that finds the active view still short, so a node whose passive peers all refuse
+/// asks about once per this period, not twice per second.
+const MAX_REFILL_DELAY: Duration = Duration::from_secs(16);
+
 /// How many peers the application can name as uncounted. The rest of a longer list is ignored.
 pub(crate) const MAX_UNCOUNTED_PEERS: usize = 4;
 
@@ -279,6 +284,10 @@ pub struct State<PI, RG = ThreadRng> {
     /// pass the free slots. A request of the application or a `ForwardJoin` request has no timer
     /// of this kind, so it counts from `pending_neighbor_requests`.
     request_timers: HashMap<PI, usize>,
+    /// The wait of the next refill request, which is also its timeout. It starts at
+    /// `Config::neighbor_request_timeout`, doubles when a retry finds the view still short and
+    /// goes back to the start when a link comes up or a peer leaves the active view.
+    refill_delay: Duration,
     /// The peers we answered with a `Neighbor` and that did not send us anything since. Oldest first.
     ///
     /// A `Neighbor` message does not say whether it is a request or an answer: a node reads it as an
@@ -323,6 +332,7 @@ where
             me_data,
             active_view: IndexSet::new(),
             passive_view: IndexSet::new(),
+            refill_delay: config.neighbor_request_timeout,
             config,
             shuffle_scheduled: false,
             rng,
@@ -868,6 +878,7 @@ where
     fn remove_active(&mut self, peer: &PI, reason: RemovalReason, io: &mut impl IO<PI>) {
         if let Some(idx) = self.active_view.get_index_of(peer) {
             let removed_peer = self.remove_active_by_index(idx, reason, io).unwrap();
+            self.refill_delay = self.config.neighbor_request_timeout;
             self.refill_active_from_passive(&[&removed_peer], io);
         }
     }
@@ -907,7 +918,7 @@ where
             // schedule a timer that checks if the node replied with a neighbor message,
             // otherwise try again with another passive node.
             io.push(OutEvent::ScheduleTimer(
-                self.config.neighbor_request_timeout,
+                self.refill_delay,
                 Timer::PendingNeighborRequest(node),
             ));
             *self.request_timers.entry(node).or_default() += 1;
@@ -923,6 +934,10 @@ where
         }
         if self.pending_neighbor_requests.remove(&peer) {
             self.passive_view.remove(&peer);
+        }
+        // A peer that is not in the active view refused or did not answer: wait longer for the next.
+        if !self.active_view.contains(&peer) {
+            self.refill_delay = (self.refill_delay * 2).min(MAX_REFILL_DELAY);
         }
         // Also when the peer already refused: its `Disconnect` took the entry, and this timer is
         // the retry (see `on_shuffle_reply`).
@@ -1038,6 +1053,7 @@ where
         if self.active_view.insert(peer) {
             debug!(other = ?peer, "add to active view");
             io.push(OutEvent::EmitEvent(Event::NeighborUp(peer)));
+            self.refill_delay = self.config.neighbor_request_timeout;
             if reply {
                 self.send_neighbor(peer, priority, io);
             }
@@ -2192,6 +2208,88 @@ mod tests {
         }
         assert!(most_requests <= 2, "{most_requests} requests in one tick");
         assert!(most_timers <= 2, "{most_timers} retry timers at once");
+    }
+
+    /// The scheduled wait of every retry timer in `io`.
+    fn retry_waits_of(io: &Io) -> Vec<Duration> {
+        io.iter()
+            .filter_map(|event| match event {
+                topic::OutEvent::ScheduleTimer(
+                    wait,
+                    topic::Timer::Swarm(Timer::PendingNeighborRequest(_)),
+                ) => Some(*wait),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Plays `rounds` retries of a node whose passive peers all refuse. Returns the wait of each
+    /// retry timer, the first one included.
+    fn refused_retry_waits(
+        asker: &mut TestState,
+        fulls: &mut [TestState],
+        rounds: usize,
+    ) -> Vec<Duration> {
+        let mut io = Io::new();
+        asker.refill_active_from_passive(&[], &mut io);
+        let mut waits = Vec::new();
+        for _ in 0..rounds {
+            waits.extend(retry_waits_of(&io));
+            let due: Vec<u64> = request_timers_of(&io);
+            let out = sent(&io);
+            io.clear();
+            carry(asker, fulls, out, &mut io);
+            io.clear();
+            for peer in due {
+                asker.handle(
+                    InEvent::TimerExpired(Timer::PendingNeighborRequest(peer)),
+                    &mut io,
+                );
+            }
+        }
+        waits
+    }
+
+    /// Every passive peer is full and refuses. The retry used to come every 500 ms for ever, about
+    /// 2 requests per second. Its wait doubles up to `MAX_REFILL_DELAY`.
+    #[test]
+    fn the_retries_of_refused_requests_wait_longer_each_time_up_to_a_cap() {
+        let mut asker = with_slots(1, 3, &[9]);
+        let mut fulls = full_peers(2, 3);
+        for peer in &fulls {
+            asker.passive_view.insert(peer.me);
+        }
+        let waits = refused_retry_waits(&mut asker, &mut fulls, 12);
+        assert_eq!(waits.len(), 12, "one retry timer per round: {waits:?}");
+        assert!(
+            waits.windows(2).all(|pair| pair[0] <= pair[1]),
+            "the waits never shrink: {waits:?}"
+        );
+        assert_eq!(waits[0], Duration::from_millis(500));
+        assert_eq!(waits[1], Duration::from_secs(1), "{waits:?}");
+        assert_eq!(*waits.last().unwrap(), MAX_REFILL_DELAY, "{waits:?}");
+    }
+
+    /// A link that comes up, or a peer that leaves the active view, is a new situation: the next
+    /// request is not held back by the failures before it.
+    #[test]
+    fn a_new_link_or_a_lost_link_ends_the_backoff() {
+        let mut asker = with_slots(1, 3, &[9]);
+        let mut fulls = full_peers(2, 3);
+        for peer in &fulls {
+            asker.passive_view.insert(peer.me);
+        }
+        let waits = refused_retry_waits(&mut asker, &mut fulls, 6);
+        assert!(*waits.last().unwrap() > Duration::from_secs(1), "{waits:?}");
+
+        let mut io = Io::new();
+        asker.passive_view.insert(77);
+        asker.remove_active(&9, RemovalReason::Random, &mut io);
+        assert_eq!(
+            retry_waits_of(&io).first(),
+            Some(&Duration::from_millis(500)),
+            "the first request after a loss waits the base time"
+        );
     }
 
     /// A `Neighbor` from B is already on its way when A leaves B.
