@@ -663,6 +663,7 @@ impl Actor {
         let link = ActorLink {
             in_event_tx: self.in_event_tx.clone(),
             carried_tx: self.carried_tx.clone(),
+            metrics: self.metrics.clone(),
         };
 
         // Spawn a task for this connection
@@ -1150,6 +1151,8 @@ struct ActorLink {
     in_event_tx: mpsc::Sender<InEvent>,
     /// Gets the id of the connection when it reads the first message of the peer.
     carried_tx: mpsc::Sender<(EndpointId, ConnId)>,
+    /// The counters that the send and the receive loop of the connection add to.
+    metrics: Arc<Metrics>,
 }
 
 /// How long a connection can receive nothing and still be taken as alive. A live connection ranks
@@ -1345,7 +1348,12 @@ async fn connection_loop(
 ) -> Result<(), ConnectionLoopError> {
     debug!(?origin, "connection established");
 
-    let mut send_loop = SendLoop::new(conn.clone(), send_rx, max_message_size);
+    let mut send_loop = SendLoop::new(
+        conn.clone(),
+        send_rx,
+        max_message_size,
+        link.metrics.clone(),
+    );
     let observed = conn.clone();
     let mut recv_loop = RecvLoop::new(
         from,
@@ -1353,6 +1361,7 @@ async fn connection_loop(
         link.in_event_tx,
         link.carried_tx,
         max_message_size,
+        link.metrics,
     );
 
     let send_fut = send_loop.run(queue).instrument(error_span!("send"));
@@ -2190,6 +2199,83 @@ pub(crate) mod tests {
         }
     }
 
+    /// The byte counters of the metrics read the frames that the connection loops write and read:
+    /// a broadcast shows as data messages on the sender and the receiver, and the joining as
+    /// control messages, by variant, with the 4 bytes of length prefix in each size.
+    #[tokio::test]
+    #[traced_test]
+    async fn gossip_net_counts_the_bytes_of_its_messages() {
+        let mut rng = rand::rngs::ChaCha12Rng::seed_from_u64(7);
+        let (relay_map, relay_url, _guard) = iroh::test_utils::run_relay_server().await.unwrap();
+        let memory_lookup = MemoryLookup::new();
+        let ep1 = create_endpoint(&mut rng, relay_map.clone(), Some(memory_lookup.clone()))
+            .await
+            .unwrap();
+        let ep2 = create_endpoint(&mut rng, relay_map.clone(), Some(memory_lookup.clone()))
+            .await
+            .unwrap();
+        let go1 = Gossip::builder().spawn(ep1.clone());
+        let go2 = Gossip::builder().spawn(ep2.clone());
+        let (pi1, pi2) = (ep1.id(), ep2.id());
+        let cancel = CancellationToken::new();
+        let tasks = [
+            spawn(endpoint_loop(ep1.clone(), go1.clone(), cancel.clone())),
+            spawn(endpoint_loop(ep2.clone(), go2.clone(), cancel.clone())),
+        ];
+        memory_lookup.add_endpoint_info(EndpointAddr::new(pi1).with_relay_url(relay_url.clone()));
+        memory_lookup.add_endpoint_info(EndpointAddr::new(pi2).with_relay_url(relay_url));
+        let topic: TopicId = blake3::hash(b"byte-counters").into();
+        let [sub1, mut sub2] = [
+            go1.subscribe_and_join(topic, vec![]),
+            go2.subscribe_and_join(topic, vec![pi1]),
+        ]
+        .try_join()
+        .await
+        .unwrap();
+        let (sink1, _stream1) = sub1.split();
+        let payload = Bytes::from(vec![5u8; 300]);
+        sink1.broadcast(payload.clone()).await.unwrap();
+        timeout(Duration::from_secs(10), async {
+            loop {
+                if let Event::Received(msg) = sub2.next().await.unwrap().unwrap() {
+                    assert_eq!(msg.content, payload);
+                    return;
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        let (sent, got) = (go1.metrics(), go2.metrics());
+        assert!(sent.msgs_data_sent.get() >= 1, "go1 sent data");
+        assert!(sent.msgs_gossip_sent.get() >= 1, "as a Gossip message");
+        assert!(
+            sent.msgs_data_sent_size.get() >= 300 + 4,
+            "the size holds the payload and the prefix: {}",
+            sent.msgs_data_sent_size.get()
+        );
+        assert!(got.msgs_data_recv.get() >= 1, "go2 received data");
+        assert!(got.msgs_gossip_recv.get() >= 1);
+        assert!(got.msgs_data_recv_size.get() >= 300 + 4);
+        assert!(
+            got.msgs_ctrl_sent.get() >= 1 && got.msgs_ctrl_sent_size.get() > 0,
+            "go2 joined with control messages"
+        );
+        assert!(
+            sent.msgs_ctrl_recv.get() >= 1,
+            "go1 received the control messages of the join"
+        );
+
+        cancel.cancel();
+        for t in tasks {
+            timeout(Duration::from_secs(10), t)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+    }
+
     /// Test that when a gossip topic is no longer needed it's actually unsubscribed.
     ///
     /// This test will:
@@ -2374,7 +2460,7 @@ pub(crate) mod tests {
         drop(send_tx);
 
         // With the bug this blocks on `conn.closed()` forever and the timeout fires.
-        let mut send_loop = util::SendLoop::new(conn, send_rx, 1024);
+        let mut send_loop = util::SendLoop::new(conn, send_rx, 1024, Arc::new(Metrics::default()));
         let res = timeout(Duration::from_secs(5), send_loop.run(vec![])).await;
         assert!(
             res.is_ok(),

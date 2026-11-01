@@ -96,6 +96,22 @@ pub enum Message<PI> {
     Gossip(plumtree::Message),
 }
 
+/// The variants of a protocol message: the membership layer (`Join` to `Disconnect`) and the
+/// broadcast layer (`Gossip` carries the payload, the rest is control).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Variant {
+    Join,
+    ForwardJoin,
+    Shuffle,
+    ShuffleReply,
+    Neighbor,
+    Disconnect,
+    Gossip,
+    IHave,
+    Graft,
+    Prune,
+}
+
 impl<PI> Message<PI> {
     /// Get the kind of this message
     pub fn kind(&self) -> MessageKind {
@@ -104,6 +120,26 @@ impl<PI> Message<PI> {
             Message::Gossip(message) => match message {
                 plumtree::Message::Gossip(_) => MessageKind::Data,
                 _ => MessageKind::Control,
+            },
+        }
+    }
+
+    /// Which kind of protocol message this is, down to the variant, for the byte counters.
+    pub(crate) fn variant(&self) -> Variant {
+        match self {
+            Message::Swarm(message) => match message {
+                hyparview::Message::Join(_) => Variant::Join,
+                hyparview::Message::ForwardJoin(_) => Variant::ForwardJoin,
+                hyparview::Message::Shuffle(_) => Variant::Shuffle,
+                hyparview::Message::ShuffleReply(_) => Variant::ShuffleReply,
+                hyparview::Message::Neighbor(_) => Variant::Neighbor,
+                hyparview::Message::Disconnect(_) => Variant::Disconnect,
+            },
+            Message::Gossip(message) => match message {
+                plumtree::Message::Gossip(_) => Variant::Gossip,
+                plumtree::Message::IHave(_) => Variant::IHave,
+                plumtree::Message::Graft(_) => Variant::Graft,
+                plumtree::Message::Prune => Variant::Prune,
             },
         }
     }

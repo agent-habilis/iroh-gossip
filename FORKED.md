@@ -72,3 +72,17 @@ warn. Any other transport error, a version mismatch, an open connection and a mi
 stay a warn too, and the warn line logs the close reason.
 
 If upstream changes the `failed to send` log, keep the split in `ended_without_a_fault`.
+
+## The byte counters of the metrics are filled
+
+`metrics.rs`, `net.rs` and `net/util.rs`: `msgs_ctrl_sent`, `msgs_ctrl_recv`, `msgs_data_sent`,
+`msgs_data_recv` and their `_size` counters were declared and never incremented. The send loop now
+counts each message that it writes, and the receive loop each message that it reads, by kind
+(control or data) and by variant (`join`, `forward_join`, `shuffle`, `shuffle_reply`, `neighbor`,
+`disconnect`, `gossip`, `ihave`, `graft`, `prune`: `msgs_<variant>_sent`, `_sent_size`, `_recv`,
+`_recv_size`). A size is the 4 bytes of the length prefix and the postcard encoding of the message.
+No behaviour changes: `write_frame` returns the bytes it wrote, `read_frame_sized` returns the bytes
+it read, and the counters are atomic adds. The connection loops hold the `Arc<Metrics>` through
+`ActorLink`.
+
+If upstream starts to count these, drop this change and keep their names.

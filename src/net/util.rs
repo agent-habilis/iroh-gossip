@@ -3,6 +3,7 @@
 use std::{
     collections::{hash_map, HashMap},
     io,
+    sync::Arc,
     time::Duration,
 };
 
@@ -25,6 +26,7 @@ use tokio::{
 use tracing::{debug, trace, Instrument};
 
 use super::{InEvent, ProtoMessage};
+use crate::metrics::Metrics;
 use crate::proto::{util::TimerMap, TopicId};
 
 /// Errors related to message writing
@@ -95,6 +97,7 @@ pub(crate) struct RecvLoop {
     in_event_tx: mpsc::Sender<InEvent>,
     /// Gets `(peer, connection id)` once, when the first message of the peer was read.
     carried_tx: mpsc::Sender<(EndpointId, usize)>,
+    metrics: Arc<Metrics>,
 }
 
 impl RecvLoop {
@@ -104,6 +107,7 @@ impl RecvLoop {
         in_event_tx: mpsc::Sender<InEvent>,
         carried_tx: mpsc::Sender<(EndpointId, usize)>,
         max_message_size: usize,
+        metrics: Arc<Metrics>,
     ) -> Self {
         Self {
             remote_endpoint_id,
@@ -111,6 +115,7 @@ impl RecvLoop {
             max_message_size,
             in_event_tx,
             carried_tx,
+            metrics,
         }
     }
 
@@ -147,7 +152,8 @@ impl RecvLoop {
                     };
                     match msg {
                         None => debug!(topic=%state.header.topic_id.fmt_short(), "stream closed"),
-                        Some(msg) => {
+                        Some((msg, bytes)) => {
+                            self.metrics.note_recv(&msg.message, bytes);
                             // Before the message itself, and again with the next message if the
                             // channel was full: the actor must know that the peer sends on this
                             // connection when it handles what the peer sent.
@@ -199,11 +205,15 @@ impl RecvStreamState {
     /// ## Cancellation safety
     ///
     /// This function is not cancellation-safe.
-    async fn next(mut self) -> Result<(Self, Option<ProtoMessage>), ReadError> {
-        let msg = read_frame(&mut self.stream, &mut self.buffer, self.max_message_size).await?;
-        let msg = msg.map(|msg| ProtoMessage {
-            topic: self.header.topic_id,
-            message: msg,
+    async fn next(mut self) -> Result<(Self, Option<(ProtoMessage, usize)>), ReadError> {
+        let msg =
+            read_frame_sized(&mut self.stream, &mut self.buffer, self.max_message_size).await?;
+        let msg = msg.map(|(msg, bytes)| {
+            let message = ProtoMessage {
+                topic: self.header.topic_id,
+                message: msg,
+            };
+            (message, bytes)
         });
         Ok((self, msg))
     }
@@ -216,6 +226,7 @@ pub(crate) struct SendLoop {
     max_message_size: usize,
     finishing: JoinSet<()>,
     send_rx: mpsc::Receiver<ProtoMessage>,
+    metrics: Arc<Metrics>,
 }
 
 impl SendLoop {
@@ -223,8 +234,10 @@ impl SendLoop {
         conn: Connection,
         send_rx: mpsc::Receiver<ProtoMessage>,
         max_message_size: usize,
+        metrics: Arc<Metrics>,
     ) -> Self {
         Self {
+            metrics,
             conn,
             max_message_size,
             buffer: Default::default(),
@@ -311,7 +324,8 @@ impl SendLoop {
         };
         let stream = entry.get_mut();
 
-        write_frame(stream, message, &mut self.buffer, self.max_message_size).await?;
+        let bytes = write_frame(stream, message, &mut self.buffer, self.max_message_size).await?;
+        self.metrics.note_sent(message, bytes);
 
         if is_last {
             trace!(topic=%topic_id.fmt_short(), "stream closing");
@@ -359,11 +373,23 @@ pub async fn read_frame<T: DeserializeOwned>(
     buffer: &mut BytesMut,
     max_message_size: usize,
 ) -> Result<Option<T>, ReadError> {
+    Ok(read_frame_sized(reader, buffer, max_message_size)
+        .await?
+        .map(|(message, _bytes)| message))
+}
+
+/// [`read_frame`], and the bytes that the frame took on the stream: the length prefix and the
+/// encoded message.
+pub async fn read_frame_sized<T: DeserializeOwned>(
+    reader: &mut RecvStream,
+    buffer: &mut BytesMut,
+    max_message_size: usize,
+) -> Result<Option<(T, usize)>, ReadError> {
     match read_lp(reader, buffer, max_message_size).await? {
         None => Ok(None),
         Some(data) => {
             let message = postcard::from_bytes(&data)?;
-            Ok(Some(message))
+            Ok(Some((message, data.len() + 4)))
         }
     }
 }
@@ -400,7 +426,7 @@ pub async fn write_frame<T: Serialize>(
     message: &T,
     buffer: &mut Vec<u8>,
     max_message_size: usize,
-) -> Result<(), WriteError> {
+) -> Result<usize, WriteError> {
     let len = postcard::experimental::serialized_size(&message)?;
     if len >= max_message_size {
         return Err(e!(WriteError::TooLarge));
@@ -410,7 +436,7 @@ pub async fn write_frame<T: Serialize>(
     let slice = postcard::to_slice(&message, buffer)?;
     stream.write_u32(len as u32).await?;
     stream.write_all(slice).await.map_err(io::Error::other)?;
-    Ok(())
+    Ok(len + 4)
 }
 
 /// A [`TimerMap`] with an async method to wait for the next timer expiration.
