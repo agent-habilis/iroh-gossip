@@ -152,6 +152,14 @@ pub struct ShuffleReply<PI> {
     nodes: Vec<PeerInfo<PI>>,
 }
 
+#[cfg(all(test, feature = "net"))]
+impl<PI> ShuffleReply<PI> {
+    /// A reply with no nodes: a message that a peer outside the active view can send.
+    pub(crate) fn empty() -> Self {
+        Self { nodes: Vec::new() }
+    }
+}
+
 /// The priority of a `Join` message
 ///
 /// This is `High` if the sender does not have any active peers, and `Low` otherwise.

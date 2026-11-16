@@ -86,3 +86,16 @@ it read, and the counters are atomic adds. The connection loops hold the `Arc<Me
 `ActorLink`.
 
 If upstream starts to count these, drop this change and keep their names.
+
+## A disconnect during a dial delivers the queue of the dial first
+
+`net.rs`: the protocol sends `DisconnectPeer` after any message from a peer outside its active
+view. If that comes while we dial the peer, the actor used to remove the peer, and the messages
+that waited for the dial were lost. A `Join` is sent once, so after `leave_peers` a `join_peers`
+could fail for good when a shuffle reply from the peer came in during a slow dial (CI saw it in
+`leave_peers_is_not_undone_by_shuffles_of_a_third_peer`). Now a peer that is still pending and has
+a queue is marked `disconnect_after_flush`: the dial delivers the queue, and then the peer is
+dropped, so its connection drains and closes, as the connection of an active peer does on
+`DisconnectPeer`. A new send to the peer clears the mark.
+
+If upstream changes `PeerState` or the `DisconnectPeer` arm, keep the queue of a pending peer.
