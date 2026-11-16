@@ -2,6 +2,7 @@
 
 use iroh_metrics::{Counter, MetricsGroup};
 
+#[cfg(feature = "net")]
 use crate::proto::{
     state::MessageKind,
     topic::{Message, Variant},
@@ -134,6 +135,7 @@ pub struct Metrics {
     pub send_overflow_disconnects: Counter,
 }
 
+#[cfg(feature = "net")]
 impl Metrics {
     /// Count a message that was written to a connection: `bytes` is the length prefix and the
     /// encoded message. The counters of its kind (control or data) and of its variant go up.
@@ -215,7 +217,7 @@ impl Metrics {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "net"))]
 mod tests {
     use super::Metrics;
     use crate::proto::{

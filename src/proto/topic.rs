@@ -98,6 +98,7 @@ pub enum Message<PI> {
 
 /// The variants of a protocol message: the membership layer (`Join` to `Disconnect`) and the
 /// broadcast layer (`Gossip` carries the payload, the rest is control).
+#[cfg(feature = "net")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Variant {
     Join,
@@ -125,6 +126,7 @@ impl<PI> Message<PI> {
     }
 
     /// Which kind of protocol message this is, down to the variant, for the byte counters.
+    #[cfg(feature = "net")]
     pub(crate) fn variant(&self) -> Variant {
         match self {
             Message::Swarm(message) => match message {

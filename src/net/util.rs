@@ -26,8 +26,10 @@ use tokio::{
 use tracing::{debug, trace, Instrument};
 
 use super::{InEvent, ProtoMessage};
-use crate::metrics::Metrics;
-use crate::proto::{util::TimerMap, TopicId};
+use crate::{
+    metrics::Metrics,
+    proto::{util::TimerMap, TopicId},
+};
 
 /// Errors related to message writing
 #[allow(missing_docs)]
