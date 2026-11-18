@@ -95,6 +95,23 @@ for the old link. These messages can come after newer ones that went straight to
 connection, and a message that a stopped write had partly sent comes twice. Plumtree takes both. A
 frame that was written to a QUIC stream but not acknowledged is still lost with the connection.
 
+## A dial that connects after it was replaced or cancelled is not dropped
+
+`net.rs`: upstream dropped the result of a dial that `replace_old_dial` or `cancel_dial` had taken
+out. If that dial had connected, the drop closed the connection with code 0 and an empty reason. The
+remote had accepted it and could choose it, so what the remote sent on it was lost. A cancel could
+also drop the dial in its handshake, with the same close. And while no other dial was pending,
+`Dialer::next_conn` did not join the old dial, so its connection stayed open and unread.
+
+Now a cancel stops a dial only before its handshake starts (`connect_with_opts`). After that the
+handshake runs to its end. `Dialer::next_conn` joins every dial and returns a connection of an old
+dial as `DialEnd::Stale`. If we still know the peer, the actor admits that connection as one more
+connection of the peer (`ConnSet` then chooses). If we dropped the peer, the actor closes it with
+`DIAL_NOT_NEEDED_CODE` (1) and the reason `dial no longer needed`. A cancelled dial to a peer that
+does not answer now runs until the handshake times out.
+
+If upstream changes the `Dialer`, keep the rule that it never drops a connected dial.
+
 ## A new neighbor gets an `IHave` of each message in the cache
 
 `proto/plumtree.rs`: upstream sends a message only to the neighbors that the node has when it first

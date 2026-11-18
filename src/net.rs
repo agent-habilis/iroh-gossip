@@ -497,9 +497,16 @@ impl Actor {
                 self.metrics.actor_tick_endpoint.inc();
                 self.handle_addr_update(new_address).await;
             }
-            (peer_id, res) = self.dialer.next_conn() => {
+            dial_end = self.dialer.next_conn() => {
                 trace!(?i, "tick: dialer");
                 self.metrics.actor_tick_dialer.inc();
+                let (peer_id, res) = match dial_end {
+                    DialEnd::Current(peer_id, res) => (peer_id, res),
+                    DialEnd::Stale(peer_id, conn) => {
+                        self.handle_stale_dial(peer_id, conn);
+                        return true;
+                    }
+                };
                 match res {
                     Some(Ok(conn)) => {
                         self.dialer.no_address.forget(peer_id);
@@ -606,6 +613,19 @@ impl Actor {
                 self.handle_in_event(InEvent::PeerDisconnected(peer_id), now)
                     .await;
             }
+        }
+    }
+
+    /// A dial that was replaced or cancelled connected after all. The remote can have admitted
+    /// the connection and send on it. A peer that we still know takes it as one more connection.
+    /// For a peer that we dropped, nothing reads or sends on it, so it closes with a reason.
+    fn handle_stale_dial(&mut self, peer_id: EndpointId, conn: Connection) {
+        if self.peers.contains_key(&peer_id) {
+            debug!(peer = %peer_id.fmt_short(), "admit a dial that connected after it was replaced");
+            self.handle_connection(peer_id, ConnOrigin::Dial, conn);
+        } else {
+            debug!(peer = %peer_id.fmt_short(), "close a dial that connected after its peer was dropped");
+            conn.close(DIAL_NOT_NEEDED_CODE.into(), b"dial no longer needed");
         }
     }
 
@@ -1813,6 +1833,9 @@ fn dial_had_no_address(err: &iroh::endpoint::ConnectError) -> bool {
 /// the peer for up to the idle timeout after the peer is served.
 const DIAL_REPLACED_AFTER: Duration = Duration::from_secs(5);
 
+/// The application close code of a dial that connected after its peer was dropped.
+const DIAL_NOT_NEEDED_CODE: u32 = 1;
+
 /// How long a peer may fail the dial for want of an address before the log says so at warn.
 /// The dial repeats with each message to the peer, and the address of a peer that the gossip
 /// learned from the overlay comes from the app a few hundred ms later, so a short gap is the
@@ -1987,12 +2010,20 @@ impl Dialer {
         let endpoint = self.endpoint.clone();
         self.pending.spawn(
             async move {
-                let res = tokio::select! {
+                let connecting = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => None,
-                    res = endpoint.connect(endpoint_id, &alpn) => Some(res),
+                    res = endpoint.connect_with_opts(endpoint_id, &alpn, Default::default()) => Some(res),
                 };
-                (endpoint_id, generation, res)
+                // A cancel stops the dial only before the handshake starts. A drop after that is an
+                // implicit close with code 0 of a connection that the remote can have admitted, so
+                // the handshake runs to its end and `Dialer::next_conn` returns the connection.
+                let outcome = match connecting {
+                    None => None,
+                    Some(Err(err)) => Some(Err(err.into())),
+                    Some(Ok(connecting)) => Some(connecting.await.map_err(Into::into)),
+                };
+                (endpoint_id, generation, outcome)
             }
             .instrument(tracing::Span::current()),
         );
@@ -2024,38 +2055,46 @@ impl Dialer {
         self.pending_dials.contains_key(&endpoint)
     }
 
-    /// Waits for the next dial operation to complete.
-    /// `None` means disconnected
-    async fn next_conn(&mut self) -> (EndpointId, DialOutcome) {
-        match self.pending_dials.is_empty() {
-            false => {
-                let (endpoint_id, res) = loop {
-                    match self.pending.join_next().await {
-                        Some(Ok((endpoint_id, generation, res))) => {
-                            let current = self
-                                .pending_dials
-                                .get(&endpoint_id)
-                                .is_some_and(|dial| dial.generation == generation);
-                            if current {
-                                self.pending_dials.remove(&endpoint_id);
-                                break (endpoint_id, res);
-                            }
-                        }
-                        Some(Err(e)) => {
-                            error!("next conn error: {:?}", e);
-                        }
-                        None => {
-                            error!("no more pending conns available");
-                            std::future::pending().await
-                        }
-                    }
-                };
-
-                (endpoint_id, res)
+    /// Waits for the next dial to end. A dial that was replaced or cancelled and still connected
+    /// comes back as [`DialEnd::Stale`]: the remote can have admitted it, so it is never dropped.
+    async fn next_conn(&mut self) -> DialEnd {
+        loop {
+            let Some(joined) = self.pending.join_next().await else {
+                return std::future::pending().await;
+            };
+            let (endpoint_id, generation, outcome) = match joined {
+                Ok(end) => end,
+                Err(err) => {
+                    error!("dial task failed: {err:?}");
+                    continue;
+                }
+            };
+            let current = self
+                .pending_dials
+                .get(&endpoint_id)
+                .is_some_and(|dial| dial.generation == generation);
+            if current {
+                self.pending_dials.remove(&endpoint_id);
+                return DialEnd::Current(endpoint_id, outcome);
             }
-            true => std::future::pending().await,
+            match outcome {
+                Some(Ok(conn)) => return DialEnd::Stale(endpoint_id, conn),
+                Some(Err(err)) => {
+                    debug!(peer = %endpoint_id.fmt_short(), "a replaced dial failed: {err}");
+                }
+                None => {}
+            }
         }
     }
+}
+
+/// The end of a dial, as [`Dialer::next_conn`] returns it.
+#[derive(Debug)]
+enum DialEnd {
+    /// The dial that the peer waits for ended.
+    Current(EndpointId, DialOutcome),
+    /// A dial that was replaced or cancelled connected after all.
+    Stale(EndpointId, Connection),
 }
 
 #[cfg(test)]
@@ -4799,6 +4838,152 @@ pub(crate) mod tests {
         assert!(
             arrived,
             "the queued broadcast reaches the other live connection of the peer"
+        );
+        Ok(())
+    }
+
+    /// A remote that the actor of a [`Rig`] can dial by id. It accepts each connection and hands
+    /// it to the test, which keeps it open.
+    struct DialTarget {
+        id: EndpointId,
+        accepted: mpsc::Receiver<Connection>,
+        _accept: AbortOnDropHandle<()>,
+        _endpoint: Endpoint,
+        _relay: Box<dyn std::any::Any>,
+    }
+
+    impl DialTarget {
+        async fn new(rig: &Rig, seed: u64) -> Result<Self> {
+            let rng = &mut rand::rngs::ChaCha12Rng::seed_from_u64(seed);
+            let (relay_map, _relay_url, relay) =
+                iroh::test_utils::run_relay_server().await.unwrap();
+            let remote = create_endpoint(rng, relay_map, None).await?;
+            remote.online().await;
+            let lookup = MemoryLookup::new();
+            lookup.add_endpoint_info(remote.addr());
+            rig.actor
+                .endpoint
+                .address_lookup()
+                .expect("endpoint is not closed")
+                .add(lookup);
+            let (accepted_tx, accepted) = mpsc::channel(8);
+            let accept_ep = remote.clone();
+            let accept = AbortOnDropHandle::new(task::spawn(async move {
+                while let Some(incoming) = accept_ep.accept().await {
+                    if let Ok(conn) = incoming.accept().expect("accept incoming").await {
+                        accepted_tx.send(conn).await.ok();
+                    }
+                }
+            }));
+            Ok(Self {
+                id: remote.id(),
+                accepted,
+                _accept: accept,
+                _endpoint: remote,
+                _relay: Box::new(relay),
+            })
+        }
+
+        async fn next_accepted(&mut self) -> Connection {
+            timeout(Duration::from_secs(10), self.accepted.recv())
+                .await
+                .expect("the remote accepts the dial in time")
+                .expect("the accept task runs")
+        }
+    }
+
+    /// Runs the event loop of the actor until `done` holds, or for at most `limit`.
+    async fn run_actor_until(rig: &mut Rig, limit: Duration, mut done: impl FnMut(&Actor) -> bool) {
+        let deadline = Instant::now() + limit;
+        let mut step = 0;
+        while !done(&rig.actor) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return;
+            }
+            step += 1;
+            let addr_updates = &mut n0_future::stream::pending();
+            let _ = timeout(left, rig.actor.event_loop(addr_updates, step)).await;
+        }
+    }
+
+    /// A dial that connects after a new dial replaced it is admitted, not dropped. The remote
+    /// accepted that connection and can choose it, so a drop (an implicit close with code 0) loses
+    /// what the remote sends on it.
+    #[tokio::test]
+    #[traced_test]
+    async fn a_dial_that_connects_after_it_was_replaced_is_admitted() -> Result {
+        let mut rig = Rig::new(16, 0).await?;
+        let mut target = DialTarget::new(&rig, 116).await?;
+        let remote_id = target.id;
+        rig.actor.peers.insert(remote_id, PeerState::default());
+
+        rig.actor
+            .dialer
+            .queue_dial(remote_id, Bytes::from_static(GOSSIP_ALPN));
+        let replaced = target.next_accepted().await;
+        // What `replace_old_dial` does to a dial older than `DIAL_REPLACED_AFTER`.
+        rig.actor.dialer.cancel_dial(remote_id);
+        rig.actor
+            .dialer
+            .queue_dial(remote_id, Bytes::from_static(GOSSIP_ALPN));
+        let _current = target.next_accepted().await;
+
+        run_actor_until(&mut rig, Duration::from_secs(5), |actor| {
+            replaced.close_reason().is_some()
+                || matches!(
+                    actor.peers.get(&remote_id),
+                    Some(PeerState::Active { conns, .. }) if conns.entries().len() == 2
+                )
+        })
+        .await;
+        assert_eq!(
+            replaced.close_reason(),
+            None,
+            "the remote keeps the dial that was replaced"
+        );
+        let Some(PeerState::Active { conns, .. }) = rig.actor.peers.get(&remote_id) else {
+            panic!("the remote is active");
+        };
+        assert_eq!(conns.entries().len(), 2, "the actor admits both dials");
+        Ok(())
+    }
+
+    /// A dial that connects after its peer was dropped is closed with its own code and reason, so
+    /// that the remote knows why. Before, the dialer dropped it (an implicit close with code 0),
+    /// or held it unread until the next dial ended.
+    #[tokio::test]
+    #[traced_test]
+    async fn a_dial_that_connects_after_its_peer_was_dropped_is_closed_with_a_reason() -> Result {
+        let mut rig = Rig::new(17, 0).await?;
+        let mut target = DialTarget::new(&rig, 117).await?;
+        let remote_id = target.id;
+        rig.actor.peers.insert(remote_id, PeerState::default());
+
+        rig.actor
+            .dialer
+            .queue_dial(remote_id, Bytes::from_static(GOSSIP_ALPN));
+        let dropped = target.next_accepted().await;
+        // What `forget_peer` does to a pending peer.
+        rig.actor.peers.remove(&remote_id);
+        rig.actor.dialer.cancel_dial(remote_id);
+
+        run_actor_until(&mut rig, Duration::from_secs(5), |_| {
+            dropped.close_reason().is_some()
+        })
+        .await;
+        let reason = dropped.close_reason();
+        let Some(iroh::endpoint::ConnectionError::ApplicationClosed(close)) = &reason else {
+            panic!("the actor closes the dial of the dropped peer: {reason:?}");
+        };
+        assert_eq!(
+            (close.error_code, close.reason.as_ref()),
+            (1u32.into(), &b"dial no longer needed"[..]),
+            "the close names why the dial is not used"
+        );
+        assert!(
+            !rig.actor.peers.contains_key(&remote_id),
+            "the dropped peer does not come back"
         );
         Ok(())
     }
