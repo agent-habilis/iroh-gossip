@@ -581,15 +581,27 @@ impl Actor {
         true
     }
 
-    /// A dial to the peer failed. A peer with a connection keeps it. A peer that waits for the dial
-    /// is disconnected in the protocol, and its queue stays for a connection that the peer opens
-    /// to us.
+    /// A dial to the peer failed. A peer with a connection keeps it.
+    ///
+    /// A queue that holds a `Join` stays for a connection that the peer opens to us (the protocol
+    /// never sends a lost `Join` again, see `queued_join_survives_failed_dial_for_inbound_flush`),
+    /// and the protocol hears `DialFailed`: the `Join` keeps waiting there, and its expiry sends
+    /// the `DisconnectPeer` that drops the queue. Any other queue goes with the peer, and the
+    /// protocol hears `PeerDisconnected`.
     async fn handle_dial_failed(&mut self, peer_id: EndpointId) {
-        let peer_state = self.peers.get(&peer_id);
-        let is_active = matches!(peer_state, Some(PeerState::Active { .. }));
-        if !is_active {
-            self.handle_in_event(InEvent::PeerDisconnected(peer_id), Instant::now())
-                .await;
+        let now = Instant::now();
+        match self.peers.get(&peer_id) {
+            Some(PeerState::Active { .. }) => {}
+            Some(PeerState::Pending { queue }) if queue.iter().any(ProtoMessage::is_join) => {
+                debug!(peer = %peer_id.fmt_short(), "dial failed: keep the queued Join for an inbound connection");
+                self.handle_in_event(InEvent::DialFailed(peer_id), now)
+                    .await;
+            }
+            _ => {
+                forget_peer(&mut self.peers, &mut self.dialer, peer_id);
+                self.handle_in_event(InEvent::PeerDisconnected(peer_id), now)
+                    .await;
+            }
         }
     }
 
@@ -4518,6 +4530,52 @@ pub(crate) mod tests {
                 proto::topic::Message::Swarm(proto::hyparview::Message::Join(_))
             )),
             "the Join must stay queued"
+        );
+        Ok(())
+    }
+
+    /// After a failed dial, a queued `Join` waits for a connection that the peer opens to us. A
+    /// message of the peer on that connection before its `Neighbor` (a `ShuffleReply`) must not
+    /// disconnect it: the protocol still waits for the answer to the `Join`. A queue without a
+    /// `Join` goes with the failed dial.
+    #[tokio::test]
+    #[traced_test]
+    async fn a_failed_dial_keeps_the_join_waiting_for_an_inbound_connection() -> Result {
+        let mut rig = Rig::new(19, 1).await?;
+        let joined = SecretKey::from_bytes(&[14u8; 32]).public();
+        let now = Instant::now();
+        rig.actor
+            .handle_in_event(
+                proto::InEvent::Command(rig.topic, ProtoCommand::Join(vec![joined])),
+                now,
+            )
+            .await;
+        rig.actor.handle_dial_failed(joined).await;
+        let shuffle_reply = ProtoMessage {
+            topic: rig.topic,
+            message: proto::topic::Message::Swarm(proto::hyparview::Message::ShuffleReply(
+                proto::hyparview::ShuffleReply::empty(),
+            )),
+        };
+        rig.actor
+            .handle_in_event(proto::InEvent::RecvMessage(joined, shuffle_reply), now)
+            .await;
+        assert!(
+            matches!(
+                rig.actor.peers.get(&joined),
+                Some(PeerState::Pending { queue }) if queue.iter().any(ProtoMessage::is_join)
+            ),
+            "the Join must wait for the inbound connection"
+        );
+
+        // A peer whose queue holds only data: the failed dial drops it.
+        let ghost = rig.peers[0].id;
+        rig.actor.peers.insert(ghost, PeerState::default());
+        rig.broadcast("data").await;
+        rig.actor.handle_dial_failed(ghost).await;
+        assert!(
+            !rig.actor.peers.contains_key(&ghost),
+            "a queue without a Join goes with the failed dial"
         );
         Ok(())
     }

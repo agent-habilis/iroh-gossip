@@ -27,6 +27,9 @@ pub enum InEvent<PI> {
     TimerExpired(Timer<PI>),
     /// Peer disconnected on the network level.
     PeerDisconnected(PI),
+    /// A dial to the peer failed, and the network level keeps what it queued for the peer. A
+    /// `Join` that waits for the peer keeps waiting (see `hyparview::InEvent::DialFailed`).
+    DialFailed(PI),
     /// Update the opaque peer data about yourself.
     UpdatePeerData(PeerData),
 }
@@ -362,6 +365,10 @@ impl<PI: PeerIdentity, R: Rng> State<PI, R> {
             },
             InEvent::PeerDisconnected(peer) => {
                 self.swarm.handle(SwarmIn::PeerDisconnected(peer), io);
+                self.gossip.handle(GossipIn::NeighborDown(peer), now, io);
+            }
+            InEvent::DialFailed(peer) => {
+                self.swarm.handle(SwarmIn::DialFailed(peer), io);
                 self.gossip.handle(GossipIn::NeighborDown(peer), now, io);
             }
             InEvent::UpdatePeerData(data) => self.swarm.handle(SwarmIn::UpdatePeerData(data), io),

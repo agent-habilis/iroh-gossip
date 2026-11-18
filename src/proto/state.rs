@@ -10,6 +10,7 @@ use tracing::trace;
 use crate::{
     metrics::Metrics,
     proto::{
+        hyparview,
         topic::{self, Command},
         util::idbytes_impls,
         Config, PeerData, PeerIdentity, MIN_MAX_MESSAGE_SIZE,
@@ -57,6 +58,15 @@ impl<PI> Message<PI> {
             topic::Message::Gossip(
                 super::plumtree::Message::Gossip(_) | super::plumtree::Message::IHave(_)
             )
+        )
+    }
+
+    /// Whether this is a `Join`, which the protocol sends once and never again.
+    #[cfg(feature = "net")]
+    pub(crate) fn is_join(&self) -> bool {
+        matches!(
+            self.message,
+            topic::Message::Swarm(hyparview::Message::Join(_))
         )
     }
 }
@@ -112,6 +122,9 @@ pub enum InEvent<PI> {
     TimerExpired(Timer<PI>),
     /// Peer disconnected on the network level.
     PeerDisconnected(PI),
+    /// A dial to the peer failed, and the network level keeps what it queued for the peer, for a
+    /// connection that the peer opens to us. A `Join` that waits for the peer keeps waiting.
+    DialFailed(PI),
     /// Update the opaque peer data about yourself.
     UpdatePeerData(PeerData),
 }
@@ -153,6 +166,7 @@ impl<PI> From<InEvent<PI>> for InEventMapped<PI> {
                 Self::TopicEvent(topic, topic::InEvent::TimerExpired(timer))
             }
             InEvent::PeerDisconnected(peer) => Self::All(topic::InEvent::PeerDisconnected(peer)),
+            InEvent::DialFailed(peer) => Self::All(topic::InEvent::DialFailed(peer)),
             InEvent::UpdatePeerData(data) => Self::All(topic::InEvent::UpdatePeerData(data)),
         }
     }
@@ -322,6 +336,12 @@ fn handle_out_event<PI: PeerIdentity>(
     trace!("out: {event:?}");
     match event {
         topic::OutEvent::SendMessage(to, message) => {
+            // A topic that sends a `Join` wants the connection for the answer, as a topic that
+            // received a message does: its later `DisconnectPeer` (at the expiry of the `Join`)
+            // must reach the network level, also when the peer never sent us anything.
+            if matches!(message, topic::Message::Swarm(hyparview::Message::Join(_))) {
+                conns.entry(to).or_default().insert(topic);
+            }
             outbox.push(OutEvent::SendMessage(to, Message { topic, message }))
         }
         topic::OutEvent::EmitEvent(event) => outbox.push(OutEvent::EmitEvent(topic, event)),

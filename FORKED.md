@@ -100,8 +100,18 @@ while we dialed the peer, the actor removed the peer and the `Join` in the queue
 `leave_peers_is_not_undone_by_shuffles_of_a_third_peer`). On a live connection the disconnect
 closed the connection that carries the answer. Now `pending_joins` holds each peer whose `Join`
 waits: no `DisconnectPeer` goes to it until its `Neighbor`, a `Disconnect`, a closed connection, a
-leave, or `JOIN_EXPIRY` (20 s, the bound of a neighbor request). At the expiry a peer outside the
-active view is disconnected.
+leave, or `JOIN_EXPIRY` (20 s, the bound of a neighbor request). Each `Join` has a generation in
+its `Timer::JoinExpired`, so the timer of an older `Join` does not end a newer one. A message from
+the peer, or a failed dial, sets `disconnect_at_expiry`: at the expiry such a peer, if it is still
+outside the active view, is disconnected. A peer that did neither keeps its dial, which can take
+longer than the expiry on a relay path.
+
+A failed dial whose queue holds a `Join` sends the new `InEvent::DialFailed`, not
+`PeerDisconnected` (`net.rs`, `handle_dial_failed`): the queue stays for a connection that the peer
+opens to us, the `Join` keeps waiting in the protocol, and its expiry sends the `DisconnectPeer`
+that drops the queue. Any other failed dial drops the queue at once. A topic that sends a `Join`
+registers the peer in its connection map (`state.rs`), so that this `DisconnectPeer` reaches the
+network level also when the peer never sent us anything.
 
 If upstream changes the disconnect in `handle_message`, keep the exception for a pending `Join`.
 
