@@ -1280,18 +1280,17 @@ enum PeerState {
     },
 }
 
-/// Drops the state of a peer. A pending peer takes its dial with it: a dial that connected after
-/// the drop would make an active peer that nothing sends to and nothing disconnects.
+/// Drops the state of a peer. The peer takes its dial with it: a dial that connected after the drop
+/// would make an active peer that nothing sends to and nothing disconnects. An active peer can have
+/// a dial too, if its inbound connection came while the dial was pending. A cancelled dial that
+/// connects still ends in [`Actor::handle_stale_dial`].
 fn forget_peer(
     peers: &mut HashMap<EndpointId, PeerState>,
     dialer: &mut Dialer,
     peer_id: EndpointId,
 ) -> Option<PeerState> {
-    let state = peers.remove(&peer_id);
-    if matches!(state, Some(PeerState::Pending { .. })) {
-        dialer.cancel_dial(peer_id);
-    }
-    state
+    dialer.cancel_dial(peer_id);
+    peers.remove(&peer_id)
 }
 
 /// One topic is done with a peer that another topic still uses: its connection stays, and only the
@@ -5035,6 +5034,51 @@ pub(crate) mod tests {
         assert!(
             !rig.actor.peers.contains_key(&remote_id),
             "the dropped peer does not come back"
+        );
+        Ok(())
+    }
+
+    /// A peer that became active through an inbound connection while our dial to it was pending
+    /// takes the dial with it when it is dropped. Before, only a pending peer did, and the dial
+    /// that connected later made the peer again, with no topic that uses it.
+    #[tokio::test]
+    #[traced_test]
+    async fn a_dropped_active_peer_takes_its_pending_dial_with_it() -> Result {
+        let mut rig = Rig::new(19, 0).await?;
+        let mut target = DialTarget::new(&rig, 119).await?;
+        let remote_id = target.id;
+        rig.actor.peers.insert(remote_id, PeerState::default());
+        rig.actor
+            .dialer
+            .queue_dial(remote_id, Bytes::from_static(GOSSIP_ALPN));
+        let dialed = target.next_accepted().await;
+        // An inbound connection of the peer made it active while the dial was pending.
+        let (inbound_tx, _inbound_rx) = mpsc::channel(SEND_QUEUE_CAP);
+        let inbound = ConnHandle {
+            send_tx: Some(inbound_tx),
+            conn: None,
+        };
+        let Some(state) = rig.actor.peers.get_mut(&remote_id) else {
+            panic!("the peer is known");
+        };
+        state.admit(Conn::new(1, inbound, true, RxClock::new()), Instant::now());
+        forget_peer(&mut rig.actor.peers, &mut rig.actor.dialer, remote_id);
+
+        run_actor_until(&mut rig, Duration::from_secs(5), |actor| {
+            dialed.close_reason().is_some() || actor.peers.contains_key(&remote_id)
+        })
+        .await;
+        assert!(
+            !rig.actor.peers.contains_key(&remote_id),
+            "the dial of the dropped peer does not make it again"
+        );
+        assert!(
+            matches!(
+                dialed.close_reason(),
+                Some(iroh::endpoint::ConnectionError::ApplicationClosed(_))
+            ),
+            "the dial closes: {:?}",
+            dialed.close_reason()
         );
         Ok(())
     }

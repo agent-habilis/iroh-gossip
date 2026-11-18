@@ -114,6 +114,11 @@ connection of the peer (`ConnSet` then chooses). If we dropped the peer, the act
 `DIAL_NOT_NEEDED_CODE` (1) and the reason `dial no longer needed`. A cancelled dial to a peer that
 does not answer now runs until the handshake times out.
 
+`forget_peer` cancels the dial of every peer that it drops, not only of a pending one. A peer whose
+inbound connection came while our dial was pending is active and still has the dial. Before, that
+dial connected after the drop as the current dial and made the peer again, with no topic that uses
+it. Now it ends as a stale dial, and the actor closes it.
+
 If upstream changes the `Dialer`, keep the rule that it never drops a connected dial.
 
 ## A new neighbor gets an `IHave` of each message in the cache
