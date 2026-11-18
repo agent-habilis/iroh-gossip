@@ -606,7 +606,7 @@ mod test {
         // now connect the two sections of the swarm
         network.command(2, t, Command::Join(vec![5]));
         network.run_trips(3);
-        let _ = network.events();
+        let mut late_events: Vec<_> = network.events().collect();
         println!("{}", network.report());
 
         // now broadcast again
@@ -616,10 +616,22 @@ mod test {
             Command::Broadcast(b"hi2".to_vec().into(), Scope::Swarm),
         );
         network.run_trips(5);
-        let events = network.events();
-        let received = events.filter(|x| matches!(x, (_, _, Event::Received(_))));
-        // message should be received by all 5 other nodes
-        assert_eq!(received.count(), 5);
+        late_events.extend(network.events());
+        let receivers_of = |content: &[u8]| {
+            let mut nodes: Vec<_> = late_events
+                .iter()
+                .filter_map(|(node, _, event)| match event {
+                    Event::Received(gossip) if gossip.content == content => Some(*node),
+                    _ => None,
+                })
+                .collect();
+            nodes.sort();
+            nodes
+        };
+        // the second message is received by all 5 other nodes
+        assert_eq!(receivers_of(b"hi2"), vec![0, 2, 3, 4, 5]);
+        // the section that joined late gets the first message from the cache of its new neighbor
+        assert_eq!(receivers_of(b"hi1"), vec![3, 4, 5]);
         assert!(network.check_synchronicity());
         println!("{}", network.report());
     }

@@ -95,6 +95,23 @@ for the old link. These messages can come after newer ones that went straight to
 connection, and a message that a stopped write had partly sent comes twice. Plumtree takes both. A
 frame that was written to a QUIC stream but not acknowledged is still lost with the connection.
 
+## A new neighbor gets an `IHave` of each message in the cache
+
+`proto/plumtree.rs`: upstream sends a message only to the neighbors that the node has when it first
+holds the message. A neighbor that comes up later never gets it, so a peer that joins just after a
+broadcast loses that broadcast. Now `on_neighbor_up` queues an `IHave` for each message in the cache
+with a round (the `Swarm` scope) to the new neighbor, through the lazy push queue and its dispatch
+timer, so a large cache splits into frames as before. The neighbor sends a `Graft` only for the ids it
+does not have, and the node answers from the cache. A joiner thus gets up to 30 s of history (the
+retention of the cache). A link that goes down and comes up again sends the list of ids again. If a
+soak test shows a storm of these lists, bound the offer to 1 per peer per cache window.
+
+`proto.rs`: `plumtree_smoke` counted every `Received` event after the 2 sections joined, which pinned
+the old fault (no history to a late neighbor). With the user's approval it now counts by content: the
+second message reaches all 5 other nodes, and the first one reaches the 3 nodes of the late section.
+
+If upstream changes `NeighborUp` in plumtree, keep the offer of the cache.
+
 ## The byte counters of the metrics are filled
 
 `metrics.rs`, `net.rs`, `net/util.rs` and `proto/state.rs`: upstream counts `msgs_ctrl_*` and
