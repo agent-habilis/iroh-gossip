@@ -4878,15 +4878,16 @@ pub(crate) mod tests {
                 ) = event
                 {
                     if gossip == expected {
-                        return;
+                        return true;
                     }
                 }
             }
+            false
         })
-        .await
-        .is_ok();
-        assert!(
+        .await;
+        assert_eq!(
             arrived,
+            Ok(true),
             "the queued broadcast reaches the other live connection of the peer"
         );
         Ok(())
