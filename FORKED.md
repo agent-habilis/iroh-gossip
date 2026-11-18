@@ -73,6 +73,16 @@ stay a warn too, and the warn line logs the close reason.
 
 If upstream changes the `failed to send` log, keep the split in `ended_without_a_fault`.
 
+## A message that finds the chosen send loop ended goes to the next connection
+
+`net.rs` and `net/conns.rs`: a peer can have more than one connection (`ConnSet`). If the send loop
+of the chosen connection has ended and another connection can take the sends, `send_on_live` takes
+the dead one out of the set (`ConnSet::retire`), closes it, and sends the same message on the next
+chosen one. Before, the message was dropped and the dead connection left only after the event. The
+protocol sends a message once, so the drop lost it. Only the last connection still ends with the
+`failed to send` path above, and the peer goes. The messages that were already in the queue of the
+dead send loop are not covered: that queue goes with the loop.
+
 ## The byte counters of the metrics are filled
 
 `metrics.rs`, `net.rs`, `net/util.rs` and `proto/state.rs`: upstream counts `msgs_ctrl_*` and

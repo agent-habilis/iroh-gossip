@@ -149,6 +149,23 @@ impl<H> ConnSet<H> {
         (actions, self.chosen.is_none())
     }
 
+    /// The send loop of `id` ended. If another connection can take the sends, `id` leaves the set
+    /// and the set chooses again: returns the entry, to close it, and what to do. Returns `None`
+    /// if `id` is the last connection to send on: the caller drops it with the peer.
+    pub(super) fn retire(&mut self, id: ConnId, now: Instant) -> Option<(Conn<H>, Vec<Action>)> {
+        if !self
+            .entries
+            .iter()
+            .any(|entry| entry.id != id && !entry.stopped)
+        {
+            return None;
+        }
+        let index = self.entries.iter().position(|entry| entry.id == id)?;
+        let entry = self.entries.remove(index);
+        let (actions, _none_left) = self.closed(id, now);
+        Some((entry, actions))
+    }
+
     /// All the handles, to close them when the protocol drops the peer.
     pub(super) fn drain_all(&mut self) -> Vec<Conn<H>> {
         self.chosen = None;

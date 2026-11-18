@@ -720,23 +720,7 @@ impl Actor {
         else {
             return;
         };
-        for action in actions {
-            match action {
-                Action::Choose(conn_id) => {
-                    debug!(conn_id, "send on this connection from now on");
-                    *refused_since = None;
-                }
-                Action::StopSending(conn_id) => {
-                    debug!(
-                        conn_id,
-                        "stop sending on this connection: it drains and closes"
-                    );
-                    if let Some(conn) = conns.get_mut(conn_id) {
-                        conn.handle.send_tx = None;
-                    }
-                }
-            }
-        }
+        apply_conn_actions(conns, refused_since, actions);
     }
 
     /// Takes in what the connections carried. A reader sends this signal before it sends the
@@ -1031,7 +1015,7 @@ impl Actor {
                         PeerState::Active {
                             conns,
                             refused_since,
-                        } => match send_on_chosen(conns, message) {
+                        } => match send_on_live(conns, refused_since, message, now) {
                             Ok(()) => *refused_since = None,
                             Err(mpsc::error::TrySendError::Full(message)) => {
                                 let since = *refused_since.get_or_insert_with(Instant::now);
@@ -1234,6 +1218,67 @@ fn drop_topic_frames(
 
 /// How often the connections of the peers are looked at.
 const CONNS_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Does what the set of connections of a peer asks for after a change.
+fn apply_conn_actions(
+    conns: &mut ConnSet<ConnHandle>,
+    refused_since: &mut Option<Instant>,
+    actions: Vec<Action>,
+) {
+    for action in actions {
+        match action {
+            Action::Choose(conn_id) => {
+                debug!(conn_id, "send on this connection from now on");
+                *refused_since = None;
+            }
+            Action::StopSending(conn_id) => {
+                debug!(
+                    conn_id,
+                    "stop sending on this connection: it drains and closes"
+                );
+                if let Some(conn) = conns.get_mut(conn_id) {
+                    conn.handle.send_tx = None;
+                }
+            }
+        }
+    }
+}
+
+/// Sends `message` on the chosen connection of a peer. A chosen connection whose send loop ended
+/// leaves the set while another connection can take the sends, and the message goes to the next
+/// one: the protocol sends it once, and a drop loses it. `Closed` comes back only for the last
+/// connection, which the caller drops with the peer.
+fn send_on_live(
+    conns: &mut ConnSet<ConnHandle>,
+    refused_since: &mut Option<Instant>,
+    mut message: ProtoMessage,
+    now: Instant,
+) -> Result<(), mpsc::error::TrySendError<ProtoMessage>> {
+    loop {
+        match send_on_chosen(conns, message) {
+            Err(mpsc::error::TrySendError::Closed(unsent)) => {
+                let Some(dead) = conns.chosen().map(|conn| conn.id) else {
+                    return Err(mpsc::error::TrySendError::Closed(unsent));
+                };
+                let Some((entry, actions)) = conns.retire(dead, now) else {
+                    return Err(mpsc::error::TrySendError::Closed(unsent));
+                };
+                debug!(
+                    conn_id = dead,
+                    "the send loop of the chosen connection ended: send on the next one"
+                );
+                if let Some(conn) = entry.handle.conn {
+                    if conn.close_reason().is_none() {
+                        conn.close(0u32.into(), b"send loop ended");
+                    }
+                }
+                apply_conn_actions(conns, refused_since, actions);
+                message = unsent;
+            }
+            res => return res,
+        }
+    }
+}
 
 /// Sends `message` on the chosen connection of a peer.
 fn send_on_chosen(
@@ -4535,6 +4580,59 @@ pub(crate) mod tests {
         assert!(
             rig.neighbor_downs().is_empty(),
             "the peer is not disconnected"
+        );
+        Ok(())
+    }
+
+    /// The message that finds the send loop of the chosen connection ended goes to the other live
+    /// connection of the peer. The protocol sends it once and never again, so a drop loses it.
+    #[tokio::test]
+    #[traced_test]
+    async fn a_message_that_finds_the_chosen_send_loop_ended_goes_to_the_other_connection() -> Result
+    {
+        let mut rig = Rig::new(14, 1).await?;
+        let peer = rig.peers[0].id;
+        let (second_tx, mut second_rx) = mpsc::channel(SEND_QUEUE_CAP);
+        let Some(PeerState::Active { conns, .. }) = rig.actor.peers.get_mut(&peer) else {
+            panic!("the peer is active");
+        };
+        conns.admit(
+            Conn::new(
+                1,
+                ConnHandle {
+                    send_tx: Some(second_tx),
+                    conn: None,
+                },
+                true,
+                RxClock::new(),
+            ),
+            Instant::now(),
+        );
+        let chosen = conns.chosen().expect("a chosen connection").id;
+        let mut other_rx = if chosen == 0 {
+            rig.end_send_loop(0);
+            second_rx
+        } else {
+            second_rx.close();
+            std::mem::replace(&mut rig.peers[0].rx, mpsc::channel(1).1)
+        };
+
+        let payload = Bytes::from_static(b"after the send loop ended");
+        rig.broadcast(payload.clone()).await;
+
+        let expected = crate::proto::plumtree::Gossip::first_round(payload, Scope::Swarm);
+        let mut arrived = false;
+        while let Ok(message) = other_rx.try_recv() {
+            if let crate::proto::topic::Message::Gossip(crate::proto::plumtree::Message::Gossip(
+                gossip,
+            )) = message.message
+            {
+                arrived |= gossip == expected;
+            }
+        }
+        assert!(
+            arrived,
+            "the broadcast reaches the other live connection of the peer"
         );
         Ok(())
     }
