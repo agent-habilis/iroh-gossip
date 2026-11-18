@@ -80,7 +80,8 @@ of the chosen connection has ended and another connection can take the sends, `s
 the dead one out of the set (`ConnSet::retire`), closes it, and sends the same message on the next
 chosen one. Before, the message was dropped and the dead connection left only after the event. The
 protocol sends a message once, so the drop lost it. Only the last connection still ends with the
-`failed to send` path above, and the peer goes.
+`failed to send` path above, and the peer goes. A connection that the actor takes out because its
+send loop ended closes with `SEND_LOOP_ENDED_CODE` (2) and the reason `send loop ended`, not code 0.
 
 ## The messages that a closed connection did not write go to the next connection
 

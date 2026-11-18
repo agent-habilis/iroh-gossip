@@ -617,8 +617,10 @@ impl Actor {
     }
 
     /// A dial that was replaced or cancelled connected after all. The remote can have admitted
-    /// the connection and send on it. A peer that we still know takes it as one more connection.
-    /// For a peer that we dropped, nothing reads or sends on it, so it closes with a reason.
+    /// the connection and send on it. Any peer that we know takes it as one more connection: also a
+    /// peer that we dropped after the dial started and that came back since. The dial reached the
+    /// same identity, and it is a working connection to it. For a peer that we do not know, nothing
+    /// reads or sends on it, so it closes with a reason.
     fn handle_stale_dial(&mut self, peer_id: EndpointId, conn: Connection) {
         if self.peers.contains_key(&peer_id) {
             debug!(peer = %peer_id.fmt_short(), "admit a dial that connected after it was replaced");
@@ -1000,7 +1002,7 @@ impl Actor {
             };
             if let Some(conn) = entry.handle.conn.as_ref() {
                 if conn.close_reason().is_none() {
-                    conn.close(0u32.into(), b"send loop ended");
+                    conn.close(SEND_LOOP_ENDED_CODE.into(), b"send loop ended");
                 }
             }
             self.drop_conn(peer_id, conn_id).await;
@@ -1367,7 +1369,7 @@ fn send_on_live(
                 );
                 if let Some(conn) = entry.handle.conn {
                     if conn.close_reason().is_none() {
-                        conn.close(0u32.into(), b"send loop ended");
+                        conn.close(SEND_LOOP_ENDED_CODE.into(), b"send loop ended");
                     }
                 }
                 apply_conn_actions(conns, refused_since, actions);
@@ -1885,6 +1887,9 @@ const DIAL_REPLACED_AFTER: Duration = Duration::from_secs(5);
 
 /// The application close code of a dial that connected after its peer was dropped.
 const DIAL_NOT_NEEDED_CODE: u32 = 1;
+
+/// The application close code of a connection whose send loop ended, when the actor takes it out.
+const SEND_LOOP_ENDED_CODE: u32 = 2;
 
 /// How long a peer may fail the dial for want of an address before the log says so at warn.
 /// The dial repeats with each message to the peer, and the address of a peer that the gossip
@@ -5035,6 +5040,85 @@ pub(crate) mod tests {
         assert!(
             !rig.actor.peers.contains_key(&remote_id),
             "the dropped peer does not come back"
+        );
+        Ok(())
+    }
+
+    /// A connection whose send loop ended and that leaves the set for the next one closes with its
+    /// own code and reason, so that the remote can tell it from a close with code 0.
+    #[tokio::test]
+    #[traced_test]
+    async fn a_connection_retired_for_its_ended_send_loop_closes_with_its_code() -> Result {
+        let mut rig = Rig::new(21, 0).await?;
+        let mut target = DialTarget::new(&rig, 121).await?;
+        let conn = rig
+            .actor
+            .endpoint
+            .connect(target.id, GOSSIP_ALPN)
+            .await
+            .std_context("connect")?;
+        let remote_conn = target.next_accepted().await;
+        let (other_tx, _other_rx) = mpsc::channel(SEND_QUEUE_CAP);
+        let (ended_tx, ended_rx) = mpsc::channel(SEND_QUEUE_CAP);
+        drop(ended_rx);
+        let mut state = PeerState::default();
+        state.admit(
+            Conn::new(
+                1,
+                ConnHandle {
+                    send_tx: Some(other_tx),
+                    conn: None,
+                },
+                true,
+                RxClock::new(),
+            ),
+            Instant::now(),
+        );
+        let ended_id = conn.stable_id();
+        state.admit(
+            Conn::new(
+                ended_id,
+                ConnHandle {
+                    send_tx: Some(ended_tx),
+                    conn: Some(conn),
+                },
+                true,
+                RxClock::new(),
+            ),
+            Instant::now(),
+        );
+        let PeerState::Active { conns, .. } = &state else {
+            panic!("the peer is active");
+        };
+        assert_eq!(
+            conns.chosen().map(|chosen| chosen.id),
+            Some(ended_id),
+            "the connection whose send loop ended is the chosen one"
+        );
+        rig.actor.peers.insert(target.id, state);
+
+        rig.broadcast(Bytes::from_static(b"finds the send loop ended"))
+            .await;
+        rig.actor.send_to_peer(
+            target.id,
+            ProtoMessage {
+                topic: rig.topic,
+                message: proto::topic::Message::Swarm(proto::hyparview::Message::Neighbor(
+                    proto::hyparview::Neighbor::low(),
+                )),
+            },
+            Instant::now(),
+        );
+        let reason = timeout(Duration::from_secs(5), remote_conn.closed())
+            .await
+            .std_context("the remote sees the close")?;
+        let iroh::endpoint::ConnectionError::ApplicationClosed(close) = &reason else {
+            panic!("an application close: {reason:?}");
+        };
+        assert_eq!(
+            (close.error_code, close.reason.as_ref()),
+            (2u32.into(), &b"send loop ended"[..]),
+            "the close names why the connection left"
         );
         Ok(())
     }
