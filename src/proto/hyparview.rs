@@ -207,7 +207,7 @@ pub struct Neighbor {
     data: Option<PeerData>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "net"))]
 impl Neighbor {
     /// A low priority `Neighbor` without user data.
     pub(crate) fn low() -> Self {
@@ -231,7 +231,7 @@ pub struct Disconnect {
     left: bool,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "net"))]
 impl Disconnect {
     /// The `Disconnect` of a peer that stays alive and did not leave.
     pub(crate) fn alive() -> Self {
