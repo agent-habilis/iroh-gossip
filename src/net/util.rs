@@ -23,7 +23,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     sync::mpsc,
 };
-use tracing::{debug, trace, Instrument};
+use tracing::{debug, trace, warn, Instrument};
 
 use super::{InEvent, ProtoMessage};
 use crate::{
@@ -309,9 +309,19 @@ impl SendLoop {
     }
 
     /// Writes the messages of the backlog in order. Each leaves the backlog after its write.
+    ///
+    /// A message that cannot be encoded within the maximum message size is a fault of that message,
+    /// found before a byte of it is written: it is dropped, and the loop goes on. Another connection
+    /// has the same limit, so it must not get the message again.
     async fn write_backlog(&mut self) -> Result<(), WriteError> {
         while let Some(message) = self.backlog.front().cloned() {
-            self.write_message(&message).await?;
+            match self.write_message(&message).await {
+                Ok(()) => {}
+                Err(err @ (WriteError::TooLarge { .. } | WriteError::Ser { .. })) => {
+                    warn!(topic = %message.topic.fmt_short(), "drop a message that cannot be sent: {err:#}");
+                }
+                Err(err) => return Err(err),
+            }
             self.backlog.pop_front();
         }
         Ok(())

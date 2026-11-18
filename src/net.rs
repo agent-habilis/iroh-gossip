@@ -5038,6 +5038,73 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// A frame larger than the maximum message size is a fault of that frame, not of the
+    /// connection: the send loop drops it and writes the frames behind it. Before, the loop ended
+    /// with the frame at the front of its backlog, and the actor sent it to the next connection,
+    /// which failed on it too.
+    #[tokio::test]
+    #[traced_test]
+    async fn a_frame_too_large_to_write_is_dropped_and_the_next_one_is_written() -> Result {
+        let rig = Rig::new(20, 0).await?;
+        let mut target = DialTarget::new(&rig, 120).await?;
+        let conn = rig
+            .actor
+            .endpoint
+            .connect(target.id, GOSSIP_ALPN)
+            .await
+            .std_context("connect")?;
+        let remote_conn = target.next_accepted().await;
+        let (recv_tx, mut recv_rx) = mpsc::channel(8);
+        let (carried_tx, _carried_rx) = mpsc::channel(8);
+        let max_message_size = 1024;
+        let mut reader = RecvLoop::new(
+            remote_conn.remote_id(),
+            remote_conn,
+            recv_tx,
+            carried_tx,
+            max_message_size,
+            Arc::new(Metrics::default()),
+        );
+        let _reader = AbortOnDropHandle::new(task::spawn(async move { reader.run().await.ok() }));
+
+        let gossip = |content: Vec<u8>| ProtoMessage {
+            topic: rig.topic,
+            message: crate::proto::topic::Message::Gossip(crate::proto::plumtree::Message::Gossip(
+                crate::proto::plumtree::Gossip::first_round(content.into(), Scope::Swarm),
+            )),
+        };
+        let too_large = gossip(vec![0; max_message_size * 2]);
+        let small = gossip(b"behind the frame that is too large".to_vec());
+        let (send_tx, send_rx) = mpsc::channel(8);
+        drop(send_tx);
+        let mut send_loop = SendLoop::new(
+            conn,
+            send_rx,
+            max_message_size,
+            Arc::new(Metrics::default()),
+        );
+        let result = send_loop.run(vec![too_large, small.clone()]).await;
+        let unsent = send_loop.take_unsent();
+        assert!(
+            unsent.iter().all(|message| format!("{message:?}")
+                != format!("{:?}", gossip(vec![0; max_message_size * 2]))),
+            "the frame that is too large is not handed back to be sent again: {result:?}"
+        );
+        let arrived = timeout(Duration::from_secs(5), async {
+            while let Some(event) = recv_rx.recv().await {
+                if let InEvent::RecvMessage(_, message) = event {
+                    if format!("{message:?}") == format!("{small:?}") {
+                        return true;
+                    }
+                }
+            }
+            false
+        })
+        .await;
+        assert_eq!(arrived, Ok(true), "the frame behind it arrives: {result:?}");
+        Ok(())
+    }
+
     /// A peer that became active through an inbound connection while our dial to it was pending
     /// takes the dial with it when it is dropped. Before, only a pending peer did, and the dial
     /// that connected later made the peer again, with no topic that uses it.

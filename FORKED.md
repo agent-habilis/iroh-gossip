@@ -99,6 +99,12 @@ of each topic (`last_swarm` of the peer), and resends a HyParView frame only if 
 the closed one or no frame of the topic was noted. A frame that was written to a QUIC stream but not
 acknowledged is still lost with the connection.
 
+A message that cannot be encoded within the maximum message size (`WriteError::TooLarge` or
+`WriteError::Ser`) is a fault of that message, found before a byte of it is written. Upstream ended
+the send loop on it, and so closed the connection. With the resend, that message would then go to
+the next connection, which has the same limit and fails the same way. Now `SendLoop::write_backlog`
+drops the message with a warn and writes the messages behind it on the same connection.
+
 ## A dial that connects after it was replaced or cancelled is not dropped
 
 `net.rs`: upstream dropped the result of a dial that `replace_old_dial` or `cancel_dial` had taken
