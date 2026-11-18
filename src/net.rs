@@ -4550,7 +4550,11 @@ pub(crate) mod tests {
             panic!("the dial for the other topic must stay");
         };
         let topics: Vec<TopicId> = queue.iter().map(|message| message.topic).collect();
-        assert_eq!(topics, vec![other], "only the Join of the other topic stays");
+        assert_eq!(
+            topics,
+            vec![other],
+            "only the Join of the other topic stays"
+        );
         Ok(())
     }
 
