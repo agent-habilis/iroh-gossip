@@ -96,8 +96,11 @@ view. If that comes while we dial the peer, the actor used to remove the peer, a
 that waited for the dial were lost. A `Join` is sent once, so after `leave_peers` a `join_peers`
 could fail for good when a shuffle reply from the peer came in during a slow dial (CI saw it in
 `leave_peers_is_not_undone_by_shuffles_of_a_third_peer`). Now a peer that is still pending and has
-a queue is marked `disconnect_after_flush`: the dial delivers the queue, and then the peer is
-dropped, so its connection drains and closes, as the connection of an active peer does on
-`DisconnectPeer`. A new send to the peer clears the mark.
+a queue is marked `disconnect_after_flush`: the dial delivers the queue, and the connection stays
+writable for `JOIN_ANSWER_WAIT` (`close_at`), because the peer answers a `Join` with a `Neighbor`
+that our `Neighbor` must answer on that connection. A send to the peer ends the wait; at its end
+the peer is dropped, so its connection drains and closes, as the connection of an active peer does
+on `DisconnectPeer`. A new send to a pending peer clears the mark, a failed dial drops a marked
+peer, and a quit takes the frames of its topic out of every queue.
 
 If upstream changes `PeerState` or the `DisconnectPeer` arm, keep the queue of a pending peer.
