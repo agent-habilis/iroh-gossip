@@ -97,8 +97,10 @@ connection, and a message that a stopped write had partly sent comes twice. Plum
 For HyParView the order changes the meaning: an old `Disconnect` after a newer `Neighbor` of the
 same topic ends the new link. So the actor notes the connection that took the last HyParView frame
 of each topic (`last_swarm` of the peer), and resends a HyParView frame only if that connection is
-the closed one or no frame of the topic was noted. A frame that was written to a QUIC stream but not
-acknowledged is still lost with the connection.
+the closed one or no frame of the topic was noted. Of a topic that quit, only the `Disconnect` is
+resent: a `Join` after the quit would put us back into the view of the peer for a topic that we left,
+as `drop_queued_frames_of` prevents for the queue of a dial. A frame that was written to a QUIC
+stream but not acknowledged is still lost with the connection.
 
 A message that cannot be encoded within the maximum message size (`WriteError::TooLarge` or
 `WriteError::Ser`) is a fault of that message, found before a byte of it is written. Upstream ended

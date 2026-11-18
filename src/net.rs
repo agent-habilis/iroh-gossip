@@ -817,7 +817,8 @@ impl Actor {
     /// A resent frame comes after the frames that went straight to the next connection. For a
     /// HyParView frame that order changes the meaning: an old `Disconnect` after a newer `Neighbor`
     /// ends the new link. So a HyParView frame is resent only if the last HyParView frame of its
-    /// topic went to `from`, which makes it the newest of its topic.
+    /// topic went to `from`, which makes it the newest of its topic. Of a topic that quit, only the
+    /// `Disconnect` is resent.
     fn resend_unsent(
         &mut self,
         peer_id: EndpointId,
@@ -853,6 +854,19 @@ impl Actor {
             debug!(
                 count = before - unsent.len(),
                 "drop unsent HyParView frames: a newer frame of their topic went to another connection"
+            );
+        }
+        // As for the queue of a dial (`drop_queued_frames_of`): a frame of a topic that quit would
+        // put us back into the view of the peer, except the `Disconnect` that the quit sent.
+        let before = unsent.len();
+        let topics = &self.topics;
+        unsent.retain(|message| {
+            topics.contains_key(&message.topic) || message.message.is_disconnect()
+        });
+        if unsent.len() < before {
+            debug!(
+                count = before - unsent.len(),
+                "drop unsent frames of a topic that quit"
             );
         }
         debug!(
@@ -5040,6 +5054,68 @@ pub(crate) mod tests {
         assert!(
             !rig.actor.peers.contains_key(&remote_id),
             "the dropped peer does not come back"
+        );
+        Ok(())
+    }
+
+    /// An unsent frame of a topic that quit is not resent, except its `Disconnect`: a `Join`
+    /// resent after the quit would put us into the view of the peer for a topic that we left. This
+    /// is what [`Actor::drop_queued_frames_of`] does for the queue of a dial.
+    #[tokio::test]
+    #[traced_test]
+    async fn an_unsent_frame_of_a_topic_that_quit_is_not_resent_but_its_disconnect_is() -> Result {
+        let mut rig = Rig::new(22, 0).await?;
+        let peer_id = SecretKey::from_bytes(&[22; 32]).public();
+        let mut state = PeerState::default();
+        let mut receivers = HashMap::new();
+        for conn_id in [1, 2] {
+            let (tx, rx) = mpsc::channel(SEND_QUEUE_CAP);
+            let handle = ConnHandle {
+                send_tx: Some(tx),
+                conn: None,
+            };
+            state.admit(
+                Conn::new(conn_id, handle, true, RxClock::new()),
+                Instant::now(),
+            );
+            receivers.insert(conn_id, rx);
+        }
+        rig.actor.peers.insert(peer_id, state);
+        let Some(PeerState::Active { conns, .. }) = rig.actor.peers.get(&peer_id) else {
+            panic!("the peer is active");
+        };
+        let first = conns.chosen().expect("a chosen connection").id;
+        let swarm = |message| ProtoMessage {
+            topic: rig.topic,
+            message: proto::topic::Message::Swarm(message),
+        };
+        let join = swarm(proto::hyparview::Message::Join(None));
+        let disconnect = swarm(proto::hyparview::Message::Disconnect(
+            proto::hyparview::Disconnect::alive(),
+        ));
+
+        let now = Instant::now();
+        rig.actor.send_to_peer(peer_id, join, now);
+        rig.actor.send_to_peer(peer_id, disconnect.clone(), now);
+        let mut first_rx = receivers.remove(&first).expect("the first receiver");
+        let unsent = vec![
+            first_rx.try_recv().expect("the Join"),
+            first_rx.try_recv().expect("the Disconnect"),
+        ];
+        drop(first_rx);
+        // The topic quits.
+        rig.actor.topics.remove(&rig.topic);
+        rig.actor.resend_unsent(peer_id, first, true, unsent);
+
+        let (_, second_rx) = receivers.iter_mut().next().expect("the second receiver");
+        let mut got = Vec::new();
+        while let Ok(message) = second_rx.try_recv() {
+            got.push(format!("{message:?}"));
+        }
+        assert_eq!(
+            got,
+            vec![format!("{disconnect:?}")],
+            "only the Disconnect of the topic that quit is resent"
         );
         Ok(())
     }
