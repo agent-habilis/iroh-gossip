@@ -668,7 +668,21 @@ impl Actor {
             dialed_by_lower,
             rx_clock.clone(),
         );
-        let queue = self.admit_connection(peer_id, entry, Instant::now());
+        let disconnect_after_flush = matches!(
+            self.peers.get(&peer_id),
+            Some(PeerState::Pending {
+                disconnect_after_flush: true,
+                ..
+            })
+        );
+        // A connection that is not chosen gets a sender too and keeps reading: the peer may send
+        // on it. See [`conns`].
+        let (queue, actions) = self
+            .peers
+            .entry(peer_id)
+            .or_default()
+            .admit(entry, Instant::now());
+        self.apply_actions(peer_id, actions);
 
         let max_message_size = self.state.max_message_size();
         let link = ActorLink {
@@ -697,21 +711,11 @@ impl Actor {
             }
             .instrument(error_span!("conn", peer = %peer_id.fmt_short())),
         );
-    }
-
-    /// Adds a connection to the state of the peer. Returns the messages that waited for it, which
-    /// the connection sends first.
-    fn admit_connection(
-        &mut self,
-        peer_id: EndpointId,
-        entry: Conn<ConnHandle>,
-        now: Instant,
-    ) -> Vec<ProtoMessage> {
-        // A connection that is not chosen gets a sender too and keeps reading: the peer may send
-        // on it. See [`conns`].
-        let (queue, actions) = self.peers.entry(peer_id).or_default().admit(entry, now);
-        self.apply_actions(peer_id, actions);
-        queue
+        if disconnect_after_flush {
+            // Dropping the sender ends the send loop after the queue: it drains and closes.
+            debug!(peer = %peer_id.fmt_short(), "queue handed to the connection: drop peer");
+            self.peers.remove(&peer_id);
+        }
     }
 
     /// Does what the set of connections of a peer asks for after a change.
@@ -719,7 +723,6 @@ impl Actor {
         let Some(PeerState::Active {
             conns,
             refused_since,
-            ..
         }) = self.peers.get_mut(&peer_id)
         else {
             return;
@@ -763,19 +766,8 @@ impl Actor {
     }
 
     /// Looks at the connections of every peer: one can have gone silent, or have been parked for
-    /// too long. A peer whose wait for the answer to a `Join` ended is dropped.
+    /// too long.
     fn check_conns(&mut self, now: Instant) {
-        self.peers.retain(|peer_id, state| match state {
-            PeerState::Active {
-                close_at: Some(close_at),
-                ..
-            } if *close_at <= now => {
-                // Dropping the senders ends the send loops: the connections drain and close.
-                debug!(peer = %peer_id.fmt_short(), "no answer to the queued Join: drop peer");
-                false
-            }
-            _ => true,
-        });
         let mut changes = Vec::new();
         for (peer_id, state) in &mut self.peers {
             if let PeerState::Active { conns, .. } = state {
@@ -1027,70 +1019,64 @@ impl Actor {
                         PeerState::Active {
                             conns,
                             refused_since,
-                            close_at,
-                        } => {
-                            // A send after the disconnect wants the peer again.
-                            *close_at = None;
-                            match send_on_chosen(conns, message) {
-                                Ok(()) => *refused_since = None,
-                                Err(mpsc::error::TrySendError::Full(message)) => {
-                                    let since = *refused_since.get_or_insert_with(Instant::now);
-                                    if message.is_droppable()
-                                        && since.elapsed() < self.send_refused_deadline
-                                    {
-                                        self.metrics.msgs_dropped_send_queue_full.inc();
-                                        let dropped =
-                                            self.metrics.msgs_dropped_send_queue_full.get();
-                                        // Log the first drop and then each power of two.
-                                        if dropped.is_power_of_two() {
-                                            warn!(
-                                                peer = %peer_id.fmt_short(),
-                                                dropped,
-                                                "dropped a data message: the send queue of the connection is full",
-                                            );
-                                        }
-                                    } else if !self.overflow_disconnects.contains(&peer_id) {
-                                        self.overflow_disconnects.push_back(peer_id);
-                                    }
-                                }
-                                Err(mpsc::error::TrySendError::Closed(_message)) => {
-                                    // The send loop of the chosen connection ended. Waiting for
-                                    // [`Self::handle_connection_task_finished`] is not enough: the arm
-                                    // that reads the result of the task is behind the arms that carry
-                                    // data, and the protocol sends to this peer until that arm runs. So
-                                    // the connection is dropped after this event, once, and the log has
-                                    // one line for each connection, not one for each message.
-                                    match conns.chosen().map(|conn| conn.id) {
-                                        Some(conn_id) => {
-                                            if !self.dead_conns.contains(&(peer_id, conn_id)) {
-                                                self.dead_conns.push_back((peer_id, conn_id));
-                                                if ended_without_a_fault(
-                                                    conns.chosen(),
-                                                    endpoint_is_closing(&self.endpoint),
-                                                ) {
-                                                    debug!(
-                                                        peer = %peer_id.fmt_short(),
-                                                        conn_id,
-                                                        "send on a connection that ended without a fault",
-                                                    );
-                                                } else {
-                                                    warn!(
-                                                        peer = %peer_id.fmt_short(),
-                                                        conn_id,
-                                                        reason = ?close_reason(conns.chosen()),
-                                                        "failed to send: connection task send loop terminated",
-                                                    );
-                                                }
-                                            }
-                                        }
-                                        None => warn!(
+                        } => match send_on_chosen(conns, message) {
+                            Ok(()) => *refused_since = None,
+                            Err(mpsc::error::TrySendError::Full(message)) => {
+                                let since = *refused_since.get_or_insert_with(Instant::now);
+                                if message.is_droppable()
+                                    && since.elapsed() < self.send_refused_deadline
+                                {
+                                    self.metrics.msgs_dropped_send_queue_full.inc();
+                                    let dropped = self.metrics.msgs_dropped_send_queue_full.get();
+                                    // Log the first drop and then each power of two.
+                                    if dropped.is_power_of_two() {
+                                        warn!(
                                             peer = %peer_id.fmt_short(),
-                                            "failed to send: connection task send loop terminated",
-                                        ),
+                                            dropped,
+                                            "dropped a data message: the send queue of the connection is full",
+                                        );
                                     }
+                                } else if !self.overflow_disconnects.contains(&peer_id) {
+                                    self.overflow_disconnects.push_back(peer_id);
                                 }
                             }
-                        }
+                            Err(mpsc::error::TrySendError::Closed(_message)) => {
+                                // The send loop of the chosen connection ended. Waiting for
+                                // [`Self::handle_connection_task_finished`] is not enough: the arm
+                                // that reads the result of the task is behind the arms that carry
+                                // data, and the protocol sends to this peer until that arm runs. So
+                                // the connection is dropped after this event, once, and the log has
+                                // one line for each connection, not one for each message.
+                                match conns.chosen().map(|conn| conn.id) {
+                                    Some(conn_id) => {
+                                        if !self.dead_conns.contains(&(peer_id, conn_id)) {
+                                            self.dead_conns.push_back((peer_id, conn_id));
+                                            if ended_without_a_fault(
+                                                conns.chosen(),
+                                                endpoint_is_closing(&self.endpoint),
+                                            ) {
+                                                debug!(
+                                                    peer = %peer_id.fmt_short(),
+                                                    conn_id,
+                                                    "send on a connection that ended without a fault",
+                                                );
+                                            } else {
+                                                warn!(
+                                                    peer = %peer_id.fmt_short(),
+                                                    conn_id,
+                                                    reason = ?close_reason(conns.chosen()),
+                                                    "failed to send: connection task send loop terminated",
+                                                );
+                                            }
+                                        }
+                                    }
+                                    None => warn!(
+                                        peer = %peer_id.fmt_short(),
+                                        "failed to send: connection task send loop terminated",
+                                    ),
+                                }
+                            }
+                        },
                         PeerState::Pending {
                             queue,
                             disconnect_after_flush,
@@ -1200,8 +1186,8 @@ enum PeerState {
     Pending {
         queue: Vec<ProtoMessage>,
         /// The protocol disconnected the peer while the dial was in flight. The queue still goes
-        /// out on the connection of the dial, which then waits [`JOIN_ANSWER_WAIT`] for the answer
-        /// to a `Join` in the queue (see `close_at`).
+        /// out on the connection of the dial, which then drains and closes, as the connection of
+        /// an active peer does on a disconnect.
         disconnect_after_flush: bool,
     },
     Active {
@@ -1209,10 +1195,6 @@ enum PeerState {
         conns: ConnSet<ConnHandle>,
         /// Since when the send queue refuses messages, with none accepted in between.
         refused_since: Option<Instant>,
-        /// When the peer is dropped, unless a send to it comes first. Set when a dial delivers a
-        /// queue whose peer the protocol disconnected during the dial: the connection stays
-        /// writable for the answer to a `Join` in that queue.
-        close_at: Option<Instant>,
     },
 }
 
@@ -1306,12 +1288,6 @@ async fn sample_rx(conn: Connection, clock: RxClock) -> std::convert::Infallible
 /// the task, so it is left as it is.
 const DRAIN: Duration = Duration::from_secs(2);
 
-/// How long the connection of a dial stays writable after it delivered a queue whose peer the
-/// protocol disconnected during the dial. The queue can hold a `Join`, and the peer answers it
-/// with a `Neighbor`, which our `Neighbor` must answer on the same connection. A send to the peer
-/// in this time ends the wait; at its end the peer is dropped, as the disconnect asked.
-const JOIN_ANSWER_WAIT: Duration = Duration::from_secs(10);
-
 /// Whether a connection keeps reading after its send loop ended. A write error ends the
 /// connection at once, and so does a connection that is closed already.
 fn drains(send_ended_cleanly: bool, conn_closed: bool) -> bool {
@@ -1330,16 +1306,11 @@ impl PeerState {
     /// connection existed (they go to this connection, the first one), and what to do.
     fn admit(&mut self, conn: Conn<ConnHandle>, now: Instant) -> (Vec<ProtoMessage>, Vec<Action>) {
         let queue = match self {
-            PeerState::Pending {
-                queue,
-                disconnect_after_flush,
-            } => {
+            PeerState::Pending { queue, .. } => {
                 let queue = std::mem::take(queue);
-                let close_at = disconnect_after_flush.then_some(now + JOIN_ANSWER_WAIT);
                 *self = PeerState::Active {
                     conns: ConnSet::default(),
                     refused_since: None,
-                    close_at,
                 };
                 queue
             }
@@ -4570,117 +4541,6 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    /// A peer that we joined during a dial and that the protocol disconnected meanwhile: the
-    /// dial connects and is admitted. Returns the receiver of the admitted connection.
-    async fn admit_a_disconnected_join(
-        rig: &mut Rig,
-        joined: EndpointId,
-        now: Instant,
-    ) -> mpsc::Receiver<ProtoMessage> {
-        rig.actor
-            .handle_in_event(
-                proto::InEvent::Command(rig.topic, ProtoCommand::Join(vec![joined])),
-                now,
-            )
-            .await;
-        let shuffle_reply = ProtoMessage {
-            topic: rig.topic,
-            message: proto::topic::Message::Swarm(proto::hyparview::Message::ShuffleReply(
-                proto::hyparview::ShuffleReply::empty(),
-            )),
-        };
-        rig.actor
-            .handle_in_event(proto::InEvent::RecvMessage(joined, shuffle_reply), now)
-            .await;
-        let (tx, rx) = mpsc::channel(SEND_QUEUE_CAP);
-        let entry = Conn::new(
-            99,
-            ConnHandle {
-                send_tx: Some(tx),
-                conn: None,
-            },
-            true,
-            RxClock::new(),
-        );
-        let queue = rig.actor.admit_connection(joined, entry, now);
-        assert!(
-            queue.iter().any(|message| matches!(
-                message.message,
-                proto::topic::Message::Swarm(proto::hyparview::Message::Join(_))
-            )),
-            "the connection sends the queued Join"
-        );
-        rx
-    }
-
-    /// The connection that delivers a `Join` after a disconnect during its dial stays writable for
-    /// the answer. The peer answers the `Join` with a `Neighbor`, and our `Neighbor` back goes on
-    /// that connection, not into the queue of a second dial that the peer can refuse.
-    #[tokio::test]
-    #[traced_test]
-    async fn the_connection_of_a_disconnected_join_carries_the_answer() -> Result {
-        let mut rig = Rig::new(16, 1).await?;
-        let joined = SecretKey::from_bytes(&[11u8; 32]).public();
-        let now = Instant::now();
-        let mut rx = admit_a_disconnected_join(&mut rig, joined, now).await;
-
-        let answer = ProtoMessage {
-            topic: rig.topic,
-            message: proto::topic::Message::Swarm(proto::hyparview::Message::Neighbor(
-                proto::hyparview::Neighbor::answer_to_join(),
-            )),
-        };
-        rig.actor
-            .handle_in_event(proto::InEvent::RecvMessage(joined, answer), now)
-            .await;
-
-        assert!(
-            matches!(rig.actor.peers.get(&joined), Some(PeerState::Active { .. })),
-            "the peer keeps the admitted connection"
-        );
-        let reply = rx
-            .try_recv()
-            .expect("our Neighbor goes on the admitted connection");
-        assert!(matches!(
-            reply.message,
-            proto::topic::Message::Swarm(proto::hyparview::Message::Neighbor(_))
-        ));
-        rig.actor.check_conns(now + JOIN_ANSWER_WAIT);
-        assert!(
-            matches!(rig.actor.peers.get(&joined), Some(PeerState::Active { .. })),
-            "a link that the peer answered outlives the wait"
-        );
-        Ok(())
-    }
-
-    /// The wait for the answer to a `Join` is bounded: a peer that does not answer is dropped at
-    /// the end of it, as the disconnect asked, and its connection drains and closes.
-    #[tokio::test]
-    #[traced_test]
-    async fn the_connection_of_an_unanswered_disconnected_join_closes_after_the_wait() -> Result {
-        let mut rig = Rig::new(17, 1).await?;
-        let joined = SecretKey::from_bytes(&[12u8; 32]).public();
-        let now = Instant::now();
-        let mut rx = admit_a_disconnected_join(&mut rig, joined, now).await;
-
-        rig.actor
-            .check_conns(now + JOIN_ANSWER_WAIT - Duration::from_millis(1));
-        assert!(
-            rig.actor.peers.contains_key(&joined),
-            "the connection waits for the answer"
-        );
-        rig.actor.check_conns(now + JOIN_ANSWER_WAIT);
-        assert!(
-            !rig.actor.peers.contains_key(&joined),
-            "the peer goes after the wait"
-        );
-        assert!(
-            matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Disconnected)),
-            "the sender of the connection is dropped, so it drains and closes"
-        );
-        Ok(())
-    }
-
     /// A peer that the protocol disconnected during the dial goes when the dial fails: nothing
     /// else would remove its queue. A queue without the disconnect stays for a connection that the
     /// peer opens to us.
@@ -4721,7 +4581,7 @@ pub(crate) mod tests {
         rig.actor.handle_dial_failed(waiting).await;
 
         assert!(
-            !rig.actor.peers.contains_key(&disconnected),
+            rig.actor.peers.get(&disconnected).is_none(),
             "the disconnected peer and its queue must go"
         );
         assert!(

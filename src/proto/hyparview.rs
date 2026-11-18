@@ -183,17 +183,6 @@ pub struct Neighbor {
     data: Option<PeerData>,
 }
 
-#[cfg(all(test, feature = "net"))]
-impl Neighbor {
-    /// What a peer sends when it takes our `Join` into its active view.
-    pub(crate) fn answer_to_join() -> Self {
-        Self {
-            priority: Priority::High,
-            data: None,
-        }
-    }
-}
-
 /// Message sent when leaving the swarm or closing down to inform peers about us being gone.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct Disconnect {
