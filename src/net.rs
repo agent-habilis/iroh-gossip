@@ -335,7 +335,7 @@ struct Actor {
     /// Internal queue of topic to close because all handles were dropped.
     quit_queue: VecDeque<TopicId>,
     /// Tasks for the connection loops, to keep track of panics.
-    connection_tasks: JoinSet<(EndpointId, Connection, Result<(), ConnectionLoopError>)>,
+    connection_tasks: JoinSet<(EndpointId, Connection, ConnLoopEnd)>,
     metrics: Arc<Metrics>,
     topic_event_forwarders: JoinSet<TopicId>,
     address_lookup: GossipAddressLookup,
@@ -562,8 +562,8 @@ impl Actor {
             }
             Some(res) = self.connection_tasks.join_next(), if !self.connection_tasks.is_empty() => {
                 trace!(?i, "tick: connection_tasks");
-                let (peer_id, conn, result) = res.expect("connection task panicked");
-                self.handle_connection_task_finished(peer_id, conn, result).await;
+                let (peer_id, conn, end) = res.expect("connection task panicked");
+                self.handle_connection_task_finished(peer_id, conn, end).await;
             }
             _ = n0_future::time::sleep(self.next_conns_check.saturating_duration_since(Instant::now())) => {
                 let now = Instant::now();
@@ -764,16 +764,52 @@ impl Actor {
         &mut self,
         peer_id: EndpointId,
         conn: Connection,
-        task_result: Result<(), ConnectionLoopError>,
+        end: ConnLoopEnd,
     ) {
+        let ConnLoopEnd {
+            result: task_result,
+            unsent,
+        } = end;
         if conn.close_reason().is_none() {
             conn.close(0u32.into(), b"close from disconnect");
         }
         let reason = conn.close_reason().expect("just closed");
         let error = task_result.err();
         debug!(%reason, ?error, "connection closed");
-        self.drop_conn(peer_id, conn.stable_id()).await;
+        let conn_id = conn.stable_id();
+        let owned = matches!(
+            self.peers.get(&peer_id),
+            Some(PeerState::Active { conns, .. }) if conns.owns(conn_id)
+        );
+        self.drop_conn(peer_id, conn_id).await;
+        self.resend_unsent(peer_id, owned, unsent);
         self.drain_queues().await;
+    }
+
+    /// Sends what the send loop of a closed connection did not write on the next connection of the
+    /// peer. Only a peer that still holds the connection gets it: a peer that the protocol dropped,
+    /// or that came back after the drop, must not get messages that were meant for the old one (a
+    /// `Disconnect` among them would end the new link).
+    fn resend_unsent(&mut self, peer_id: EndpointId, owned: bool, unsent: Vec<ProtoMessage>) {
+        if unsent.is_empty() {
+            return;
+        }
+        let active = matches!(self.peers.get(&peer_id), Some(PeerState::Active { .. }));
+        if !(owned && active) {
+            debug!(
+                count = unsent.len(),
+                "drop the unsent messages of a closed connection: the peer does not hold it"
+            );
+            return;
+        }
+        debug!(
+            count = unsent.len(),
+            "send the unsent messages of a closed connection on the next one"
+        );
+        let now = Instant::now();
+        for message in unsent {
+            self.send_to_peer(peer_id, message, now);
+        }
     }
 
     /// Takes the closed connection `conn_id` out of the set of `peer_id`. A peer with no connection
@@ -987,6 +1023,95 @@ impl Actor {
         });
     }
 
+    /// Hands a message to the peer: to its chosen connection, or to the queue of its dial.
+    fn send_to_peer(&mut self, peer_id: EndpointId, message: ProtoMessage, now: Instant) {
+        // The actor never waits for a peer: it is one task, and a peer that does
+        // not drain its queue would stop it from serving every other peer.
+        // A data message that does not fit is dropped (the protocol repairs it).
+        // A message that must not be lost leads to a disconnect, so that both sides
+        // see the same state. See `ProtoMessage::is_droppable`.
+        let state = self.peers.entry(peer_id).or_default();
+        match state {
+            PeerState::Active {
+                conns,
+                refused_since,
+            } => match send_on_live(conns, refused_since, message, now) {
+                Ok(()) => *refused_since = None,
+                Err(mpsc::error::TrySendError::Full(message)) => {
+                    let since = *refused_since.get_or_insert_with(Instant::now);
+                    if message.is_droppable() && since.elapsed() < self.send_refused_deadline {
+                        self.metrics.msgs_dropped_send_queue_full.inc();
+                        let dropped = self.metrics.msgs_dropped_send_queue_full.get();
+                        // Log the first drop and then each power of two.
+                        if dropped.is_power_of_two() {
+                            warn!(
+                                peer = %peer_id.fmt_short(),
+                                dropped,
+                                "dropped a data message: the send queue of the connection is full",
+                            );
+                        }
+                    } else if !self.overflow_disconnects.contains(&peer_id) {
+                        self.overflow_disconnects.push_back(peer_id);
+                    }
+                }
+                Err(mpsc::error::TrySendError::Closed(_message)) => {
+                    // The send loop of the chosen connection ended. Waiting for
+                    // [`Self::handle_connection_task_finished`] is not enough: the arm
+                    // that reads the result of the task is behind the arms that carry
+                    // data, and the protocol sends to this peer until that arm runs. So
+                    // the connection is dropped after this event, once, and the log has
+                    // one line for each connection, not one for each message.
+                    match conns.chosen().map(|conn| conn.id) {
+                        Some(conn_id) => {
+                            if !self.dead_conns.contains(&(peer_id, conn_id)) {
+                                self.dead_conns.push_back((peer_id, conn_id));
+                                if ended_without_a_fault(
+                                    conns.chosen(),
+                                    endpoint_is_closing(&self.endpoint),
+                                ) {
+                                    debug!(
+                                        peer = %peer_id.fmt_short(),
+                                        conn_id,
+                                        "send on a connection that ended without a fault",
+                                    );
+                                } else {
+                                    warn!(
+                                        peer = %peer_id.fmt_short(),
+                                        conn_id,
+                                        reason = ?close_reason(conns.chosen()),
+                                        "failed to send: connection task send loop terminated",
+                                    );
+                                }
+                            }
+                        }
+                        None => warn!(
+                            peer = %peer_id.fmt_short(),
+                            "failed to send: connection task send loop terminated",
+                        ),
+                    }
+                }
+            },
+            PeerState::Pending { queue } => {
+                // Dial on every send, not only on an empty queue: a failed
+                // dial leaves the queue non-empty, which used to stop every
+                // later send from dialing. `Dialer::queue_dial` already
+                // returns early while a dial is in flight, so it is the
+                // guard here, not the queue.
+                if !self.dialer.is_pending(peer_id) {
+                    debug!(peer = %peer_id.fmt_short(), "start to dial");
+                }
+                self.dialer.queue_dial(peer_id, self.alpn.clone());
+                if queue.len() < PENDING_QUEUE_CAP {
+                    queue.push(message);
+                } else if message.is_droppable() {
+                    self.metrics.msgs_dropped_send_queue_full.inc();
+                } else if !self.overflow_disconnects.contains(&peer_id) {
+                    self.overflow_disconnects.push_back(peer_id);
+                }
+            }
+        }
+    }
+
     // Stays `async`: it must never wait on a peer, and the test
     // `a_peer_with_a_full_send_queue_does_not_stall_the_actor` fails it with a timeout if it does.
     #[allow(clippy::unused_async)]
@@ -996,7 +1121,8 @@ impl Actor {
         } else {
             debug!(?event, "handle in_event");
         };
-        let out = self.state.handle(event, now, Some(&self.metrics));
+        // Collected, so that the arms below can call methods of the actor.
+        let out: Vec<_> = self.state.handle(event, now, Some(&self.metrics)).collect();
         for event in out {
             if matches!(event, OutEvent::ScheduleTimer(_, _)) {
                 trace!(?event, "handle out_event");
@@ -1004,95 +1130,7 @@ impl Actor {
                 debug!(?event, "handle out_event");
             };
             match event {
-                OutEvent::SendMessage(peer_id, message) => {
-                    // The actor never waits for a peer: it is one task, and a peer that does
-                    // not drain its queue would stop it from serving every other peer.
-                    // A data message that does not fit is dropped (the protocol repairs it).
-                    // A message that must not be lost leads to a disconnect, so that both sides
-                    // see the same state. See `ProtoMessage::is_droppable`.
-                    let state = self.peers.entry(peer_id).or_default();
-                    match state {
-                        PeerState::Active {
-                            conns,
-                            refused_since,
-                        } => match send_on_live(conns, refused_since, message, now) {
-                            Ok(()) => *refused_since = None,
-                            Err(mpsc::error::TrySendError::Full(message)) => {
-                                let since = *refused_since.get_or_insert_with(Instant::now);
-                                if message.is_droppable()
-                                    && since.elapsed() < self.send_refused_deadline
-                                {
-                                    self.metrics.msgs_dropped_send_queue_full.inc();
-                                    let dropped = self.metrics.msgs_dropped_send_queue_full.get();
-                                    // Log the first drop and then each power of two.
-                                    if dropped.is_power_of_two() {
-                                        warn!(
-                                            peer = %peer_id.fmt_short(),
-                                            dropped,
-                                            "dropped a data message: the send queue of the connection is full",
-                                        );
-                                    }
-                                } else if !self.overflow_disconnects.contains(&peer_id) {
-                                    self.overflow_disconnects.push_back(peer_id);
-                                }
-                            }
-                            Err(mpsc::error::TrySendError::Closed(_message)) => {
-                                // The send loop of the chosen connection ended. Waiting for
-                                // [`Self::handle_connection_task_finished`] is not enough: the arm
-                                // that reads the result of the task is behind the arms that carry
-                                // data, and the protocol sends to this peer until that arm runs. So
-                                // the connection is dropped after this event, once, and the log has
-                                // one line for each connection, not one for each message.
-                                match conns.chosen().map(|conn| conn.id) {
-                                    Some(conn_id) => {
-                                        if !self.dead_conns.contains(&(peer_id, conn_id)) {
-                                            self.dead_conns.push_back((peer_id, conn_id));
-                                            if ended_without_a_fault(
-                                                conns.chosen(),
-                                                endpoint_is_closing(&self.endpoint),
-                                            ) {
-                                                debug!(
-                                                    peer = %peer_id.fmt_short(),
-                                                    conn_id,
-                                                    "send on a connection that ended without a fault",
-                                                );
-                                            } else {
-                                                warn!(
-                                                    peer = %peer_id.fmt_short(),
-                                                    conn_id,
-                                                    reason = ?close_reason(conns.chosen()),
-                                                    "failed to send: connection task send loop terminated",
-                                                );
-                                            }
-                                        }
-                                    }
-                                    None => warn!(
-                                        peer = %peer_id.fmt_short(),
-                                        "failed to send: connection task send loop terminated",
-                                    ),
-                                }
-                            }
-                        },
-                        PeerState::Pending { queue } => {
-                            // Dial on every send, not only on an empty queue: a failed
-                            // dial leaves the queue non-empty, which used to stop every
-                            // later send from dialing. `Dialer::queue_dial` already
-                            // returns early while a dial is in flight, so it is the
-                            // guard here, not the queue.
-                            if !self.dialer.is_pending(peer_id) {
-                                debug!(peer = %peer_id.fmt_short(), "start to dial");
-                            }
-                            self.dialer.queue_dial(peer_id, self.alpn.clone());
-                            if queue.len() < PENDING_QUEUE_CAP {
-                                queue.push(message);
-                            } else if message.is_droppable() {
-                                self.metrics.msgs_dropped_send_queue_full.inc();
-                            } else if !self.overflow_disconnects.contains(&peer_id) {
-                                self.overflow_disconnects.push_back(peer_id);
-                            }
-                        }
-                    }
-                }
+                OutEvent::SendMessage(peer_id, message) => self.send_to_peer(peer_id, message, now),
                 OutEvent::EmitEvent(topic_id, event) => {
                     let Some(state) = self.topics.get_mut(&topic_id) else {
                         // TODO: unreachable?
@@ -1490,7 +1528,7 @@ async fn connection_loop(
     link: ActorLink,
     max_message_size: usize,
     queue: Vec<ProtoMessage>,
-) -> Result<(), ConnectionLoopError> {
+) -> ConnLoopEnd {
     debug!(?origin, "connection established");
 
     let mut send_loop = SendLoop::new(
@@ -1521,18 +1559,31 @@ async fn connection_loop(
     //
     // A send loop that ends cleanly leaves the recv loop `DRAIN` more to deliver what the peer
     // sent before the connection was replaced; a write error does not.
-    tokio::select! {
-        send_res = send_fut => {
-            send_res?;
-            if drains(true, observed.close_reason().is_some()) {
-                // Not `tokio::time::timeout`: in a browser there is no tokio timer and the call
-                // panics. The timeout of `n0_future` runs on both targets.
-                let _ = n0_future::time::timeout(DRAIN, &mut recv_fut).await;
+    let res: Result<(), ConnectionLoopError> = tokio::select! {
+        send_res = send_fut => match send_res {
+            Err(err) => Err(err.into()),
+            Ok(()) => {
+                if drains(true, observed.close_reason().is_some()) {
+                    // Not `tokio::time::timeout`: in a browser there is no tokio timer and the
+                    // call panics. The timeout of `n0_future` runs on both targets.
+                    let _ = n0_future::time::timeout(DRAIN, &mut recv_fut).await;
+                }
+                Ok(())
             }
-        }
-        recv_res = &mut recv_fut => recv_res?,
+        },
+        recv_res = &mut recv_fut => recv_res.map_err(Into::into),
+    };
+    ConnLoopEnd {
+        result: res,
+        unsent: send_loop.take_unsent(),
     }
-    Ok(())
+}
+
+/// How the loop of a connection ended.
+struct ConnLoopEnd {
+    result: Result<(), ConnectionLoopError>,
+    /// What the send loop did not write. The actor sends it on the next connection of the peer.
+    unsent: Vec<ProtoMessage>,
 }
 
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
@@ -4633,6 +4684,121 @@ pub(crate) mod tests {
         assert!(
             arrived,
             "the broadcast reaches the other live connection of the peer"
+        );
+        Ok(())
+    }
+
+    /// A message that waits in the queue of a connection when the connection closes goes to the
+    /// other live connection of the peer. The send loop of the closed connection never writes it,
+    /// and the protocol sends it once, so a drop loses it.
+    #[tokio::test]
+    #[traced_test]
+    async fn a_message_queued_on_a_connection_that_closes_goes_to_the_other_connection() -> Result {
+        let mut rig = Rig::new(15, 0).await?;
+        let rng = &mut rand::rngs::ChaCha12Rng::seed_from_u64(115);
+        let (relay_map, _relay_url, _relay) = iroh::test_utils::run_relay_server().await.unwrap();
+        let remote = create_endpoint(rng, relay_map, None).await?;
+        remote.online().await;
+        let remote_id = remote.id();
+
+        // The remote reads what each connection carries and hands it to the test.
+        let (recv_tx, mut recv_rx) = mpsc::channel(64);
+        let accept_ep = remote.clone();
+        let _accept = AbortOnDropHandle::new(task::spawn(async move {
+            let mut readers = JoinSet::new();
+            while let Some(incoming) = accept_ep.accept().await {
+                let Ok(conn) = incoming.accept().expect("accept incoming").await else {
+                    continue;
+                };
+                let (carried_tx, _carried_rx) = mpsc::channel(64);
+                let mut reader = RecvLoop::new(
+                    conn.remote_id(),
+                    conn,
+                    recv_tx.clone(),
+                    carried_tx,
+                    crate::proto::DEFAULT_MAX_MESSAGE_SIZE,
+                    Arc::new(Metrics::default()),
+                );
+                readers.spawn(async move {
+                    let _carried_rx = _carried_rx;
+                    reader.run().await.ok();
+                });
+            }
+        }));
+
+        let first = rig
+            .actor
+            .endpoint
+            .connect(remote.addr(), GOSSIP_ALPN)
+            .await
+            .std_context("first connection")?;
+        let second = rig
+            .actor
+            .endpoint
+            .connect(remote.addr(), GOSSIP_ALPN)
+            .await
+            .std_context("second connection")?;
+        // No await from here to the close: the tasks of the connections do not run before it.
+        rig.actor
+            .handle_connection(remote_id, ConnOrigin::Dial, first);
+        rig.actor
+            .handle_connection(remote_id, ConnOrigin::Dial, second);
+        let now = Instant::now();
+        rig.actor
+            .handle_in_event(
+                proto::InEvent::RecvMessage(remote_id, join_for_test(rig.topic)),
+                now,
+            )
+            .await;
+        let payload = Bytes::from_static(b"queued when the connection closed");
+        rig.broadcast(payload.clone()).await;
+        let Some(PeerState::Active { conns, .. }) = rig.actor.peers.get(&remote_id) else {
+            panic!("the remote is active");
+        };
+        let chosen = conns.chosen().expect("a chosen connection");
+        chosen
+            .handle
+            .conn
+            .as_ref()
+            .expect("a real connection")
+            .close(7u32.into(), b"closed with a message in its queue");
+
+        let (peer_id, conn, result) = rig
+            .actor
+            .connection_tasks
+            .join_next()
+            .await
+            .expect("a connection task")
+            .expect("the task does not panic");
+        rig.actor
+            .handle_connection_task_finished(peer_id, conn, result)
+            .await;
+
+        let expected = crate::proto::plumtree::Gossip::first_round(payload, Scope::Swarm);
+        let arrived = timeout(Duration::from_secs(5), async {
+            while let Some(event) = recv_rx.recv().await {
+                if let InEvent::RecvMessage(
+                    _,
+                    ProtoMessage {
+                        message:
+                            crate::proto::topic::Message::Gossip(
+                                crate::proto::plumtree::Message::Gossip(gossip),
+                            ),
+                        ..
+                    },
+                ) = event
+                {
+                    if gossip == expected {
+                        return;
+                    }
+                }
+            }
+        })
+        .await
+        .is_ok();
+        assert!(
+            arrived,
+            "the queued broadcast reaches the other live connection of the peer"
         );
         Ok(())
     }

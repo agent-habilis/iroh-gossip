@@ -80,8 +80,20 @@ of the chosen connection has ended and another connection can take the sends, `s
 the dead one out of the set (`ConnSet::retire`), closes it, and sends the same message on the next
 chosen one. Before, the message was dropped and the dead connection left only after the event. The
 protocol sends a message once, so the drop lost it. Only the last connection still ends with the
-`failed to send` path above, and the peer goes. The messages that were already in the queue of the
-dead send loop are not covered: that queue goes with the loop.
+`failed to send` path above, and the peer goes.
+
+## The messages that a closed connection did not write go to the next connection
+
+`net.rs` and `net/util.rs`: when a connection closes, its send loop stops, and upstream drops the
+messages in its queue with the loop. Now `SendLoop` keeps the message that it writes at the front of
+its backlog until the write ends, and `SendLoop::take_unsent` gives back the backlog and the queue.
+The task of the connection returns them (`ConnLoopEnd`), and the actor sends them on the next
+connection of the peer (`Actor::resend_unsent`). Only a peer that still holds the connection gets
+them (`ConnSet::owns`, which also knows the connections that `ConnSet::retire` took out): a peer that
+the protocol dropped, or that came back after the drop, must not get a `Disconnect` that was meant
+for the old link. These messages can come after newer ones that went straight to the next
+connection, and a message that a stopped write had partly sent comes twice. Plumtree takes both. A
+frame that was written to a QUIC stream but not acknowledged is still lost with the connection.
 
 ## The byte counters of the metrics are filled
 

@@ -84,6 +84,8 @@ pub(super) struct ConnSet<H> {
     entries: Vec<Conn<H>>,
     chosen: Option<ConnId>,
     next_seq: u64,
+    /// The connections that left the set by [`Self::retire`] and whose task has not ended yet.
+    retired: Vec<ConnId>,
 }
 
 impl<H> Default for ConnSet<H> {
@@ -92,6 +94,7 @@ impl<H> Default for ConnSet<H> {
             entries: Vec::new(),
             chosen: None,
             next_seq: 0,
+            retired: Vec::new(),
         }
     }
 }
@@ -142,6 +145,7 @@ impl<H> ConnSet<H> {
     /// connection to send on any more (one that was stopped and drains does not count).
     pub(super) fn closed(&mut self, id: ConnId, now: Instant) -> (Vec<Action>, bool) {
         self.entries.retain(|entry| entry.id != id);
+        self.retired.retain(|retired| *retired != id);
         if self.chosen == Some(id) {
             self.chosen = None;
         }
@@ -163,7 +167,14 @@ impl<H> ConnSet<H> {
         let index = self.entries.iter().position(|entry| entry.id == id)?;
         let entry = self.entries.remove(index);
         let (actions, _none_left) = self.closed(id, now);
+        self.retired.push(id);
         Some((entry, actions))
+    }
+
+    /// Whether `id` is a connection of this set, in it or retired from it, whose task has not
+    /// ended. A set made after the peer was dropped does not hold the connections of the old one.
+    pub(super) fn owns(&self, id: ConnId) -> bool {
+        self.entries.iter().any(|entry| entry.id == id) || self.retired.contains(&id)
     }
 
     /// All the handles, to close them when the protocol drops the peer.

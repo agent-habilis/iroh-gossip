@@ -1,7 +1,7 @@
 //! Utilities for iroh-gossip networking
 
 use std::{
-    collections::{hash_map, HashMap},
+    collections::{hash_map, HashMap, VecDeque},
     io,
     sync::Arc,
     time::Duration,
@@ -228,6 +228,9 @@ pub(crate) struct SendLoop {
     max_message_size: usize,
     finishing: JoinSet<()>,
     send_rx: mpsc::Receiver<ProtoMessage>,
+    /// The messages taken from the queue that are not written yet. The one at the front is the one
+    /// being written: it leaves only after its write, so a loop that stops keeps it.
+    backlog: VecDeque<ProtoMessage>,
     metrics: Arc<Metrics>,
 }
 
@@ -246,13 +249,13 @@ impl SendLoop {
             streams: Default::default(),
             finishing: Default::default(),
             send_rx,
+            backlog: VecDeque::new(),
         }
     }
 
     pub(crate) async fn run(&mut self, queue: Vec<ProtoMessage>) -> Result<(), WriteError> {
-        for msg in queue {
-            self.write_message(&msg).await?;
-        }
+        self.backlog.extend(queue);
+        self.write_backlog().await?;
         let conn_clone = self.conn.clone();
         let closed = conn_clone.closed();
         tokio::pin!(closed);
@@ -266,7 +269,10 @@ impl SendLoop {
                 // channel never broke the loop and the connection was never
                 // reclaimed.
                 msg = self.send_rx.recv() => match msg {
-                    Some(msg) => self.write_message(&msg).await?,
+                    Some(msg) => {
+                        self.backlog.push_back(msg);
+                        self.write_backlog().await?;
+                    }
                     None => break,
                 },
                 _ = self.finishing.join_next(), if !self.finishing.is_empty() => {}
@@ -300,6 +306,28 @@ impl SendLoop {
         }
         debug!("send loop closed");
         Ok(())
+    }
+
+    /// Writes the messages of the backlog in order. Each leaves the backlog after its write.
+    async fn write_backlog(&mut self) -> Result<(), WriteError> {
+        while let Some(message) = self.backlog.front().cloned() {
+            self.write_message(&message).await?;
+            self.backlog.pop_front();
+        }
+        Ok(())
+    }
+
+    /// The messages that the loop did not write, in order: the backlog, then the queue. The queue
+    /// closes, so nothing more comes in. The connection of a loop that stopped is closed or failed,
+    /// and the actor sends these on the next connection of the peer. A message that a stopped
+    /// write had partly sent comes again: the receiver drops a gossip message that it already has.
+    pub(crate) fn take_unsent(&mut self) -> Vec<ProtoMessage> {
+        self.send_rx.close();
+        let mut unsent: Vec<ProtoMessage> = self.backlog.drain(..).collect();
+        while let Ok(message) = self.send_rx.try_recv() {
+            unsent.push(message);
+        }
+        unsent
     }
 
     /// Write a [`ProtoMessage`] as a length-prefixed, postcard-encoded message on its stream.
