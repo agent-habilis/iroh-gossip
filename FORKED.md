@@ -85,7 +85,8 @@ counts each message that it writes, and the receive loop each message that it re
 `_recv_size`). A size is the 4 bytes of the length prefix and the postcard encoding of the message.
 No behaviour changes: `write_frame` returns the bytes it wrote, `read_frame_sized` returns the bytes
 it read, and the counters are atomic adds. The connection loops hold the `Arc<Metrics>` through
-`ActorLink`.
+`ActorLink`. The counters count only with the `net` feature: `Variant`, `Message::variant`,
+`note_sent` and `note_recv` compile only with it, and without it the fields exist and stay at 0.
 
 If upstream starts to count these, drop this change and keep their names.
 
