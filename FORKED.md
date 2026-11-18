@@ -92,8 +92,12 @@ connection of the peer (`Actor::resend_unsent`). Only a peer that still holds th
 them (`ConnSet::owns`, which also knows the connections that `ConnSet::retire` took out): a peer that
 the protocol dropped, or that came back after the drop, must not get a `Disconnect` that was meant
 for the old link. These messages can come after newer ones that went straight to the next
-connection, and a message that a stopped write had partly sent comes twice. Plumtree takes both. A
-frame that was written to a QUIC stream but not acknowledged is still lost with the connection.
+connection, and a message that a stopped write had partly sent comes twice. Plumtree takes both.
+For HyParView the order changes the meaning: an old `Disconnect` after a newer `Neighbor` of the
+same topic ends the new link. So the actor notes the connection that took the last HyParView frame
+of each topic (`last_swarm` of the peer), and resends a HyParView frame only if that connection is
+the closed one or no frame of the topic was noted. A frame that was written to a QUIC stream but not
+acknowledged is still lost with the connection.
 
 ## A dial that connects after it was replaced or cancelled is not dropped
 

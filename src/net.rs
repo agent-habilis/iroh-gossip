@@ -736,6 +736,7 @@ impl Actor {
         let Some(PeerState::Active {
             conns,
             refused_since,
+            ..
         }) = self.peers.get_mut(&peer_id)
         else {
             return;
@@ -802,25 +803,55 @@ impl Actor {
             Some(PeerState::Active { conns, .. }) if conns.owns(conn_id)
         );
         self.drop_conn(peer_id, conn_id).await;
-        self.resend_unsent(peer_id, owned, unsent);
+        self.resend_unsent(peer_id, conn_id, owned, unsent);
         self.drain_queues().await;
     }
 
-    /// Sends what the send loop of a closed connection did not write on the next connection of the
-    /// peer. Only a peer that still holds the connection gets it: a peer that the protocol dropped,
-    /// or that came back after the drop, must not get messages that were meant for the old one (a
-    /// `Disconnect` among them would end the new link).
-    fn resend_unsent(&mut self, peer_id: EndpointId, owned: bool, unsent: Vec<ProtoMessage>) {
+    /// Sends what the send loop of the closed connection `from` did not write on the next
+    /// connection of the peer. Only a peer that still holds the connection gets it: a peer that the
+    /// protocol dropped, or that came back after the drop, must not get messages that were meant
+    /// for the old one (a `Disconnect` among them would end the new link).
+    ///
+    /// A resent frame comes after the frames that went straight to the next connection. For a
+    /// HyParView frame that order changes the meaning: an old `Disconnect` after a newer `Neighbor`
+    /// ends the new link. So a HyParView frame is resent only if the last HyParView frame of its
+    /// topic went to `from`, which makes it the newest of its topic.
+    fn resend_unsent(
+        &mut self,
+        peer_id: EndpointId,
+        from: ConnId,
+        owned: bool,
+        mut unsent: Vec<ProtoMessage>,
+    ) {
         if unsent.is_empty() {
             return;
         }
-        let active = matches!(self.peers.get(&peer_id), Some(PeerState::Active { .. }));
-        if !(owned && active) {
+        let Some(PeerState::Active { last_swarm, .. }) = self.peers.get(&peer_id) else {
+            debug!(
+                count = unsent.len(),
+                "drop the unsent messages of a closed connection: the peer is not active"
+            );
+            return;
+        };
+        if !owned {
             debug!(
                 count = unsent.len(),
                 "drop the unsent messages of a closed connection: the peer does not hold it"
             );
             return;
+        }
+        let before = unsent.len();
+        unsent.retain(|message| {
+            !message.is_swarm()
+                || last_swarm
+                    .get(&message.topic)
+                    .is_none_or(|conn| *conn == from)
+        });
+        if unsent.len() < before {
+            debug!(
+                count = before - unsent.len(),
+                "drop unsent HyParView frames: a newer frame of their topic went to another connection"
+            );
         }
         debug!(
             count = unsent.len(),
@@ -1051,12 +1082,19 @@ impl Actor {
         // A message that must not be lost leads to a disconnect, so that both sides
         // see the same state. See `ProtoMessage::is_droppable`.
         let state = self.peers.entry(peer_id).or_default();
+        let swarm_topic = message.is_swarm().then_some(message.topic);
         match state {
             PeerState::Active {
                 conns,
                 refused_since,
+                last_swarm,
             } => match send_on_live(conns, refused_since, message, now) {
-                Ok(()) => *refused_since = None,
+                Ok(conn_id) => {
+                    *refused_since = None;
+                    if let Some(topic) = swarm_topic {
+                        last_swarm.insert(topic, conn_id);
+                    }
+                }
                 Err(mpsc::error::TrySendError::Full(message)) => {
                     let since = *refused_since.get_or_insert_with(Instant::now);
                     if message.is_droppable() && since.elapsed() < self.send_refused_deadline {
@@ -1236,6 +1274,9 @@ enum PeerState {
         conns: ConnSet<ConnHandle>,
         /// Since when the send queue refuses messages, with none accepted in between.
         refused_since: Option<Instant>,
+        /// The connection that took the last HyParView frame of each topic. See
+        /// [`Actor::resend_unsent`].
+        last_swarm: HashMap<TopicId, ConnId>,
     },
 }
 
@@ -1305,13 +1346,13 @@ fn apply_conn_actions(
 /// Sends `message` on the chosen connection of a peer. A chosen connection whose send loop ended
 /// leaves the set while another connection can take the sends, and the message goes to the next
 /// one: the protocol sends it once, and a drop loses it. `Closed` comes back only for the last
-/// connection, which the caller drops with the peer.
+/// connection, which the caller drops with the peer. Returns the connection that took it.
 fn send_on_live(
     conns: &mut ConnSet<ConnHandle>,
     refused_since: &mut Option<Instant>,
     mut message: ProtoMessage,
     now: Instant,
-) -> Result<(), mpsc::error::TrySendError<ProtoMessage>> {
+) -> Result<ConnId, mpsc::error::TrySendError<ProtoMessage>> {
     loop {
         match send_on_chosen(conns, message) {
             Err(mpsc::error::TrySendError::Closed(unsent)) => {
@@ -1338,13 +1379,16 @@ fn send_on_live(
     }
 }
 
-/// Sends `message` on the chosen connection of a peer.
+/// Sends `message` on the chosen connection of a peer, and returns that connection.
 fn send_on_chosen(
     conns: &ConnSet<ConnHandle>,
     message: ProtoMessage,
-) -> Result<(), mpsc::error::TrySendError<ProtoMessage>> {
-    match conns.chosen().and_then(|conn| conn.handle.send_tx.as_ref()) {
-        Some(send_tx) => send_tx.try_send(message),
+) -> Result<ConnId, mpsc::error::TrySendError<ProtoMessage>> {
+    let Some(chosen) = conns.chosen() else {
+        return Err(mpsc::error::TrySendError::Closed(message));
+    };
+    match chosen.handle.send_tx.as_ref() {
+        Some(send_tx) => send_tx.try_send(message).map(|()| chosen.id),
         None => Err(mpsc::error::TrySendError::Closed(message)),
     }
 }
@@ -1448,14 +1492,21 @@ impl PeerState {
                 *self = PeerState::Active {
                     conns: ConnSet::default(),
                     refused_since: None,
+                    last_swarm: HashMap::new(),
                 };
                 queue
             }
             PeerState::Active { .. } => Vec::new(),
         };
-        let PeerState::Active { conns, .. } = self else {
+        let PeerState::Active {
+            conns, last_swarm, ..
+        } = self
+        else {
             unreachable!("the state is active now");
         };
+        for message in queue.iter().filter(|message| message.is_swarm()) {
+            last_swarm.insert(message.topic, conn.id);
+        }
         (queue, conns.admit(conn, now))
     }
 }
@@ -4984,6 +5035,88 @@ pub(crate) mod tests {
         assert!(
             !rig.actor.peers.contains_key(&remote_id),
             "the dropped peer does not come back"
+        );
+        Ok(())
+    }
+
+    /// A HyParView frame that a closed connection did not write is not resent after a newer
+    /// HyParView frame of its topic went to the next connection: the remote reads frames in the
+    /// order they come, so an old `Disconnect` after a new `Neighbor` would end the new link. A
+    /// frame of a topic with nothing newer is still resent.
+    #[tokio::test]
+    #[traced_test]
+    async fn an_unsent_swarm_frame_is_not_resent_after_a_newer_one_of_its_topic() -> Result {
+        let mut rig = Rig::new(18, 0).await?;
+        let peer_id = SecretKey::from_bytes(&[18; 32]).public();
+        let mut state = PeerState::default();
+        let mut receivers = HashMap::new();
+        for conn_id in [1, 2] {
+            let (tx, rx) = mpsc::channel(SEND_QUEUE_CAP);
+            let handle = ConnHandle {
+                send_tx: Some(tx),
+                conn: None,
+            };
+            state.admit(
+                Conn::new(conn_id, handle, true, RxClock::new()),
+                Instant::now(),
+            );
+            receivers.insert(conn_id, rx);
+        }
+        rig.actor.peers.insert(peer_id, state);
+        let chosen = |actor: &Actor| match actor.peers.get(&peer_id) {
+            Some(PeerState::Active { conns, .. }) => conns.chosen().map(|conn| conn.id),
+            _ => None,
+        };
+        let first = chosen(&rig.actor).expect("a chosen connection");
+        let topic_a = rig.topic;
+        let topic_b: TopicId = blake3::hash(b"topic b").into();
+        let swarm = |topic, message| ProtoMessage {
+            topic,
+            message: proto::topic::Message::Swarm(message),
+        };
+        let disconnect = |topic| {
+            swarm(
+                topic,
+                proto::hyparview::Message::Disconnect(proto::hyparview::Disconnect::alive()),
+            )
+        };
+        let neighbor_a = swarm(
+            topic_a,
+            proto::hyparview::Message::Neighbor(proto::hyparview::Neighbor::low()),
+        );
+
+        let now = Instant::now();
+        rig.actor.send_to_peer(peer_id, disconnect(topic_a), now);
+        rig.actor.send_to_peer(peer_id, disconnect(topic_b), now);
+        // The send loop of the first connection ends with both frames unwritten.
+        let mut first_rx = receivers.remove(&first).expect("the first receiver");
+        let unsent = vec![
+            first_rx.try_recv().expect("the Disconnect of topic a"),
+            first_rx.try_recv().expect("the Disconnect of topic b"),
+        ];
+        drop(first_rx);
+        // A newer frame of topic a goes to the other connection.
+        rig.actor.send_to_peer(peer_id, neighbor_a.clone(), now);
+        let second = chosen(&rig.actor).expect("the other connection");
+        assert_ne!(second, first, "the sends moved to the other connection");
+        let owned = matches!(
+            rig.actor.peers.get(&peer_id),
+            Some(PeerState::Active { conns, .. }) if conns.owns(first)
+        );
+        rig.actor.resend_unsent(peer_id, first, owned, unsent);
+
+        let second_rx = receivers.get_mut(&second).expect("the second receiver");
+        let mut got = Vec::new();
+        while let Ok(message) = second_rx.try_recv() {
+            got.push(format!("{message:?}"));
+        }
+        let expected: Vec<_> = [neighbor_a, disconnect(topic_b)]
+            .iter()
+            .map(|message| format!("{message:?}"))
+            .collect();
+        assert_eq!(
+            got, expected,
+            "the old Disconnect of topic a stays behind its newer Neighbor"
         );
         Ok(())
     }

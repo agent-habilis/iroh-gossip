@@ -60,6 +60,13 @@ impl<PI> Message<PI> {
         )
     }
 
+    /// Whether this is a HyParView frame, whose meaning depends on its order with the other
+    /// HyParView frames of its topic.
+    #[cfg(feature = "net")]
+    pub(crate) fn is_swarm(&self) -> bool {
+        matches!(self.message, topic::Message::Swarm(_))
+    }
+
     /// Whether this is a `Join`, which the protocol sends once and never again.
     #[cfg(feature = "net")]
     pub(crate) fn is_join(&self) -> bool {

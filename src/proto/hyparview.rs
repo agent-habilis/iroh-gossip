@@ -207,6 +207,17 @@ pub struct Neighbor {
     data: Option<PeerData>,
 }
 
+#[cfg(test)]
+impl Neighbor {
+    /// A low priority `Neighbor` without user data.
+    pub(crate) fn low() -> Self {
+        Self {
+            priority: Priority::Low,
+            data: None,
+        }
+    }
+}
+
 /// Message sent when leaving the swarm or closing down to inform peers about us being gone.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct Disconnect {
@@ -218,6 +229,17 @@ pub struct Disconnect {
     /// This reuses the obsolete `respond` field, so the wire format is unchanged. No peer of
     /// this fork ever sent `true` there.
     left: bool,
+}
+
+#[cfg(test)]
+impl Disconnect {
+    /// The `Disconnect` of a peer that stays alive and did not leave.
+    pub(crate) fn alive() -> Self {
+        Self {
+            alive: true,
+            left: false,
+        }
+    }
 }
 
 /// Configuration for the swarm membership layer
