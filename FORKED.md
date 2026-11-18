@@ -105,17 +105,6 @@ active view is disconnected.
 
 If upstream changes the disconnect in `handle_message`, keep the exception for a pending `Join`.
 
-## The queue of a failed dial waits a bounded time
-
-`net.rs`: after a failed dial, the queue of a pending peer stays, so that a connection that the
-peer opens to us still delivers a `Join` in it (`queued_join_survives_failed_dial_for_inbound_flush`).
-The protocol forgets the peer on the failure, so nothing else removed that queue. Now the failure
-marks it (`dial_failed_at`), a new send to the peer clears the mark (it dials again), and
-`check_conns` drops a queue that waited `FAILED_DIAL_QUEUE_EXPIRY` (20 s, as long as the protocol
-waits for the answer to a `Join`).
-
-If upstream changes `PeerState::Pending` or the failed-dial arm, keep the queue and its bound.
-
 ## Version 0.103.0 of the fork is not upstream 0.103.0
 
 `Cargo.toml`, `metrics.rs`: the fork adds public fields to `Metrics` (the byte counters above). Its

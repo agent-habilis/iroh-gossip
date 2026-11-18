@@ -582,19 +582,14 @@ impl Actor {
     }
 
     /// A dial to the peer failed. A peer with a connection keeps it. A peer that waits for the dial
-    /// is disconnected in the protocol, and its queue waits [`FAILED_DIAL_QUEUE_EXPIRY`] for a
-    /// connection that the peer opens to us (see `queued_join_survives_failed_dial_for_inbound_flush`).
+    /// is disconnected in the protocol, and its queue stays for a connection that the peer opens
+    /// to us.
     async fn handle_dial_failed(&mut self, peer_id: EndpointId) {
-        let now = Instant::now();
-        match self.peers.get_mut(&peer_id) {
-            Some(PeerState::Active { .. }) => {}
-            state => {
-                if let Some(PeerState::Pending { dial_failed_at, .. }) = state {
-                    *dial_failed_at = Some(now);
-                }
-                self.handle_in_event(InEvent::PeerDisconnected(peer_id), now)
-                    .await;
-            }
+        let peer_state = self.peers.get(&peer_id);
+        let is_active = matches!(peer_state, Some(PeerState::Active { .. }));
+        if !is_active {
+            self.handle_in_event(InEvent::PeerDisconnected(peer_id), Instant::now())
+                .await;
         }
     }
 
@@ -748,18 +743,8 @@ impl Actor {
     }
 
     /// Looks at the connections of every peer: one can have gone silent, or have been parked for
-    /// too long. The queue of a failed dial that waited [`FAILED_DIAL_QUEUE_EXPIRY`] goes.
+    /// too long.
     fn check_conns(&mut self, now: Instant) {
-        self.peers.retain(|peer_id, state| match state {
-            PeerState::Pending {
-                dial_failed_at: Some(failed_at),
-                ..
-            } if now.saturating_duration_since(*failed_at) >= FAILED_DIAL_QUEUE_EXPIRY => {
-                debug!(peer = %peer_id.fmt_short(), "no connection since the failed dial: drop the queue");
-                false
-            }
-            _ => true,
-        });
         let mut changes = Vec::new();
         for (peer_id, state) in &mut self.peers {
             if let PeerState::Active { conns, .. } = state {
@@ -1075,12 +1060,7 @@ impl Actor {
                                 }
                             }
                         },
-                        PeerState::Pending {
-                            queue,
-                            dial_failed_at,
-                        } => {
-                            // The send dials again, so the queue waits for that dial now.
-                            *dial_failed_at = None;
+                        PeerState::Pending { queue } => {
                             // Dial on every send, not only on an empty queue: a failed
                             // dial leaves the queue non-empty, which used to stop every
                             // later send from dialing. `Dialer::queue_dial` already
@@ -1172,9 +1152,6 @@ struct ConnHandle {
 enum PeerState {
     Pending {
         queue: Vec<ProtoMessage>,
-        /// When the last dial failed. The queue then waits [`FAILED_DIAL_QUEUE_EXPIRY`] for a
-        /// connection that the peer opens to us; a send to the peer dials again and clears it.
-        dial_failed_at: Option<Instant>,
     },
     Active {
         /// The connections to the peer: the one that sends go to, and the ones that are parked.
@@ -1200,12 +1177,6 @@ fn forget_peer(
 
 /// How often the connections of the peers are looked at.
 const CONNS_CHECK_INTERVAL: Duration = Duration::from_secs(1);
-
-/// How long the queue of a failed dial waits for a connection that the peer opens to us. The
-/// queue can hold a `Join`, which the protocol never sends again, so it must outlive the failure;
-/// but the protocol forgot the peer, so without a bound nothing would remove it. The protocol
-/// waits as long for the answer to a `Join` (`JOIN_EXPIRY` in `hyparview`).
-const FAILED_DIAL_QUEUE_EXPIRY: Duration = Duration::from_secs(20);
 
 /// Sends `message` on the chosen connection of a peer.
 fn send_on_chosen(
@@ -1331,10 +1302,7 @@ impl PeerState {
 
 impl Default for PeerState {
     fn default() -> Self {
-        PeerState::Pending {
-            queue: Vec::new(),
-            dial_failed_at: None,
-        }
+        PeerState::Pending { queue: Vec::new() }
     }
 }
 
@@ -4582,40 +4550,6 @@ pub(crate) mod tests {
         assert!(
             !rig.actor.dialer.is_pending(joined),
             "the dial of the dropped peer must stop"
-        );
-        Ok(())
-    }
-
-    /// The queue of a failed dial waits for a connection that the peer opens to us, but not for
-    /// ever: the protocol forgot the peer (`PeerDisconnected`), so nothing else would remove it.
-    #[tokio::test]
-    #[traced_test]
-    async fn the_queue_of_a_failed_dial_goes_after_its_expiry() -> Result {
-        let mut rig = Rig::new(15, 1).await?;
-        let joined = SecretKey::from_bytes(&[10u8; 32]).public();
-        rig.actor
-            .handle_in_event(
-                proto::InEvent::Command(rig.topic, ProtoCommand::Join(vec![joined])),
-                Instant::now(),
-            )
-            .await;
-        rig.actor.handle_dial_failed(joined).await;
-        let failed = Instant::now();
-
-        rig.actor
-            .check_conns(failed + FAILED_DIAL_QUEUE_EXPIRY - Duration::from_millis(1));
-        assert!(
-            matches!(
-                rig.actor.peers.get(&joined),
-                Some(PeerState::Pending { queue, .. }) if !queue.is_empty()
-            ),
-            "the queue waits for a connection from the peer"
-        );
-        rig.actor
-            .check_conns(failed + FAILED_DIAL_QUEUE_EXPIRY + Duration::from_secs(1));
-        assert!(
-            !rig.actor.peers.contains_key(&joined),
-            "the queue goes after the expiry"
         );
         Ok(())
     }
