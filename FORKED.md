@@ -75,8 +75,10 @@ If upstream changes the `failed to send` log, keep the split in `ended_without_a
 
 ## The byte counters of the metrics are filled
 
-`metrics.rs`, `net.rs` and `net/util.rs`: `msgs_ctrl_sent`, `msgs_ctrl_recv`, `msgs_data_sent`,
-`msgs_data_recv` and their `_size` counters were declared and never incremented. The send loop now
+`metrics.rs`, `net.rs`, `net/util.rs` and `proto/state.rs`: upstream counts `msgs_ctrl_*` and
+`msgs_data_*` in `State::handle`, for each message that the protocol emits or takes in, with the
+size of the message without its prefix. The fork removes those writes from `State::handle` (it
+keeps `neighbor_up` and `neighbor_down`), so that each frame counts once. The send loop now
 counts each message that it writes, and the receive loop each message that it reads, by kind
 (control or data) and by variant (`join`, `forward_join`, `shuffle`, `shuffle_reply`, `neighbor`,
 `disconnect`, `gossip`, `ihave`, `graft`, `prune`: `msgs_<variant>_sent`, `_sent_size`, `_recv`,

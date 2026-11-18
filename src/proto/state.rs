@@ -253,9 +253,6 @@ impl<PI: PeerIdentity, R: Rng + SeedableRng> State<PI, R> {
         metrics: Option<&Metrics>,
     ) -> impl Iterator<Item = OutEvent<PI>> + '_ + use<'_, PI, R> {
         trace!("in : {event:?}");
-        if let Some(metrics) = &metrics {
-            track_in_event(&event, metrics);
-        }
 
         let event: InEventMapped<PI> = event.into();
 
@@ -308,9 +305,8 @@ impl<PI: PeerIdentity, R: Rng + SeedableRng> State<PI, R> {
             }
         }
 
-        // track metrics
         if let Some(metrics) = &metrics {
-            track_out_events(&self.outbox, metrics);
+            track_neighbor_events(&self.outbox, metrics);
         }
 
         self.outbox.drain(..)
@@ -346,24 +342,12 @@ fn handle_out_event<PI: PeerIdentity>(
     }
 }
 
-fn track_out_events<PI: Serialize>(events: &[OutEvent<PI>], metrics: &Metrics) {
+/// The message counters are not written here: the connection loops count each frame that they
+/// write or read, so a message that is dropped before it is written does not count as sent.
+fn track_neighbor_events<PI>(events: &[OutEvent<PI>], metrics: &Metrics) {
     for event in events {
-        match event {
-            OutEvent::SendMessage(_to, message) => match message.kind() {
-                MessageKind::Data => {
-                    metrics.msgs_data_sent.inc();
-                    metrics
-                        .msgs_data_sent_size
-                        .inc_by(message.size().unwrap_or(0) as u64);
-                }
-                MessageKind::Control => {
-                    metrics.msgs_ctrl_sent.inc();
-                    metrics
-                        .msgs_ctrl_sent_size
-                        .inc_by(message.size().unwrap_or(0) as u64);
-                }
-            },
-            OutEvent::EmitEvent(_topic, event) => match event {
+        if let OutEvent::EmitEvent(_topic, event) = event {
+            match event {
                 super::Event::NeighborUp(_peer) => {
                     metrics.neighbor_up.inc();
                 }
@@ -371,26 +355,6 @@ fn track_out_events<PI: Serialize>(events: &[OutEvent<PI>], metrics: &Metrics) {
                     metrics.neighbor_down.inc();
                 }
                 _ => {}
-            },
-            _ => {}
-        }
-    }
-}
-
-fn track_in_event<PI: Serialize>(event: &InEvent<PI>, metrics: &Metrics) {
-    if let InEvent::RecvMessage(_from, message) = event {
-        match message.kind() {
-            MessageKind::Data => {
-                metrics.msgs_data_recv.inc();
-                metrics
-                    .msgs_data_recv_size
-                    .inc_by(message.size().unwrap_or(0) as u64);
-            }
-            MessageKind::Control => {
-                metrics.msgs_ctrl_recv.inc();
-                metrics
-                    .msgs_ctrl_recv_size
-                    .inc_by(message.size().unwrap_or(0) as u64);
             }
         }
     }

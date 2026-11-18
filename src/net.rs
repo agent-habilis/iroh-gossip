@@ -2300,6 +2300,9 @@ pub(crate) mod tests {
             sent.msgs_ctrl_recv.get() >= 1,
             "go1 received the control messages of the join"
         );
+        for metrics in [&sent, &got] {
+            assert_kind_totals_are_the_sums_of_their_variants(metrics);
+        }
 
         cancel.cancel();
         for t in tasks {
@@ -2309,6 +2312,50 @@ pub(crate) mod tests {
                 .unwrap()
                 .unwrap();
         }
+    }
+
+    /// Each frame counts once: the data totals equal the `gossip` totals, and the control totals
+    /// equal the sums of the other variants.
+    fn assert_kind_totals_are_the_sums_of_their_variants(m: &crate::metrics::Metrics) {
+        assert_eq!(m.msgs_data_sent.get(), m.msgs_gossip_sent.get());
+        assert_eq!(m.msgs_data_sent_size.get(), m.msgs_gossip_sent_size.get());
+        assert_eq!(m.msgs_data_recv.get(), m.msgs_gossip_recv.get());
+        assert_eq!(m.msgs_data_recv_size.get(), m.msgs_gossip_recv_size.get());
+        let control_sent = [
+            (&m.msgs_join_sent, &m.msgs_join_sent_size),
+            (&m.msgs_forward_join_sent, &m.msgs_forward_join_sent_size),
+            (&m.msgs_shuffle_sent, &m.msgs_shuffle_sent_size),
+            (&m.msgs_shuffle_reply_sent, &m.msgs_shuffle_reply_sent_size),
+            (&m.msgs_neighbor_sent, &m.msgs_neighbor_sent_size),
+            (&m.msgs_disconnect_sent, &m.msgs_disconnect_sent_size),
+            (&m.msgs_ihave_sent, &m.msgs_ihave_sent_size),
+            (&m.msgs_graft_sent, &m.msgs_graft_sent_size),
+            (&m.msgs_prune_sent, &m.msgs_prune_sent_size),
+        ];
+        let control_recv = [
+            (&m.msgs_join_recv, &m.msgs_join_recv_size),
+            (&m.msgs_forward_join_recv, &m.msgs_forward_join_recv_size),
+            (&m.msgs_shuffle_recv, &m.msgs_shuffle_recv_size),
+            (&m.msgs_shuffle_reply_recv, &m.msgs_shuffle_reply_recv_size),
+            (&m.msgs_neighbor_recv, &m.msgs_neighbor_recv_size),
+            (&m.msgs_disconnect_recv, &m.msgs_disconnect_recv_size),
+            (&m.msgs_ihave_recv, &m.msgs_ihave_recv_size),
+            (&m.msgs_graft_recv, &m.msgs_graft_recv_size),
+            (&m.msgs_prune_recv, &m.msgs_prune_recv_size),
+        ];
+        let sum = |counters: &[(&iroh_metrics::Counter, &iroh_metrics::Counter)]| {
+            counters.iter().fold((0, 0), |(n, b), (count, size)| {
+                (n + count.get(), b + size.get())
+            })
+        };
+        assert_eq!(
+            (m.msgs_ctrl_sent.get(), m.msgs_ctrl_sent_size.get()),
+            sum(&control_sent)
+        );
+        assert_eq!(
+            (m.msgs_ctrl_recv.get(), m.msgs_ctrl_recv_size.get()),
+            sum(&control_recv)
+        );
     }
 
     /// Test that when a gossip topic is no longer needed it's actually unsubscribed.
