@@ -696,6 +696,7 @@ impl<PI: PeerIdentity> State<PI> {
     /// > membership. Furthermore, the record of IHAVE messages sent from failed members is deleted
     /// > from the missing history. (p9)
     fn on_neighbor_down(&mut self, peer: PI) {
+        self.lazy_push_queue.remove(&peer);
         self.missing_messages.retain(|_message_id, ihaves| {
             ihaves.retain(|(ihave_peer, _round)| *ihave_peer != peer);
             !ihaves.is_empty()
@@ -1122,6 +1123,31 @@ mod test {
             .iter()
             .map(|content| MessageId::from_content(content))
             .collect();
-        assert_eq!(offered, expected, "every cached id is offered once");
+        assert_eq!(offered, expected, "every cached id is offered");
+        assert_eq!(
+            frames.concat().len(),
+            count,
+            "every cached id is offered once"
+        );
+    }
+
+    /// A neighbor that goes down before the dispatch timer fires gets none of the offers queued
+    /// for it. An offer to a peer outside the view invites a `Graft`, and `on_graft` takes the
+    /// sender into the eager set without a HyParView link.
+    #[test]
+    fn a_neighbor_that_goes_down_before_the_dispatch_gets_no_offer() {
+        let config = Config::default();
+        let content = Bytes::from_static(b"before the neighbor came up");
+        let mut state = State::new(1, config.clone(), 1024);
+        let now = Instant::now();
+        let mut io = Io::new();
+        state.handle(InEvent::NeighborUp(2), now, &mut io);
+        state.handle(InEvent::Broadcast(content, Scope::Swarm), now, &mut io);
+        state.handle(InEvent::TimerExpired(Timer::DispatchLazyPush), now, &mut io);
+        io.clear();
+        state.handle(InEvent::NeighborUp(3), now, &mut io);
+        state.handle(InEvent::NeighborDown(3), now, &mut io);
+        state.handle(InEvent::TimerExpired(Timer::DispatchLazyPush), now, &mut io);
+        assert_eq!(ihaves_to(&io, 3), Vec::<Vec<IHave>>::new(), "{io:?}");
     }
 }
