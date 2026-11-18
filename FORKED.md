@@ -109,9 +109,14 @@ longer than the expiry on a relay path.
 A failed dial whose queue holds a `Join` sends the new `InEvent::DialFailed`, not
 `PeerDisconnected` (`net.rs`, `handle_dial_failed`): the queue stays for a connection that the peer
 opens to us, the `Join` keeps waiting in the protocol, and its expiry sends the `DisconnectPeer`
-that drops the queue. Any other failed dial drops the queue at once. A topic that sends a `Join`
-registers the peer in its connection map (`state.rs`), so that this `DisconnectPeer` reaches the
-network level also when the peer never sent us anything.
+that drops the queue. Any other failed dial drops the queue at once.
+
+`state.rs`: a topic that sends to a peer registers the peer in its connection map, as a topic that
+received from it does, so that its `DisconnectPeer` reaches the network level also when the peer
+never sent us anything. Upstream closed the connection on a `DisconnectPeer` of any topic that had
+the peer (`list.remove(&topic) || list.is_empty()`), and dropped the queue of a topic that still
+used the peer. Now only the last topic closes it; a topic before it sends `DisconnectPeerTopic`,
+and the network level drops only the frames of that topic from the queue of a dial.
 
 If upstream changes the disconnect in `handle_message`, keep the exception for a pending `Join`.
 

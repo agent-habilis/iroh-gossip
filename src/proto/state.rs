@@ -10,7 +10,6 @@ use tracing::trace;
 use crate::{
     metrics::Metrics,
     proto::{
-        hyparview,
         topic::{self, Command},
         util::idbytes_impls,
         Config, PeerData, PeerIdentity, MIN_MAX_MESSAGE_SIZE,
@@ -66,7 +65,7 @@ impl<PI> Message<PI> {
     pub(crate) fn is_join(&self) -> bool {
         matches!(
             self.message,
-            topic::Message::Swarm(hyparview::Message::Join(_))
+            topic::Message::Swarm(super::hyparview::Message::Join(_))
         )
     }
 }
@@ -141,6 +140,9 @@ pub enum OutEvent<PI> {
     ScheduleTimer(Duration, Timer<PI>),
     /// Close the connection to a peer on the network level.
     DisconnectPeer(PI),
+    /// One topic is done with a peer that another topic still uses: drop what waits for the peer
+    /// in this topic only, and keep the connection.
+    DisconnectPeerTopic(PI, TopicId),
     /// Updated peer data
     PeerData(PI, PeerData),
 }
@@ -336,12 +338,10 @@ fn handle_out_event<PI: PeerIdentity>(
     trace!("out: {event:?}");
     match event {
         topic::OutEvent::SendMessage(to, message) => {
-            // A topic that sends a `Join` wants the connection for the answer, as a topic that
-            // received a message does: its later `DisconnectPeer` (at the expiry of the `Join`)
-            // must reach the network level, also when the peer never sent us anything.
-            if matches!(message, topic::Message::Swarm(hyparview::Message::Join(_))) {
-                conns.entry(to).or_default().insert(topic);
-            }
+            // A topic that sends to a peer uses the peer, as a topic that received from it does:
+            // its later `DisconnectPeer` must reach the network level (also for a peer that never
+            // sent us anything), and must not close what another topic still uses.
+            conns.entry(to).or_default().insert(topic);
             outbox.push(OutEvent::SendMessage(to, Message { topic, message }))
         }
         topic::OutEvent::EmitEvent(event) => outbox.push(OutEvent::EmitEvent(topic, event)),
@@ -349,13 +349,16 @@ fn handle_out_event<PI: PeerIdentity>(
             outbox.push(OutEvent::ScheduleTimer(delay, Timer { topic, timer }))
         }
         topic::OutEvent::DisconnectPeer(peer) => {
-            let empty = conns
-                .get_mut(&peer)
-                .map(|list| list.remove(&topic) || list.is_empty())
-                .unwrap_or(false);
-            if empty {
-                conns.remove(&peer);
-                outbox.push(OutEvent::DisconnectPeer(peer));
+            // Only the last topic that uses the peer closes the connection. A topic before it
+            // drops only its own part. A peer that no topic uses has nothing to close.
+            if let Some(topics) = conns.get_mut(&peer) {
+                topics.remove(&topic);
+                if topics.is_empty() {
+                    conns.remove(&peer);
+                    outbox.push(OutEvent::DisconnectPeer(peer));
+                } else {
+                    outbox.push(OutEvent::DisconnectPeerTopic(peer, topic));
+                }
             }
         }
         topic::OutEvent::PeerData(peer, data) => outbox.push(OutEvent::PeerData(peer, data)),

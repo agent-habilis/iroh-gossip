@@ -1128,6 +1128,16 @@ impl Actor {
                     debug!(peer=%peer_id.fmt_short(), "gossip state indicates disconnect: drop peer");
                     forget_peer(&mut self.peers, &mut self.dialer, peer_id);
                 }
+                OutEvent::DisconnectPeerTopic(peer_id, topic_id) => {
+                    // Another topic still uses the peer: its connection stays, and only the frames
+                    // of this topic leave the queue of a dial.
+                    if let Some(PeerState::Pending { queue }) = self.peers.get_mut(&peer_id) {
+                        queue.retain(|message| message.topic != topic_id);
+                        if queue.is_empty() {
+                            forget_peer(&mut self.peers, &mut self.dialer, peer_id);
+                        }
+                    }
+                }
                 OutEvent::PeerData(endpoint_id, data) => match decode_peer_data(&data) {
                     Err(err) => warn!("Failed to decode {data:?} from {endpoint_id}: {err}"),
                     Ok(info) => {
@@ -4576,6 +4586,45 @@ pub(crate) mod tests {
         assert!(
             !rig.actor.peers.contains_key(&ghost),
             "a queue without a Join goes with the failed dial"
+        );
+        Ok(())
+    }
+
+    /// A `DisconnectPeer` of one topic leaves a peer that another topic still uses. Topic A
+    /// disconnects the peer (a message from it outside the active view), while topic B waits for
+    /// the answer to its `Join` to the same peer: the `Join` of B must stay queued.
+    #[tokio::test]
+    #[traced_test]
+    async fn a_disconnect_of_one_topic_keeps_the_queue_of_another() -> Result {
+        let mut rig = Rig::new(20, 1).await?;
+        let other: TopicId = blake3::hash(b"other topic").into();
+        rig.actor.topics.insert(other, TopicState::default());
+        let shared = SecretKey::from_bytes(&[15u8; 32]).public();
+        let now = Instant::now();
+        rig.actor
+            .handle_in_event(
+                proto::InEvent::Command(other, ProtoCommand::Join(vec![shared])),
+                now,
+            )
+            .await;
+        let shuffle_reply = ProtoMessage {
+            topic: rig.topic,
+            message: proto::topic::Message::Swarm(proto::hyparview::Message::ShuffleReply(
+                proto::hyparview::ShuffleReply::empty(),
+            )),
+        };
+        rig.actor
+            .handle_in_event(proto::InEvent::RecvMessage(shared, shuffle_reply), now)
+            .await;
+
+        let Some(PeerState::Pending { queue }) = rig.actor.peers.get(&shared) else {
+            panic!("the queue of the other topic must stay");
+        };
+        assert!(
+            queue
+                .iter()
+                .any(|message| message.topic == other && message.is_join()),
+            "the Join of the other topic stays queued"
         );
         Ok(())
     }
