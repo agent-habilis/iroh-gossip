@@ -73,10 +73,16 @@ pub enum Timer<PI> {
     /// We answered a `Neighbor` request of the peer a while ago: forget that we did, so that its
     /// next `Neighbor` is read as a request.
     AnsweredNeighborExpired(PI),
+    /// A `Join` that we sent got no answer: stop waiting for it (see [`State::pending_joins`]).
+    JoinExpired(PI),
 }
 
 /// How long a request made with [`InEvent::RequestNeighbors`] stays pending without an answer.
 const NEIGHBOR_REQUEST_EXPIRY: Duration = Duration::from_secs(20);
+
+/// How long a `Join` that we sent waits for its `Neighbor` answer. The same bound as a neighbor
+/// request: both wait for one `Neighbor` from the peer.
+const JOIN_EXPIRY: Duration = NEIGHBOR_REQUEST_EXPIRY;
 
 /// How many peers the application can name as uncounted. The rest of a longer list is ignored.
 pub(crate) const MAX_UNCOUNTED_PEERS: usize = 4;
@@ -152,7 +158,7 @@ pub struct ShuffleReply<PI> {
     nodes: Vec<PeerInfo<PI>>,
 }
 
-#[cfg(all(test, feature = "net"))]
+#[cfg(test)]
 impl<PI> ShuffleReply<PI> {
     /// A reply with no nodes: a message that a peer outside the active view can send.
     pub(crate) fn empty() -> Self {
@@ -303,6 +309,16 @@ pub struct State<PI, RG = ThreadRng> {
     /// flight (`handle_request_neighbors` skips pending peers and counts them against the free
     /// slots of the active view).
     answered_neighbors: indexmap::IndexSet<PI>,
+    /// The peers that we sent a `Join` to and that did not answer it yet.
+    ///
+    /// The peer stays outside our active view until its `Neighbor` answer comes. A message from a
+    /// peer outside the active view disconnects it (see [`Self::handle_message`]), but not while
+    /// its `Join` waits: the disconnect would close the connection that carries the answer. The
+    /// entry is spent by the `Neighbor` of the peer, and dropped with a `Disconnect`, a closed
+    /// connection, a leave, or after [`JOIN_EXPIRY`]. At the expiry a peer that is still outside
+    /// the active view is disconnected, as its first message would have done. A second `Join`
+    /// inside the period does not carry a generation, so the timer of the first can end its wait.
+    pending_joins: HashSet<PI>,
     /// The opaque user peer data we received for other peers
     peer_data: HashMap<PI, PeerData>,
     /// List of peers that are disconnecting, but which we want to keep in the passive set once the connection closes
@@ -338,6 +354,7 @@ where
             pending_neighbor_requests: Default::default(),
             request_timers: Default::default(),
             answered_neighbors: Default::default(),
+            pending_joins: Default::default(),
             peer_data: Default::default(),
             alive_disconnect_peers: Default::default(),
             left: Default::default(),
@@ -355,6 +372,7 @@ where
                 Timer::AnsweredNeighborExpired(peer) => {
                     self.answered_neighbors.shift_remove(&peer);
                 }
+                Timer::JoinExpired(peer) => self.handle_join_expired(peer, io),
             },
             InEvent::PeerDisconnected(peer) => self.handle_connection_closed(peer, io),
             InEvent::RequestJoin(peer) => self.handle_join(peer, io),
@@ -395,7 +413,10 @@ where
 
         // Disconnect from passive nodes right after receiving a message.
         // TODO(frando): I'm not sure anymore that this is correct. Maybe remove?
-        if !is_disconnect && !self.active_view.contains(&from) {
+        if !is_disconnect
+            && !self.active_view.contains(&from)
+            && !self.pending_joins.contains(&from)
+        {
             io.push(OutEvent::DisconnectPeer(from));
         }
     }
@@ -406,6 +427,19 @@ where
             peer,
             Message::Join(self.me_data.clone()),
         ));
+        self.pending_joins.insert(peer);
+        io.push(OutEvent::ScheduleTimer(
+            JOIN_EXPIRY,
+            Timer::JoinExpired(peer),
+        ));
+    }
+
+    /// A `Join` got no answer in time. A peer that is still outside the active view is
+    /// disconnected now: the messages that it sent while the `Join` waited did not do it.
+    fn handle_join_expired(&mut self, peer: PI, io: &mut impl IO<PI>) {
+        if self.pending_joins.remove(&peer) && !self.active_view.contains(&peer) {
+            io.push(OutEvent::DisconnectPeer(peer));
+        }
     }
 
     /// Ask peers for a link with low priority, for as many free slots as the active view has.
@@ -450,6 +484,7 @@ where
     fn on_disconnect(&mut self, peer: PI, details: Disconnect, io: &mut impl IO<PI>) {
         self.pending_neighbor_requests.remove(&peer);
         self.answered_neighbors.shift_remove(&peer);
+        self.pending_joins.remove(&peer);
         let is_alive = details.alive && !details.left;
         if self.active_view.contains(&peer) {
             self.remove_active(&peer, RemovalReason::DisconnectReceived { is_alive }, io);
@@ -466,6 +501,7 @@ where
     fn handle_connection_closed(&mut self, peer: PI, io: &mut impl IO<PI>) {
         self.pending_neighbor_requests.remove(&peer);
         self.answered_neighbors.shift_remove(&peer);
+        self.pending_joins.remove(&peer);
         if self.active_view.contains(&peer) {
             self.remove_active(&peer, RemovalReason::ConnectionClosed, io);
         } else if !self.alive_disconnect_peers.remove(&peer) {
@@ -507,6 +543,7 @@ where
         self.alive_disconnect_peers.remove(&peer);
         self.pending_neighbor_requests.remove(&peer);
         self.answered_neighbors.shift_remove(&peer);
+        self.pending_joins.remove(&peer);
         if !self.active_view.contains(&peer) {
             self.peer_data.remove(&peer);
         }
@@ -538,6 +575,7 @@ where
         let message = Message::Disconnect(Disconnect { alive, left });
         io.push(OutEvent::SendMessage(peer, message));
         io.push(OutEvent::DisconnectPeer(peer));
+        self.pending_joins.remove(&peer);
     }
 
     fn on_join(&mut self, peer: PI, data: Option<PeerData>, io: &mut impl IO<PI>) {
@@ -678,6 +716,8 @@ where
     fn on_neighbor(&mut self, from: PI, details: Neighbor, io: &mut impl IO<PI>) {
         // Both entries are spent by this message, so that a doubled `Neighbor` is read as an
         // answer once and not answered, whichever of the two the first one found.
+        // A `Neighbor` is the answer to a `Join` that we sent, if one waits.
+        self.pending_joins.remove(&from);
         let was_asked = self.pending_neighbor_requests.remove(&from);
         let was_answered = self.answered_neighbors.shift_remove(&from);
         let is_reply = was_asked || was_answered;
@@ -1475,6 +1515,76 @@ mod tests {
         io.clear();
         a.handle(InEvent::RequestNeighbors(vec![3, 4]), &mut io);
         assert_eq!(low_neighbor_requests(&io), vec![4]);
+    }
+
+    fn disconnects(io: &Io, peer: u64) -> usize {
+        io.iter()
+            .filter(|e| matches!(e, topic::OutEvent::DisconnectPeer(p) if *p == peer))
+            .count()
+    }
+
+    // A peer that we sent a `Join` to is outside our active view until its `Neighbor` answer
+    // comes. Another message from it before the answer (a `ShuffleReply` of an older shuffle) must
+    // not disconnect it: the network layer would close the connection that carries the answer.
+    #[test]
+    fn a_message_before_the_answer_to_a_join_does_not_disconnect_the_peer() {
+        let mut a = state(0);
+        let mut io = Io::new();
+        a.handle(InEvent::RequestJoin(10), &mut io);
+        io.clear();
+
+        recv(
+            &mut a,
+            10,
+            Message::ShuffleReply(ShuffleReply::empty()),
+            &mut io,
+        );
+        assert_eq!(disconnects(&io, 10), 0, "the Join waits for its answer");
+
+        recv(&mut a, 10, neighbor(Priority::High), &mut io);
+        assert!(a.active_view.contains(&10), "the answer makes the link");
+        assert_eq!(disconnects(&io, 10), 0);
+    }
+
+    // The wait for the answer to a `Join` is bounded: at its expiry a peer that did not answer is
+    // disconnected, as its first message would have done. A peer that answered stays.
+    #[test]
+    fn an_unanswered_join_disconnects_the_peer_at_its_expiry() {
+        let mut a = state(0);
+        let mut io = Io::new();
+        a.handle(InEvent::RequestJoin(10), &mut io);
+        a.handle(InEvent::RequestJoin(11), &mut io);
+        let expiries: Vec<_> = io
+            .iter()
+            .filter_map(|event| match event {
+                topic::OutEvent::ScheduleTimer(
+                    after,
+                    topic::Timer::Swarm(Timer::JoinExpired(peer)),
+                ) => Some((*after, *peer)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(expiries, vec![(JOIN_EXPIRY, 10), (JOIN_EXPIRY, 11)]);
+        recv(
+            &mut a,
+            10,
+            Message::ShuffleReply(ShuffleReply::empty()),
+            &mut io,
+        );
+        recv(&mut a, 11, neighbor(Priority::High), &mut io);
+        io.clear();
+
+        a.handle(InEvent::TimerExpired(Timer::JoinExpired(10)), &mut io);
+        a.handle(InEvent::TimerExpired(Timer::JoinExpired(11)), &mut io);
+
+        assert_eq!(
+            disconnects(&io, 10),
+            1,
+            "no answer: the peer is disconnected"
+        );
+        assert_eq!(disconnects(&io, 11), 0, "the peer answered: the link stays");
+        assert!(a.active_view.contains(&11));
+        assert!(a.pending_joins.is_empty());
     }
 
     #[test]

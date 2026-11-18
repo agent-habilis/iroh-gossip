@@ -89,15 +89,17 @@ it read, and the counters are atomic adds. The connection loops hold the `Arc<Me
 
 If upstream starts to count these, drop this change and keep their names.
 
-## A disconnect during a dial delivers the queue of the dial first
+## A peer whose `Join` waits for its answer is not disconnected
 
-`net.rs`: the protocol sends `DisconnectPeer` after any message from a peer outside its active
-view. If that comes while we dial the peer, the actor used to remove the peer, and the messages
-that waited for the dial were lost. A `Join` is sent once, so after `leave_peers` a `join_peers`
-could fail for good when a shuffle reply from the peer came in during a slow dial (CI saw it in
-`leave_peers_is_not_undone_by_shuffles_of_a_third_peer`). Now a peer that is still pending and has
-a queue is marked `disconnect_after_flush`: the dial delivers the queue, and then the peer is
-dropped, so its connection drains and closes, as the connection of an active peer does on
-`DisconnectPeer`. A new send to the peer clears the mark.
+`proto/hyparview.rs`: the protocol sends `DisconnectPeer` after any message from a peer outside its
+active view. A peer that we sent a `Join` to is outside the view until its `Neighbor` answer
+comes, so a message from it before the answer (a shuffle reply) disconnected it. If that came
+while we dialed the peer, the actor removed the peer and the `Join` in the queue of the dial. A
+`Join` is sent once, so after `leave_peers` a `join_peers` could fail for good (CI saw it in
+`leave_peers_is_not_undone_by_shuffles_of_a_third_peer`). On a live connection the disconnect
+closed the connection that carries the answer. Now `pending_joins` holds each peer whose `Join`
+waits: no `DisconnectPeer` goes to it until its `Neighbor`, a `Disconnect`, a closed connection, a
+leave, or `JOIN_EXPIRY` (20 s, the bound of a neighbor request). At the expiry a peer outside the
+active view is disconnected.
 
-If upstream changes `PeerState` or the `DisconnectPeer` arm, keep the queue of a pending peer.
+If upstream changes the disconnect in `handle_message`, keep the exception for a pending `Join`.

@@ -583,21 +583,10 @@ impl Actor {
 
     /// A dial to the peer failed. A peer with a connection keeps it. A peer that waits for the dial
     /// is disconnected in the protocol, and its queue stays for a connection that the peer opens
-    /// to us, unless the protocol disconnected the peer during the dial: then the queue was only
-    /// kept for this dial, and nothing else would remove it.
+    /// to us.
     async fn handle_dial_failed(&mut self, peer_id: EndpointId) {
         let peer_state = self.peers.get(&peer_id);
         let is_active = matches!(peer_state, Some(PeerState::Active { .. }));
-        if matches!(
-            peer_state,
-            Some(PeerState::Pending {
-                disconnect_after_flush: true,
-                ..
-            })
-        ) {
-            debug!(peer = %peer_id.fmt_short(), "dial of a disconnected peer failed: drop its queue");
-            self.peers.remove(&peer_id);
-        }
         if !is_active {
             self.handle_in_event(InEvent::PeerDisconnected(peer_id), Instant::now())
                 .await;
@@ -668,13 +657,6 @@ impl Actor {
             dialed_by_lower,
             rx_clock.clone(),
         );
-        let disconnect_after_flush = matches!(
-            self.peers.get(&peer_id),
-            Some(PeerState::Pending {
-                disconnect_after_flush: true,
-                ..
-            })
-        );
         // A connection that is not chosen gets a sender too and keeps reading: the peer may send
         // on it. See [`conns`].
         let (queue, actions) = self
@@ -711,11 +693,6 @@ impl Actor {
             }
             .instrument(error_span!("conn", peer = %peer_id.fmt_short())),
         );
-        if disconnect_after_flush {
-            // Dropping the sender ends the send loop after the queue: it drains and closes.
-            debug!(peer = %peer_id.fmt_short(), "queue handed to the connection: drop peer");
-            self.peers.remove(&peer_id);
-        }
     }
 
     /// Does what the set of connections of a peer asks for after a change.
@@ -1077,12 +1054,7 @@ impl Actor {
                                 }
                             }
                         },
-                        PeerState::Pending {
-                            queue,
-                            disconnect_after_flush,
-                        } => {
-                            // A send after the disconnect wants the peer again.
-                            *disconnect_after_flush = false;
+                        PeerState::Pending { queue } => {
                             // Dial on every send, not only on an empty queue: a failed
                             // dial leaves the queue non-empty, which used to stop every
                             // later send from dialing. `Dialer::queue_dial` already
@@ -1133,22 +1105,11 @@ impl Actor {
                 OutEvent::ScheduleTimer(delay, timer) => {
                     self.timers.insert(now + delay, timer);
                 }
-                OutEvent::DisconnectPeer(peer_id) => match self.peers.get_mut(&peer_id) {
-                    // The messages that wait for the dial go out first. Dropping them here would
-                    // lose a `Join` sent just before, and the protocol does not send it again.
-                    Some(PeerState::Pending {
-                        queue,
-                        disconnect_after_flush,
-                    }) if !queue.is_empty() => {
-                        debug!(peer=%peer_id.fmt_short(), "gossip state indicates disconnect: drop peer after the dial delivers its queue");
-                        *disconnect_after_flush = true;
-                    }
-                    _ => {
-                        // signal disconnection by dropping the senders to the connection
-                        debug!(peer=%peer_id.fmt_short(), "gossip state indicates disconnect: drop peer");
-                        self.peers.remove(&peer_id);
-                    }
-                },
+                OutEvent::DisconnectPeer(peer_id) => {
+                    // signal disconnection by dropping the senders to the connection
+                    debug!(peer=%peer_id.fmt_short(), "gossip state indicates disconnect: drop peer");
+                    self.peers.remove(&peer_id);
+                }
                 OutEvent::PeerData(endpoint_id, data) => match decode_peer_data(&data) {
                     Err(err) => warn!("Failed to decode {data:?} from {endpoint_id}: {err}"),
                     Ok(info) => {
@@ -1185,10 +1146,6 @@ struct ConnHandle {
 enum PeerState {
     Pending {
         queue: Vec<ProtoMessage>,
-        /// The protocol disconnected the peer while the dial was in flight. The queue still goes
-        /// out on the connection of the dial, which then drains and closes, as the connection of
-        /// an active peer does on a disconnect.
-        disconnect_after_flush: bool,
     },
     Active {
         /// The connections to the peer: the one that sends go to, and the ones that are parked.
@@ -1325,10 +1282,7 @@ impl PeerState {
 
 impl Default for PeerState {
     fn default() -> Self {
-        PeerState::Pending {
-            queue: Vec::new(),
-            disconnect_after_flush: false,
-        }
+        PeerState::Pending { queue: Vec::new() }
     }
 }
 
@@ -4502,10 +4456,11 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    /// A `DisconnectPeer` that comes while we dial a peer keeps what waits for the dial. After a
+    /// A message from a peer that we dial for a `Join` keeps what waits for the dial. After a
     /// `Join` to a peer outside the active view, a message from that peer (a shuffle reply on
-    /// another connection) makes the protocol disconnect it. The `Join` waits in the queue of the
-    /// dial, and the protocol never sends a lost `Join` again, so the pair stays apart.
+    /// another connection) used to make the protocol disconnect it, and the actor dropped the
+    /// queue of the dial with the peer. The protocol never sends a lost `Join` again, so the pair
+    /// stayed apart. Now the protocol does not disconnect a peer whose `Join` waits for its answer.
     #[tokio::test]
     #[traced_test]
     async fn a_disconnect_while_we_dial_keeps_the_queued_join() -> Result {
@@ -4537,59 +4492,6 @@ pub(crate) mod tests {
                 proto::topic::Message::Swarm(proto::hyparview::Message::Join(_))
             )),
             "the Join must stay queued"
-        );
-        Ok(())
-    }
-
-    /// A peer that the protocol disconnected during the dial goes when the dial fails: nothing
-    /// else would remove its queue. A queue without the disconnect stays for a connection that the
-    /// peer opens to us.
-    #[tokio::test]
-    #[traced_test]
-    async fn a_failed_dial_retires_a_peer_that_was_disconnected_during_it() -> Result {
-        let mut rig = Rig::new(15, 1).await?;
-        let disconnected = SecretKey::from_bytes(&[9u8; 32]).public();
-        let waiting = SecretKey::from_bytes(&[10u8; 32]).public();
-        let now = Instant::now();
-        rig.actor
-            .handle_in_event(
-                proto::InEvent::Command(rig.topic, ProtoCommand::Join(vec![disconnected, waiting])),
-                now,
-            )
-            .await;
-        let shuffle_reply = ProtoMessage {
-            topic: rig.topic,
-            message: proto::topic::Message::Swarm(proto::hyparview::Message::ShuffleReply(
-                proto::hyparview::ShuffleReply::empty(),
-            )),
-        };
-        rig.actor
-            .handle_in_event(
-                proto::InEvent::RecvMessage(disconnected, shuffle_reply),
-                now,
-            )
-            .await;
-        assert!(matches!(
-            rig.actor.peers.get(&disconnected),
-            Some(PeerState::Pending {
-                disconnect_after_flush: true,
-                ..
-            })
-        ));
-
-        rig.actor.handle_dial_failed(disconnected).await;
-        rig.actor.handle_dial_failed(waiting).await;
-
-        assert!(
-            rig.actor.peers.get(&disconnected).is_none(),
-            "the disconnected peer and its queue must go"
-        );
-        assert!(
-            matches!(
-                rig.actor.peers.get(&waiting),
-                Some(PeerState::Pending { queue, .. }) if !queue.is_empty()
-            ),
-            "the queue of a peer that was not disconnected stays"
         );
         Ok(())
     }
