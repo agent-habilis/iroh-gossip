@@ -115,3 +115,14 @@ marks it (`dial_failed_at`), a new send to the peer clears the mark (it dials ag
 waits for the answer to a `Join`).
 
 If upstream changes `PeerState::Pending` or the failed-dial arm, keep the queue and its bound.
+
+## Version 0.103.0 of the fork is not upstream 0.103.0
+
+`Cargo.toml`, `metrics.rs`: the fork adds public fields to `Metrics` (the byte counters above). Its
+`Metrics` had no `#[non_exhaustive]`, so a new field breaks a struct literal, and
+`cargo semver-checks` asks for a new major version (`constructible_struct_adds_field`). The fork
+marks `Metrics` `#[non_exhaustive]`, as upstream did in c5f44db7 (upstream 0.102.0 has it), and
+moves to 0.103.0. Later counters then add no break. The fork's 0.103.0 is its own release: it is
+not upstream 0.103.0, and the fork is pinned by git revision, so Cargo never mixes the two.
+
+If the fork moves to an upstream release, take its version and keep `#[non_exhaustive]`.
