@@ -197,6 +197,19 @@ pub enum Scope {
 }
 
 impl Gossip {
+    /// The message that a broadcast of `content` sends first.
+    pub(crate) fn first_round(content: Bytes, scope: Scope) -> Self {
+        let scope = match scope {
+            Scope::Neighbors => DeliveryScope::Neighbors,
+            Scope::Swarm => DeliveryScope::Swarm(Round(0)),
+        };
+        Gossip {
+            id: MessageId::from_content(&content),
+            content,
+            scope,
+        }
+    }
+
     /// Get a clone of this `Gossip` message and increase the delivery round by 1.
     pub fn next_round(&self) -> Option<Gossip> {
         match self.scope {
@@ -465,12 +478,8 @@ impl<PI: PeerIdentity> State<PI> {
     /// Will be pushed in full to eager peers.
     /// Pushing the message id to the lazy peers is delayed by a timer.
     fn broadcast(&mut self, content: Bytes, scope: Scope, now: Instant, io: &mut impl IO<PI>) {
-        let id = MessageId::from_content(&content);
-        let scope = match scope {
-            Scope::Neighbors => DeliveryScope::Neighbors,
-            Scope::Swarm => DeliveryScope::Swarm(Round(0)),
-        };
-        let message = Gossip { id, content, scope };
+        let message = Gossip::first_round(content, scope);
+        let (id, scope) = (message.id, message.scope);
         let me = self.me;
         if let DeliveryScope::Swarm(_) = scope {
             self.received_messages

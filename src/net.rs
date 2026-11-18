@@ -2281,17 +2281,22 @@ pub(crate) mod tests {
         .await
         .unwrap();
 
+        let frame: crate::proto::topic::Message<PublicKey> =
+            crate::proto::topic::Message::Gossip(crate::proto::plumtree::Message::Gossip(
+                crate::proto::plumtree::Gossip::first_round(payload, crate::proto::Scope::Swarm),
+            ));
+        let frame_size = postcard::experimental::serialized_size(&frame).unwrap() as u64 + 4;
         let (sent, got) = (go1.metrics(), go2.metrics());
-        assert!(sent.msgs_data_sent.get() >= 1, "go1 sent data");
-        assert!(sent.msgs_gossip_sent.get() >= 1, "as a Gossip message");
-        assert!(
-            sent.msgs_data_sent_size.get() >= 300 + 4,
-            "the size holds the payload and the prefix: {}",
-            sent.msgs_data_sent_size.get()
+        assert_eq!(sent.msgs_data_sent.get(), 1, "go1 sent 1 data message");
+        assert_eq!(sent.msgs_gossip_sent.get(), 1, "as a Gossip message");
+        assert_eq!(
+            sent.msgs_data_sent_size.get(),
+            frame_size,
+            "the size is the encoded message and the 4 bytes of prefix"
         );
-        assert!(got.msgs_data_recv.get() >= 1, "go2 received data");
-        assert!(got.msgs_gossip_recv.get() >= 1);
-        assert!(got.msgs_data_recv_size.get() >= 300 + 4);
+        assert_eq!(got.msgs_data_recv.get(), 1, "go2 received 1 data message");
+        assert_eq!(got.msgs_gossip_recv.get(), 1);
+        assert_eq!(got.msgs_data_recv_size.get(), frame_size);
         assert!(
             got.msgs_ctrl_sent.get() >= 1 && got.msgs_ctrl_sent_size.get() > 0,
             "go2 joined with control messages"
