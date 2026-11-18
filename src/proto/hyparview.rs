@@ -92,7 +92,7 @@ const JOIN_EXPIRY: Duration = NEIGHBOR_REQUEST_EXPIRY;
 
 /// A `Join` that waits for its answer, see [`State::pending_joins`].
 #[derive(Debug)]
-struct PendingJoin {
+pub(crate) struct PendingJoin {
     /// Tells this `Join` from an older one to the same peer, when the older timer ends.
     generation: u64,
     /// A disconnect of the peer waits for the expiry: the peer sent a message while it was
@@ -336,7 +336,7 @@ pub struct State<PI, RG = ThreadRng> {
     /// `Join` for a connection that the peer opens to us. The entry is spent by the `Neighbor` of
     /// the peer, and dropped with a `Disconnect`, a closed connection, a leave, or after
     /// [`JOIN_EXPIRY`] (see [`PendingJoin`]).
-    pending_joins: HashMap<PI, PendingJoin>,
+    pub(crate) pending_joins: HashMap<PI, PendingJoin>,
     /// The generation of the next `Join`, see [`Timer::JoinExpired`].
     next_join_generation: u64,
     /// The opaque user peer data we received for other peers

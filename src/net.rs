@@ -347,6 +347,9 @@ struct Actor {
     /// the arms that carry data, so a busy actor can send to the dead connection for a long time
     /// before that arm runs.
     dead_conns: VecDeque<(EndpointId, ConnId)>,
+    /// Pending peers whose dial was dropped with their last queued frame (`drop_topic_frames`), to
+    /// report to the protocol as disconnected after the current event.
+    abandoned_dials: VecDeque<EndpointId>,
     /// See [`SEND_REFUSED_DEADLINE`]. A field so that a test can shorten it.
     send_refused_deadline: Duration,
     /// The capacity of the event queue of each topic, see [`Builder::topic_event_capacity`].
@@ -402,6 +405,7 @@ impl Actor {
             address_lookup,
             overflow_disconnects: Default::default(),
             dead_conns: Default::default(),
+            abandoned_dials: Default::default(),
             send_refused_deadline: SEND_REFUSED_DEADLINE,
             topic_event_capacity,
         };
@@ -896,7 +900,20 @@ impl Actor {
     async fn drain_queues(&mut self) {
         self.process_overflow_disconnects().await;
         self.process_dead_conns().await;
+        self.process_abandoned_dials().await;
         self.process_quit_queue().await;
+    }
+
+    /// Tells the protocol that a peer whose dial was dropped is disconnected, so that the topics
+    /// that still waited for the dial do not wait for ever. A peer that a later send of the same
+    /// event made pending again has a new dial, and nothing to report.
+    async fn process_abandoned_dials(&mut self) {
+        while let Some(peer_id) = self.abandoned_dials.pop_front() {
+            if !self.peers.contains_key(&peer_id) {
+                self.handle_in_event_inner(InEvent::PeerDisconnected(peer_id), Instant::now())
+                    .await;
+            }
+        }
     }
 
     /// Drops the connections whose send loop ended, as the result of their task would
@@ -1128,16 +1145,13 @@ impl Actor {
                     debug!(peer=%peer_id.fmt_short(), "gossip state indicates disconnect: drop peer");
                     forget_peer(&mut self.peers, &mut self.dialer, peer_id);
                 }
-                OutEvent::DisconnectPeerTopic(peer_id, topic_id) => {
-                    // Another topic still uses the peer: its connection stays, and only the frames
-                    // of this topic leave the queue of a dial.
-                    if let Some(PeerState::Pending { queue }) = self.peers.get_mut(&peer_id) {
-                        queue.retain(|message| message.topic != topic_id);
-                        if queue.is_empty() {
-                            forget_peer(&mut self.peers, &mut self.dialer, peer_id);
-                        }
-                    }
-                }
+                OutEvent::DisconnectPeerTopic(peer_id, topic_id) => drop_topic_frames(
+                    &mut self.peers,
+                    &mut self.dialer,
+                    &mut self.abandoned_dials,
+                    peer_id,
+                    topic_id,
+                ),
                 OutEvent::PeerData(endpoint_id, data) => match decode_peer_data(&data) {
                     Err(err) => warn!("Failed to decode {data:?} from {endpoint_id}: {err}"),
                     Ok(info) => {
@@ -1195,6 +1209,27 @@ fn forget_peer(
         dialer.cancel_dial(peer_id);
     }
     state
+}
+
+/// One topic is done with a peer that another topic still uses: its connection stays, and only the
+/// frames of this topic leave the queue of a dial. A queue that becomes empty drops the peer and
+/// its dial, and the peer goes to `abandoned_dials`: the other topics wait for that dial, so the
+/// protocol must hear that the peer is disconnected (`Actor::process_abandoned_dials`).
+fn drop_topic_frames(
+    peers: &mut HashMap<EndpointId, PeerState>,
+    dialer: &mut Dialer,
+    abandoned_dials: &mut VecDeque<EndpointId>,
+    peer_id: EndpointId,
+    topic_id: TopicId,
+) {
+    let Some(PeerState::Pending { queue }) = peers.get_mut(&peer_id) else {
+        return;
+    };
+    queue.retain(|message| message.topic != topic_id);
+    if queue.is_empty() {
+        forget_peer(peers, dialer, peer_id);
+        abandoned_dials.push_back(peer_id);
+    }
 }
 
 /// How often the connections of the peers are looked at.
@@ -4625,6 +4660,47 @@ pub(crate) mod tests {
                 .iter()
                 .any(|message| message.topic == other && message.is_join()),
             "the Join of the other topic stays queued"
+        );
+        Ok(())
+    }
+
+    /// A topic drop that empties the queue of a dial drops the peer and its dial, and the
+    /// protocol hears that the peer is disconnected: a topic that waited for the dial must not
+    /// wait for ever.
+    #[tokio::test]
+    #[traced_test]
+    async fn a_topic_drop_that_empties_a_queue_reports_the_peer_disconnected() -> Result {
+        let mut rig = Rig::new(21, 1).await?;
+        let joined = SecretKey::from_bytes(&[16u8; 32]).public();
+        rig.actor
+            .handle_in_event(
+                proto::InEvent::Command(rig.topic, ProtoCommand::Join(vec![joined])),
+                Instant::now(),
+            )
+            .await;
+        let waits = |actor: &Actor| {
+            actor
+                .state
+                .state(&rig.topic)
+                .is_some_and(|state| state.swarm.pending_joins.contains_key(&joined))
+        };
+        assert!(waits(&rig.actor), "the Join waits for its answer");
+
+        let actor = &mut rig.actor;
+        drop_topic_frames(
+            &mut actor.peers,
+            &mut actor.dialer,
+            &mut actor.abandoned_dials,
+            joined,
+            rig.topic,
+        );
+        actor.drain_queues().await;
+
+        assert!(!actor.peers.contains_key(&joined), "the empty queue goes");
+        assert!(!actor.dialer.is_pending(joined), "and its dial");
+        assert!(
+            !waits(actor),
+            "the protocol hears that the peer is disconnected"
         );
         Ok(())
     }
