@@ -476,11 +476,16 @@ where
         ));
         let generation = self.next_join_generation;
         self.next_join_generation += 1;
+        // A `Join` sent again while one waits keeps a disconnect that was put off to the expiry.
+        let disconnect_at_expiry = self
+            .pending_joins
+            .get(&peer)
+            .is_some_and(|join| join.disconnect_at_expiry);
         self.pending_joins.insert(
             peer,
             PendingJoin {
                 generation,
-                disconnect_at_expiry: false,
+                disconnect_at_expiry,
             },
         );
         io.push(OutEvent::ScheduleTimer(
@@ -1703,6 +1708,29 @@ mod tests {
 
         assert_eq!(disconnects(&io, 10), 0, "the dial of the Join stays");
         assert!(a.pending_joins.is_empty(), "the wait ends");
+    }
+
+    // A `Join` sent again while the first one waits keeps the disconnect that a message of the
+    // peer put off to the expiry: the peer is still outside the active view, and the new wait
+    // must not forget it.
+    #[test]
+    fn a_join_sent_again_keeps_the_disconnect_put_off_to_the_expiry() {
+        let mut a = state(0);
+        let mut io = Io::new();
+        a.handle(InEvent::RequestJoin(10), &mut io);
+        recv(&mut a, 10, shuffle_reply(), &mut io);
+        io.clear();
+        a.handle(InEvent::RequestJoin(10), &mut io);
+        let (_, newer) = join_timer(&io, 10);
+        io.clear();
+
+        expire(&mut a, newer, &mut io);
+
+        assert_eq!(
+            disconnects(&io, 10),
+            1,
+            "the put-off disconnect comes at the expiry of the new Join"
+        );
     }
 
     // The timer of an older `Join` does not end the wait of a newer `Join` to the same peer
