@@ -192,6 +192,11 @@ the peer (`list.remove(&topic) || list.is_empty()`), and dropped the queue of a 
 used the peer. Now only the last topic closes it; a topic before it sends `DisconnectPeerTopic`,
 and the network level drops only the frames of that topic from the queue of a dial.
 
+A leave (`InEvent::Leave`) of a peer whose `Join` waits and that is not in the active view sends
+`DisconnectPeer`. The tombstone forgets the `Join` in the protocol, but the network level still held
+it in the queue of the dial and delivered it if the dial connected, to a peer that we left. The
+state level makes it a `DisconnectPeerTopic` while another topic uses the peer.
+
 If upstream changes the disconnect in `handle_message`, keep the exception for a pending `Join`.
 
 ## Version 0.103.0 of the fork is not upstream 0.103.0

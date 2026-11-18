@@ -619,6 +619,10 @@ where
                 // `send_disconnect` sends a `ShuffleReply` first, so the far side learns some of
                 // our other peers. Look here first if links to the leaver still come back.
                 self.send_disconnect(peer, false, true, io);
+            } else if self.pending_joins.contains_key(&peer) {
+                // The IO layer still holds the `Join` for the dial. Only this topic drops it: the
+                // state level makes this a `DisconnectPeerTopic` while another topic uses the peer.
+                io.push(OutEvent::DisconnectPeer(peer));
             }
             self.add_tombstone(peer);
         }
@@ -1731,6 +1735,26 @@ mod tests {
             1,
             "the put-off disconnect comes at the expiry of the new Join"
         );
+    }
+
+    // A leave of a peer whose `Join` waits disconnects the peer, so that the IO layer drops the
+    // `Join` that it still holds for the dial. The protocol forgets the `Join`, and without the
+    // disconnect a dial that connects later would deliver it to a peer that we left.
+    #[test]
+    fn a_leave_of_a_peer_whose_join_waits_disconnects_it() {
+        let mut a = state(0);
+        let mut io = Io::new();
+        a.handle(InEvent::RequestJoin(10), &mut io);
+        io.clear();
+
+        a.handle(InEvent::Leave(vec![10]), &mut io);
+
+        assert_eq!(
+            disconnects(&io, 10),
+            1,
+            "the IO layer drops the waiting Join"
+        );
+        assert!(a.pending_joins.is_empty());
     }
 
     // The timer of an older `Join` does not end the wait of a newer `Join` to the same peer
