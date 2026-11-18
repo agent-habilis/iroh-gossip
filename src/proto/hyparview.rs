@@ -491,6 +491,9 @@ where
     fn handle_dial_failed(&mut self, peer: PI, io: &mut impl IO<PI>) {
         match self.pending_joins.remove(&peer) {
             Some(mut join) => {
+                // The failed dial is a closed connection for every other state (the passive view
+                // and the peer data go, as on `PeerDisconnected`); only the waiting `Join` is put
+                // back, because the IO layer still holds it for the peer.
                 self.handle_connection_closed(peer, io);
                 join.disconnect_at_expiry = true;
                 self.pending_joins.insert(peer, join);

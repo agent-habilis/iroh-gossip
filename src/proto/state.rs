@@ -305,6 +305,7 @@ impl<PI: PeerIdentity, R: Rng + SeedableRng> State<PI, R> {
 
                 if quit {
                     self.states.remove(&topic);
+                    self.forget_topic(topic);
                 }
             }
             // when a peer disconnected on the network level, forward event to all states
@@ -318,6 +319,11 @@ impl<PI: PeerIdentity, R: Rng + SeedableRng> State<PI, R> {
                         handle_out_event(*topic, event, &mut self.peer_topics, &mut self.outbox);
                     }
                 }
+                // The connection is gone, so no topic uses the peer any more. A stale entry would
+                // turn the last real disconnect of the peer into a partial one.
+                if let topic::InEvent::PeerDisconnected(peer) = &event {
+                    self.peer_topics.remove(peer);
+                }
             }
         }
 
@@ -326,6 +332,18 @@ impl<PI: PeerIdentity, R: Rng + SeedableRng> State<PI, R> {
         }
 
         self.outbox.drain(..)
+    }
+
+    /// A topic that quit uses no peer any more. A peer that no other topic uses is disconnected:
+    /// the disconnects that the quit itself sent cover only the peers of its active view.
+    fn forget_topic(&mut self, topic: TopicId) {
+        let outbox = &mut self.outbox;
+        self.peer_topics.retain(|peer, topics| {
+            if topics.remove(&topic) && topics.is_empty() {
+                outbox.push(OutEvent::DisconnectPeer(*peer));
+            }
+            !topics.is_empty()
+        });
     }
 }
 
@@ -406,5 +424,84 @@ mod tests {
         assert!(gossip(plumtree::Message::IHave(Vec::new())).is_droppable());
         assert!(!gossip(plumtree::Message::Prune).is_droppable());
         assert!(!swarm(hyparview::Message::Join(None)).is_droppable());
+    }
+
+    type TestState = State<u64, rand::rngs::ChaCha12Rng>;
+
+    fn test_state() -> TestState {
+        State::new(
+            0,
+            PeerData::new(Vec::new()),
+            Config::default(),
+            rand::SeedableRng::seed_from_u64(0),
+        )
+    }
+
+    fn command(state: &mut TestState, topic: TopicId, command: Command<u64>) -> Vec<OutEvent<u64>> {
+        state
+            .handle(InEvent::Command(topic, command), Instant::now(), None)
+            .collect()
+    }
+
+    fn shuffle_reply(topic: TopicId) -> Message<u64> {
+        Message {
+            topic,
+            message: topic::Message::Swarm(hyparview::Message::ShuffleReply(
+                hyparview::ShuffleReply::empty(),
+            )),
+        }
+    }
+
+    // A closed connection leaves no topic on the peer. Topic B joined peer 7, the connection
+    // closed, and then peer 7 sends to topic A, where it is not active: the disconnect of A is the
+    // last one and must close the connection, not leave it to a stale entry of B.
+    #[test]
+    fn a_closed_connection_leaves_no_topic_on_the_peer() {
+        let (a, b) = (TopicId::from([1u8; 32]), TopicId::from([2u8; 32]));
+        let mut state = test_state();
+        command(&mut state, a, Command::Join(Vec::new()));
+        command(&mut state, b, Command::Join(vec![7]));
+        let _: Vec<_> = state
+            .handle(InEvent::PeerDisconnected(7), Instant::now(), None)
+            .collect();
+
+        let out: Vec<_> = state
+            .handle(
+                InEvent::RecvMessage(7, shuffle_reply(a)),
+                Instant::now(),
+                None,
+            )
+            .collect();
+
+        let full = out
+            .iter()
+            .filter(|e| matches!(e, OutEvent::DisconnectPeer(7)))
+            .count();
+        let partial = out
+            .iter()
+            .filter(|e| matches!(e, OutEvent::DisconnectPeerTopic(7, _)))
+            .count();
+        assert_eq!((full, partial), (1, 0), "the connection must close");
+    }
+
+    // The map of the topics that use each peer is empty once every topic quit.
+    #[test]
+    fn no_peer_keeps_a_topic_after_all_topics_quit() {
+        let (a, b) = (TopicId::from([1u8; 32]), TopicId::from([2u8; 32]));
+        let mut state = test_state();
+        command(&mut state, a, Command::Join(Vec::new()));
+        command(&mut state, b, Command::Join(vec![7]));
+        let _: Vec<_> = state
+            .handle(
+                InEvent::RecvMessage(8, shuffle_reply(a)),
+                Instant::now(),
+                None,
+            )
+            .collect();
+
+        command(&mut state, a, Command::Quit);
+        command(&mut state, b, Command::Quit);
+
+        assert!(state.peer_topics.is_empty(), "{:?}", state.peer_topics);
     }
 }
