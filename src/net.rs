@@ -946,6 +946,7 @@ impl Actor {
 
     async fn process_quit_queue(&mut self) {
         while let Some(topic_id) = self.quit_queue.pop_front() {
+            self.drop_queued_frames_of(topic_id);
             self.handle_in_event_inner(
                 InEvent::Command(topic_id, ProtoCommand::Quit),
                 Instant::now(),
@@ -955,6 +956,21 @@ impl Actor {
                 tracing::debug!(%topic_id, "publishers and subscribers gone; unsubscribing");
             }
         }
+    }
+
+    /// Takes the frames of a topic that quits out of the queues of the dials. A dial that
+    /// connects after the quit would deliver them, and a `Join` among them would put us into the
+    /// view of the peer for a topic that we left. A queue that becomes empty has nothing to
+    /// deliver, so its peer goes. The `Disconnect` frames that the quit itself sends come after
+    /// this.
+    fn drop_queued_frames_of(&mut self, topic_id: TopicId) {
+        self.peers.retain(|_peer_id, state| match state {
+            PeerState::Pending { queue, .. } => {
+                queue.retain(|message| message.topic != topic_id);
+                !queue.is_empty()
+            }
+            PeerState::Active { .. } => true,
+        });
     }
 
     // Stays `async`: it must never wait on a peer, and the test
@@ -4504,6 +4520,37 @@ pub(crate) mod tests {
             )),
             "the Join must stay queued"
         );
+        Ok(())
+    }
+
+    /// A topic that quits takes its frames out of the queue of a dial. A `Join` that the dial
+    /// delivered after the quit would put us into the view of the peer for a topic that we left.
+    /// The frames of the other topics stay.
+    #[tokio::test]
+    #[traced_test]
+    async fn a_quit_drops_the_queued_frames_of_its_topic() -> Result {
+        let mut rig = Rig::new(14, 1).await?;
+        let other: TopicId = blake3::hash(b"other topic").into();
+        rig.actor.topics.insert(other, TopicState::default());
+        let joined = SecretKey::from_bytes(&[8u8; 32]).public();
+        let now = Instant::now();
+        for topic in [rig.topic, other] {
+            rig.actor
+                .handle_in_event(
+                    proto::InEvent::Command(topic, ProtoCommand::Join(vec![joined])),
+                    now,
+                )
+                .await;
+        }
+
+        rig.actor.quit_queue.push_back(rig.topic);
+        rig.actor.process_quit_queue().await;
+
+        let Some(PeerState::Pending { queue, .. }) = rig.actor.peers.get(&joined) else {
+            panic!("the dial for the other topic must stay");
+        };
+        let topics: Vec<TopicId> = queue.iter().map(|message| message.topic).collect();
+        assert_eq!(topics, vec![other], "only the Join of the other topic stays");
         Ok(())
     }
 
