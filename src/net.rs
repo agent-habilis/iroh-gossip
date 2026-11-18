@@ -939,7 +939,9 @@ impl Actor {
                     "disconnect: the send queue of the peer refused a message for too long, or one that must not be dropped",
                 );
             }
-            if let Some(PeerState::Active { mut conns, .. }) = self.peers.remove(&peer_id) {
+            if let Some(PeerState::Active { mut conns, .. }) =
+                forget_peer(&mut self.peers, &mut self.dialer, peer_id)
+            {
                 let chosen = conns.chosen().map(|conn| conn.id);
                 for conn in conns.drain_all() {
                     if Some(conn.id) == chosen {
@@ -971,12 +973,16 @@ impl Actor {
     /// Takes the frames of a topic that quits out of the queues of the dials. A dial that
     /// connects after the quit would deliver them, and a `Join` among them would put us into the
     /// view of the peer for a topic that we left. A queue that becomes empty has nothing to
-    /// deliver, so its peer goes. The `Disconnect` frames that the quit itself sends come after
-    /// this.
+    /// deliver, so its peer goes with its dial. The `Disconnect` frames that the quit itself sends
+    /// come after this.
     fn drop_queued_frames_of(&mut self, topic_id: TopicId) {
-        self.peers.retain(|_peer_id, state| match state {
+        let dialer = &mut self.dialer;
+        self.peers.retain(|peer_id, state| match state {
             PeerState::Pending { queue, .. } => {
                 queue.retain(|message| message.topic != topic_id);
+                if queue.is_empty() {
+                    dialer.cancel_dial(*peer_id);
+                }
                 !queue.is_empty()
             }
             PeerState::Active { .. } => true,
@@ -1128,7 +1134,7 @@ impl Actor {
                 OutEvent::DisconnectPeer(peer_id) => {
                     // signal disconnection by dropping the senders to the connection
                     debug!(peer=%peer_id.fmt_short(), "gossip state indicates disconnect: drop peer");
-                    self.peers.remove(&peer_id);
+                    forget_peer(&mut self.peers, &mut self.dialer, peer_id);
                 }
                 OutEvent::PeerData(endpoint_id, data) => match decode_peer_data(&data) {
                     Err(err) => warn!("Failed to decode {data:?} from {endpoint_id}: {err}"),
@@ -1176,6 +1182,20 @@ enum PeerState {
         /// Since when the send queue refuses messages, with none accepted in between.
         refused_since: Option<Instant>,
     },
+}
+
+/// Drops the state of a peer. A pending peer takes its dial with it: a dial that connected after
+/// the drop would make an active peer that nothing sends to and nothing disconnects.
+fn forget_peer(
+    peers: &mut HashMap<EndpointId, PeerState>,
+    dialer: &mut Dialer,
+    peer_id: EndpointId,
+) -> Option<PeerState> {
+    let state = peers.remove(&peer_id);
+    if matches!(state, Some(PeerState::Pending { .. })) {
+        dialer.cancel_dial(peer_id);
+    }
+    state
 }
 
 /// How often the connections of the peers are looked at.
@@ -1868,8 +1888,14 @@ impl Dialer {
             return;
         }
         debug!(peer = %endpoint_id.fmt_short(), "replace a dial that is still pending");
-        dial.cancel.cancel();
-        self.pending_dials.remove(&endpoint_id);
+        self.cancel_dial(endpoint_id);
+    }
+
+    /// Stops the dial of a peer, if one is pending. The dial ends without a result.
+    fn cancel_dial(&mut self, endpoint_id: EndpointId) {
+        if let Some(dial) = self.pending_dials.remove(&endpoint_id) {
+            dial.cancel.cancel();
+        }
     }
 
     /// Checks if a endpoint is currently being dialed.
@@ -4524,6 +4550,38 @@ pub(crate) mod tests {
                 proto::topic::Message::Swarm(proto::hyparview::Message::Join(_))
             )),
             "the Join must stay queued"
+        );
+        Ok(())
+    }
+
+    /// A pending peer that is dropped takes its dial with it. A dial that connected after the drop
+    /// would make an active peer that nothing sends to and nothing disconnects.
+    #[tokio::test]
+    #[traced_test]
+    async fn a_dropped_pending_peer_stops_its_dial() -> Result {
+        let mut rig = Rig::new(18, 1).await?;
+        let joined = SecretKey::from_bytes(&[13u8; 32]).public();
+        rig.actor
+            .handle_in_event(
+                proto::InEvent::Command(rig.topic, ProtoCommand::Join(vec![joined])),
+                Instant::now(),
+            )
+            .await;
+        assert!(
+            rig.actor.dialer.is_pending(joined),
+            "the Join dials the peer"
+        );
+
+        rig.actor.quit_queue.push_back(rig.topic);
+        rig.actor.process_quit_queue().await;
+
+        assert!(
+            !rig.actor.peers.contains_key(&joined),
+            "the quit empties the queue, so the peer goes"
+        );
+        assert!(
+            !rig.actor.dialer.is_pending(joined),
+            "the dial of the dropped peer must stop"
         );
         Ok(())
     }
