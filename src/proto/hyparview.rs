@@ -95,11 +95,21 @@ const JOIN_EXPIRY: Duration = NEIGHBOR_REQUEST_EXPIRY;
 pub(crate) struct PendingJoin {
     /// Tells this `Join` from an older one to the same peer, when the older timer ends.
     generation: u64,
-    /// A disconnect of the peer waits for the expiry: the peer sent a message while it was
-    /// outside the active view, or a dial to it failed. At the expiry the peer is disconnected if
-    /// it is still outside the active view. A peer that did neither keeps its connection or its
-    /// dial: a slow dial (a relay path) must not lose the `Join` it carries.
-    disconnect_at_expiry: bool,
+    /// The peer sent a message while it was outside the active view. A `Join` sent again keeps it:
+    /// the connection of that message is still there.
+    peer_sent: bool,
+    /// A dial to the peer failed. A `Join` sent again starts a new dial, so it does not keep it.
+    dial_failed: bool,
+}
+
+impl PendingJoin {
+    /// Whether a disconnect of the peer waits for the expiry. At the expiry the peer is
+    /// disconnected if it is still outside the active view. A peer that neither sent a message nor
+    /// failed a dial keeps its connection or its dial: a slow dial (a relay path) must not lose the
+    /// `Join` it carries.
+    fn disconnect_at_expiry(&self) -> bool {
+        self.peer_sent || self.dial_failed
+    }
 }
 
 /// How many peers the application can name as uncounted. The rest of a longer list is ignored.
@@ -462,7 +472,7 @@ where
         if !is_disconnect && !self.active_view.contains(&from) {
             match self.pending_joins.get_mut(&from) {
                 // The answer to our `Join` comes on this connection: the disconnect waits.
-                Some(join) => join.disconnect_at_expiry = true,
+                Some(join) => join.peer_sent = true,
                 None => io.push(OutEvent::DisconnectPeer(from)),
             }
         }
@@ -476,16 +486,18 @@ where
         ));
         let generation = self.next_join_generation;
         self.next_join_generation += 1;
-        // A `Join` sent again while one waits keeps a disconnect that was put off to the expiry.
-        let disconnect_at_expiry = self
+        // A `Join` sent again while one waits keeps a disconnect that a message of the peer put
+        // off to the expiry. A failed dial does not carry over: this `Join` starts a new dial.
+        let peer_sent = self
             .pending_joins
             .get(&peer)
-            .is_some_and(|join| join.disconnect_at_expiry);
+            .is_some_and(|join| join.peer_sent);
         self.pending_joins.insert(
             peer,
             PendingJoin {
                 generation,
-                disconnect_at_expiry,
+                peer_sent,
+                dial_failed: false,
             },
         );
         io.push(OutEvent::ScheduleTimer(
@@ -504,7 +516,7 @@ where
         if join.generation != generation {
             return;
         }
-        let disconnect = join.disconnect_at_expiry;
+        let disconnect = join.disconnect_at_expiry();
         self.pending_joins.remove(&peer);
         if disconnect && !self.active_view.contains(&peer) {
             io.push(OutEvent::DisconnectPeer(peer));
@@ -522,7 +534,7 @@ where
                 // and the peer data go, as on `PeerDisconnected`); only the waiting `Join` is put
                 // back, because the IO layer still holds it for the peer.
                 self.handle_connection_closed(peer, io);
-                join.disconnect_at_expiry = true;
+                join.dial_failed = true;
                 self.pending_joins.insert(peer, join);
             }
             None => {
@@ -1735,6 +1747,25 @@ mod tests {
             1,
             "the put-off disconnect comes at the expiry of the new Join"
         );
+    }
+
+    // A `Join` sent again after a failed dial starts a new dial, and that dial can take longer than
+    // the expiry on a relay path. The failed dial does not carry over: only a message of the peer
+    // does, so the new `Join` keeps its slow dial at the expiry.
+    #[test]
+    fn a_join_sent_again_after_a_failed_dial_keeps_its_slow_dial() {
+        let mut a = state(0);
+        let mut io = Io::new();
+        a.handle(InEvent::RequestJoin(10), &mut io);
+        a.handle(InEvent::DialFailed(10), &mut io);
+        io.clear();
+        a.handle(InEvent::RequestJoin(10), &mut io);
+        let (_, newer) = join_timer(&io, 10);
+        io.clear();
+
+        expire(&mut a, newer, &mut io);
+
+        assert_eq!(disconnects(&io, 10), 0, "the dial of the new Join stays");
     }
 
     // A leave of a peer whose `Join` waits disconnects the peer, so that the IO layer drops the
