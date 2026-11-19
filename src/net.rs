@@ -5350,13 +5350,14 @@ pub(crate) mod tests {
         let small = gossip(b"behind the frame that is too large".to_vec());
         let (send_tx, send_rx) = mpsc::channel(8);
         drop(send_tx);
-        let mut send_loop = SendLoop::new(
-            conn,
-            send_rx,
-            max_message_size,
-            Arc::new(Metrics::default()),
-        );
+        let metrics = Arc::new(Metrics::default());
+        let mut send_loop = SendLoop::new(conn, send_rx, max_message_size, metrics.clone());
         let result = send_loop.run(vec![too_large, small.clone()]).await;
+        assert_eq!(
+            metrics.msgs_dropped_too_large.get(),
+            1,
+            "the drop is counted: {result:?}"
+        );
         let unsent = send_loop.take_unsent();
         assert!(
             unsent.iter().all(|message| format!("{message:?}")
