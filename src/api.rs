@@ -219,13 +219,18 @@ impl GossipSender {
         Ok(())
     }
 
-    /// Asks one peer for a link with high priority, even if its active view is full.
+    /// Asks one peer for a link with high priority, even if the active view of the peer is full.
     ///
     /// The peer always accepts, and drops one random neighbor to make room. The dropped
     /// neighbor gets a notice, and no `ForwardJoin` goes out. A peer that left this node
     /// refuses it. Unlike [`join_peers`](Self::join_peers), it starts no walk through the swarm.
-    /// Use [`neighbor_peers`](Self::neighbor_peers) first: this request costs a neighbor of the
-    /// peer, so use it only when a low priority request cannot link the pair.
+    ///
+    /// This node sends the request only while its own active view has a free slot, counting the
+    /// requests that wait for an answer. With a full view it sends nothing: the answer of the
+    /// peer would evict a second neighbor of this node. Call it at most once for each window of
+    /// time, because each call can cost a neighbor of the peer. Use
+    /// [`neighbor_peers`](Self::neighbor_peers) first, and this request only when a low priority
+    /// request cannot link the pair.
     pub async fn force_neighbor_peer(&self, peer: EndpointId) -> Result<(), ApiError> {
         self.send(Command::ForceNeighborPeer(peer)).await?;
         Ok(())

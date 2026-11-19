@@ -226,8 +226,9 @@ pub enum Command<PI> {
     /// Ask one peer for a link with high priority.
     ///
     /// A peer with a full active view accepts the request and drops one random counted
-    /// neighbor. No `ForwardJoin` goes out. A peer that left refuses it. On a topic that was
-    /// not joined, the command is dropped.
+    /// neighbor. No `ForwardJoin` goes out. A peer that left refuses it. Nothing is sent when
+    /// the active view of this node is full, counting the pending requests. On a topic that
+    /// was not joined, the command is dropped.
     ForceNeighborPeer(PI),
     /// Name the peers that take no slot of the active view. The set replaces the last one.
     ///
