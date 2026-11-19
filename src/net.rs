@@ -1067,6 +1067,11 @@ impl Actor {
             if self.topics.remove(&topic_id).is_some() {
                 tracing::debug!(%topic_id, "publishers and subscribers gone; unsubscribing");
             }
+            for state in self.peers.values_mut() {
+                if let PeerState::Active { last_link, .. } = state {
+                    last_link.remove(&topic_id);
+                }
+            }
         }
     }
 
@@ -5055,6 +5060,53 @@ pub(crate) mod tests {
         assert!(
             !rig.actor.peers.contains_key(&remote_id),
             "the dropped peer does not come back"
+        );
+        Ok(())
+    }
+
+    /// A topic that quits leaves no note of its link frames in the state of a peer: the note is
+    /// only for the resend of frames of a live topic.
+    #[tokio::test]
+    #[traced_test]
+    async fn a_topic_that_quits_leaves_no_link_note_in_the_peer_state() -> Result {
+        // A peer that the protocol of the topic does not know, so that the quit keeps its state, as
+        // it does for a peer that another topic uses.
+        let mut rig = Rig::new(24, 0).await?;
+        let peer_id = SecretKey::from_bytes(&[24; 32]).public();
+        let (tx, _rx) = mpsc::channel(SEND_QUEUE_CAP);
+        let mut state = PeerState::default();
+        state.admit(
+            Conn::new(
+                1,
+                ConnHandle {
+                    send_tx: Some(tx),
+                    conn: None,
+                },
+                true,
+                RxClock::new(),
+            ),
+            Instant::now(),
+        );
+        rig.actor.peers.insert(peer_id, state);
+        let disconnect = ProtoMessage {
+            topic: rig.topic,
+            message: proto::topic::Message::Swarm(proto::hyparview::Message::Disconnect(
+                proto::hyparview::Disconnect::alive(),
+            )),
+        };
+        rig.actor.send_to_peer(peer_id, disconnect, Instant::now());
+        let notes = |actor: &Actor| match actor.peers.get(&peer_id) {
+            Some(PeerState::Active { last_link, .. }) => last_link.contains_key(&rig.topic),
+            _ => false,
+        };
+        assert!(notes(&rig.actor), "the Disconnect is noted");
+
+        rig.actor.quit_queue.push_back(rig.topic);
+        rig.actor.process_quit_queue().await;
+
+        assert!(
+            !notes(&rig.actor),
+            "the note of the topic that quit is gone"
         );
         Ok(())
     }
