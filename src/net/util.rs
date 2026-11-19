@@ -319,7 +319,7 @@ impl SendLoop {
                 Ok(()) => {}
                 Err(err @ (WriteError::TooLarge { .. } | WriteError::Ser { .. })) => {
                     warn!(topic = %message.topic.fmt_short(), "drop a message that cannot be sent: {err:#}");
-                    self.metrics.msgs_dropped_too_large.inc();
+                    self.metrics.msgs_dropped_unencodable.inc();
                 }
                 Err(err) => return Err(err),
             }

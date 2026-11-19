@@ -72,6 +72,7 @@ impl<PI> Message<PI> {
 
     /// Which way this frame moves the link of its topic with the peer: `Join`, `ForwardJoin` and
     /// `Neighbor` up, `Disconnect` down. `Shuffle`, `ShuffleReply` and plumtree frames move nothing.
+    /// A `ForwardJoin` counts as up because the protocol sends it only to a peer in its active view.
     #[cfg(feature = "net")]
     pub(crate) fn link_side(&self) -> Option<LinkSide> {
         use super::hyparview::Message as Swarm;

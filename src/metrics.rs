@@ -131,8 +131,9 @@ pub struct Metrics {
     pub actor_tick_timers: Counter,
     /// Number of data messages dropped because the send queue of a connection was full
     pub msgs_dropped_send_queue_full: Counter,
-    /// Number of messages dropped because they cannot be encoded within the maximum message size
-    pub msgs_dropped_too_large: Counter,
+    /// Number of messages dropped because they cannot be encoded: larger than the maximum message
+    /// size, or a serialization error
+    pub msgs_dropped_unencodable: Counter,
     /// Number of peers disconnected because their send queue refused a message for too long, or
     /// refused a message that must not be dropped
     pub send_overflow_disconnects: Counter,

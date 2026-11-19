@@ -5354,7 +5354,7 @@ pub(crate) mod tests {
         let mut send_loop = SendLoop::new(conn, send_rx, max_message_size, metrics.clone());
         let result = send_loop.run(vec![too_large, small.clone()]).await;
         assert_eq!(
-            metrics.msgs_dropped_too_large.get(),
+            metrics.msgs_dropped_unencodable.get(),
             1,
             "the drop is counted: {result:?}"
         );
