@@ -219,6 +219,18 @@ impl GossipSender {
         Ok(())
     }
 
+    /// Asks one peer for a link with high priority, even if its active view is full.
+    ///
+    /// The peer always accepts, and drops one random neighbor to make room. The dropped
+    /// neighbor gets a notice, and no `ForwardJoin` goes out. A peer that left this node
+    /// refuses it. Unlike [`join_peers`](Self::join_peers), it starts no walk through the swarm.
+    /// Use [`neighbor_peers`](Self::neighbor_peers) first: this request costs a neighbor of the
+    /// peer, so use it only when a low priority request cannot link the pair.
+    pub async fn force_neighbor_peer(&self, peer: EndpointId) -> Result<(), ApiError> {
+        self.send(Command::ForceNeighborPeer(peer)).await?;
+        Ok(())
+    }
+
     /// Names the peers that take no slot of the active view. The set replaces the last one.
     ///
     /// The view holds them beside its capacity. They do not count for it, they do not stop a
@@ -426,6 +438,8 @@ pub enum Command {
     LeavePeers(Vec<EndpointId>),
     /// Asks a set of peers for a link with low priority.
     NeighborPeers(Vec<EndpointId>),
+    /// Asks one peer for a link with high priority.
+    ForceNeighborPeer(EndpointId),
     /// Names the peers that take no slot of the active view.
     UncountedPeers(Vec<EndpointId>),
 }
