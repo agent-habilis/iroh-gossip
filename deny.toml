@@ -1,14 +1,7 @@
 [advisories]
 ignore = [
-    "RUSTSEC-2024-0436",
     "RUSTSEC-2026-0194",        # netdev unaffected
     "RUSTSEC-2026-0195",        # netdev unaffected
-    # Unmaintained, with no fixed version and no known vulnerability. Path: tokio-rustls-acme
-    # 0.9.1, through iroh-relay.
-    { id = "RUSTSEC-2026-0543", reason = "chrono: unmaintained, no fixed version, no known vulnerability; via tokio-rustls-acme 0.9.1 (iroh-relay)" },
-    # Unmaintained because it wraps chrono, with no fixed version and no known vulnerability.
-    # Path: humantime-serde 1.1.1, only in the test-utils feature and the dev-dependencies.
-    { id = "RUSTSEC-2026-0542", reason = "humantime: unmaintained (wraps chrono), no fixed version, no known vulnerability; via humantime-serde 1.1.1 (test-utils and dev only)" },
 ]
 
 [bans]
