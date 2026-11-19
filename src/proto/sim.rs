@@ -359,6 +359,8 @@ impl<PI: PeerIdentity + fmt::Display, R: Rng + SeedableRng> Network<PI, R> {
                     debug!(peer = ?peer, "emit {event:?}");
                     self.events.push_back((peer, topic, event));
                 }
+                // The simulated connection carries every topic, and another topic still uses it.
+                OutEvent::DisconnectPeerTopic(_peer, _topic) => {}
                 OutEvent::PeerData(_peer, _data) => {}
             }
         }

@@ -27,6 +27,9 @@ pub enum InEvent<PI> {
     TimerExpired(Timer<PI>),
     /// Peer disconnected on the network level.
     PeerDisconnected(PI),
+    /// A dial to the peer failed, and the network level keeps what it queued for the peer. A
+    /// `Join` that waits for the peer keeps waiting (see `hyparview::InEvent::DialFailed`).
+    DialFailed(PI),
     /// Update the opaque peer data about yourself.
     UpdatePeerData(PeerData),
 }
@@ -96,6 +99,23 @@ pub enum Message<PI> {
     Gossip(plumtree::Message),
 }
 
+/// The variants of a protocol message: the membership layer (`Join` to `Disconnect`) and the
+/// broadcast layer (`Gossip` carries the payload, the rest is control).
+#[cfg(feature = "net")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Variant {
+    Join,
+    ForwardJoin,
+    Shuffle,
+    ShuffleReply,
+    Neighbor,
+    Disconnect,
+    Gossip,
+    IHave,
+    Graft,
+    Prune,
+}
+
 impl<PI> Message<PI> {
     /// Get the kind of this message
     pub fn kind(&self) -> MessageKind {
@@ -104,6 +124,27 @@ impl<PI> Message<PI> {
             Message::Gossip(message) => match message {
                 plumtree::Message::Gossip(_) => MessageKind::Data,
                 _ => MessageKind::Control,
+            },
+        }
+    }
+
+    /// Which kind of protocol message this is, down to the variant, for the byte counters.
+    #[cfg(feature = "net")]
+    pub(crate) fn variant(&self) -> Variant {
+        match self {
+            Message::Swarm(message) => match message {
+                hyparview::Message::Join(_) => Variant::Join,
+                hyparview::Message::ForwardJoin(_) => Variant::ForwardJoin,
+                hyparview::Message::Shuffle(_) => Variant::Shuffle,
+                hyparview::Message::ShuffleReply(_) => Variant::ShuffleReply,
+                hyparview::Message::Neighbor(_) => Variant::Neighbor,
+                hyparview::Message::Disconnect(_) => Variant::Disconnect,
+            },
+            Message::Gossip(message) => match message {
+                plumtree::Message::Gossip(_) => Variant::Gossip,
+                plumtree::Message::IHave(_) => Variant::IHave,
+                plumtree::Message::Graft(_) => Variant::Graft,
+                plumtree::Message::Prune => Variant::Prune,
             },
         }
     }
@@ -324,6 +365,10 @@ impl<PI: PeerIdentity, R: Rng> State<PI, R> {
             },
             InEvent::PeerDisconnected(peer) => {
                 self.swarm.handle(SwarmIn::PeerDisconnected(peer), io);
+                self.gossip.handle(GossipIn::NeighborDown(peer), now, io);
+            }
+            InEvent::DialFailed(peer) => {
+                self.swarm.handle(SwarmIn::DialFailed(peer), io);
                 self.gossip.handle(GossipIn::NeighborDown(peer), now, io);
             }
             InEvent::UpdatePeerData(data) => self.swarm.handle(SwarmIn::UpdatePeerData(data), io),

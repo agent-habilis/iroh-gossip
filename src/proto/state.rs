@@ -29,6 +29,16 @@ impl TopicId {
     }
 }
 
+/// Which way a HyParView frame moves the link of its topic between two peers.
+#[cfg(feature = "net")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LinkSide {
+    /// `Join`, `ForwardJoin` or `Neighbor`.
+    Up,
+    /// `Disconnect`.
+    Down,
+}
+
 /// Protocol wire message
 ///
 /// This is the wire frame of the `iroh-gossip` protocol.
@@ -57,6 +67,47 @@ impl<PI> Message<PI> {
             topic::Message::Gossip(
                 super::plumtree::Message::Gossip(_) | super::plumtree::Message::IHave(_)
             )
+        )
+    }
+
+    /// Which way this frame moves the link of its topic with the peer: `Join`, `ForwardJoin` and
+    /// `Neighbor` up, `Disconnect` down. `Shuffle`, `ShuffleReply` and plumtree frames move nothing.
+    /// A `ForwardJoin` counts as up because the protocol sends it only to a peer in its active view.
+    #[cfg(feature = "net")]
+    pub(crate) fn link_side(&self) -> Option<LinkSide> {
+        use super::hyparview::Message as Swarm;
+        match self.message {
+            topic::Message::Swarm(Swarm::Join(_) | Swarm::ForwardJoin(_) | Swarm::Neighbor(_)) => {
+                Some(LinkSide::Up)
+            }
+            topic::Message::Swarm(Swarm::Disconnect(_)) => Some(LinkSide::Down),
+            _ => None,
+        }
+    }
+
+    /// Whether a newer frame of `side` to the same peer and topic undoes this one, so that this one
+    /// must not come after it: a `Disconnect` is undone by a frame that brings the link up, a `Join`
+    /// or a `Neighbor` by a `Disconnect`. A `ForwardJoin` introduces another peer, and a `Shuffle`
+    /// or a `ShuffleReply` moves nothing, so nothing undoes them.
+    #[cfg(feature = "net")]
+    pub(crate) fn is_undone_by(&self, side: LinkSide) -> bool {
+        use super::hyparview::Message as Swarm;
+        matches!(
+            (&self.message, side),
+            (topic::Message::Swarm(Swarm::Disconnect(_)), LinkSide::Up)
+                | (
+                    topic::Message::Swarm(Swarm::Join(_) | Swarm::Neighbor(_)),
+                    LinkSide::Down
+                )
+        )
+    }
+
+    /// Whether this is a `Join`, which the protocol sends once and never again.
+    #[cfg(feature = "net")]
+    pub(crate) fn is_join(&self) -> bool {
+        matches!(
+            self.message,
+            topic::Message::Swarm(super::hyparview::Message::Join(_))
         )
     }
 }
@@ -112,6 +163,9 @@ pub enum InEvent<PI> {
     TimerExpired(Timer<PI>),
     /// Peer disconnected on the network level.
     PeerDisconnected(PI),
+    /// A dial to the peer failed, and the network level keeps what it queued for the peer, for a
+    /// connection that the peer opens to us. A `Join` that waits for the peer keeps waiting.
+    DialFailed(PI),
     /// Update the opaque peer data about yourself.
     UpdatePeerData(PeerData),
 }
@@ -128,6 +182,9 @@ pub enum OutEvent<PI> {
     ScheduleTimer(Duration, Timer<PI>),
     /// Close the connection to a peer on the network level.
     DisconnectPeer(PI),
+    /// One topic is done with a peer that another topic still uses: drop what waits for the peer
+    /// in this topic only, and keep the connection.
+    DisconnectPeerTopic(PI, TopicId),
     /// Updated peer data
     PeerData(PI, PeerData),
 }
@@ -153,6 +210,7 @@ impl<PI> From<InEvent<PI>> for InEventMapped<PI> {
                 Self::TopicEvent(topic, topic::InEvent::TimerExpired(timer))
             }
             InEvent::PeerDisconnected(peer) => Self::All(topic::InEvent::PeerDisconnected(peer)),
+            InEvent::DialFailed(peer) => Self::All(topic::InEvent::DialFailed(peer)),
             InEvent::UpdatePeerData(data) => Self::All(topic::InEvent::UpdatePeerData(data)),
         }
     }
@@ -253,9 +311,6 @@ impl<PI: PeerIdentity, R: Rng + SeedableRng> State<PI, R> {
         metrics: Option<&Metrics>,
     ) -> impl Iterator<Item = OutEvent<PI>> + '_ + use<'_, PI, R> {
         trace!("in : {event:?}");
-        if let Some(metrics) = &metrics {
-            track_in_event(&event, metrics);
-        }
 
         let event: InEventMapped<PI> = event.into();
 
@@ -292,6 +347,7 @@ impl<PI: PeerIdentity, R: Rng + SeedableRng> State<PI, R> {
 
                 if quit {
                     self.states.remove(&topic);
+                    self.forget_topic(topic);
                 }
             }
             // when a peer disconnected on the network level, forward event to all states
@@ -305,15 +361,31 @@ impl<PI: PeerIdentity, R: Rng + SeedableRng> State<PI, R> {
                         handle_out_event(*topic, event, &mut self.peer_topics, &mut self.outbox);
                     }
                 }
+                // The connection is gone, so no topic uses the peer any more. A stale entry would
+                // turn the last real disconnect of the peer into a partial one.
+                if let topic::InEvent::PeerDisconnected(peer) = &event {
+                    self.peer_topics.remove(peer);
+                }
             }
         }
 
-        // track metrics
         if let Some(metrics) = &metrics {
-            track_out_events(&self.outbox, metrics);
+            track_neighbor_events(&self.outbox, metrics);
         }
 
         self.outbox.drain(..)
+    }
+
+    /// A topic that quit uses no peer any more. A peer that no other topic uses is disconnected:
+    /// the disconnects that the quit itself sent cover only the peers of its active view.
+    fn forget_topic(&mut self, topic: TopicId) {
+        let outbox = &mut self.outbox;
+        self.peer_topics.retain(|peer, topics| {
+            if topics.remove(&topic) && topics.is_empty() {
+                outbox.push(OutEvent::DisconnectPeer(*peer));
+            }
+            !topics.is_empty()
+        });
     }
 }
 
@@ -326,6 +398,10 @@ fn handle_out_event<PI: PeerIdentity>(
     trace!("out: {event:?}");
     match event {
         topic::OutEvent::SendMessage(to, message) => {
+            // A topic that sends to a peer uses the peer, as a topic that received from it does:
+            // its later `DisconnectPeer` must reach the network level (also for a peer that never
+            // sent us anything), and must not close what another topic still uses.
+            conns.entry(to).or_default().insert(topic);
             outbox.push(OutEvent::SendMessage(to, Message { topic, message }))
         }
         topic::OutEvent::EmitEvent(event) => outbox.push(OutEvent::EmitEvent(topic, event)),
@@ -333,37 +409,28 @@ fn handle_out_event<PI: PeerIdentity>(
             outbox.push(OutEvent::ScheduleTimer(delay, Timer { topic, timer }))
         }
         topic::OutEvent::DisconnectPeer(peer) => {
-            let empty = conns
-                .get_mut(&peer)
-                .map(|list| list.remove(&topic) || list.is_empty())
-                .unwrap_or(false);
-            if empty {
-                conns.remove(&peer);
-                outbox.push(OutEvent::DisconnectPeer(peer));
+            // Only the last topic that uses the peer closes the connection. A topic before it
+            // drops only its own part. A peer that no topic uses has nothing to close.
+            if let Some(topics) = conns.get_mut(&peer) {
+                topics.remove(&topic);
+                if topics.is_empty() {
+                    conns.remove(&peer);
+                    outbox.push(OutEvent::DisconnectPeer(peer));
+                } else {
+                    outbox.push(OutEvent::DisconnectPeerTopic(peer, topic));
+                }
             }
         }
         topic::OutEvent::PeerData(peer, data) => outbox.push(OutEvent::PeerData(peer, data)),
     }
 }
 
-fn track_out_events<PI: Serialize>(events: &[OutEvent<PI>], metrics: &Metrics) {
+/// The message counters are not written here: the connection loops count each frame that they
+/// write or read, so a message that is dropped before it is written does not count as sent.
+fn track_neighbor_events<PI>(events: &[OutEvent<PI>], metrics: &Metrics) {
     for event in events {
-        match event {
-            OutEvent::SendMessage(_to, message) => match message.kind() {
-                MessageKind::Data => {
-                    metrics.msgs_data_sent.inc();
-                    metrics
-                        .msgs_data_sent_size
-                        .inc_by(message.size().unwrap_or(0) as u64);
-                }
-                MessageKind::Control => {
-                    metrics.msgs_ctrl_sent.inc();
-                    metrics
-                        .msgs_ctrl_sent_size
-                        .inc_by(message.size().unwrap_or(0) as u64);
-                }
-            },
-            OutEvent::EmitEvent(_topic, event) => match event {
+        if let OutEvent::EmitEvent(_topic, event) = event {
+            match event {
                 super::Event::NeighborUp(_peer) => {
                     metrics.neighbor_up.inc();
                 }
@@ -371,26 +438,6 @@ fn track_out_events<PI: Serialize>(events: &[OutEvent<PI>], metrics: &Metrics) {
                     metrics.neighbor_down.inc();
                 }
                 _ => {}
-            },
-            _ => {}
-        }
-    }
-}
-
-fn track_in_event<PI: Serialize>(event: &InEvent<PI>, metrics: &Metrics) {
-    if let InEvent::RecvMessage(_from, message) = event {
-        match message.kind() {
-            MessageKind::Data => {
-                metrics.msgs_data_recv.inc();
-                metrics
-                    .msgs_data_recv_size
-                    .inc_by(message.size().unwrap_or(0) as u64);
-            }
-            MessageKind::Control => {
-                metrics.msgs_ctrl_recv.inc();
-                metrics
-                    .msgs_ctrl_recv_size
-                    .inc_by(message.size().unwrap_or(0) as u64);
             }
         }
     }
@@ -419,5 +466,84 @@ mod tests {
         assert!(gossip(plumtree::Message::IHave(Vec::new())).is_droppable());
         assert!(!gossip(plumtree::Message::Prune).is_droppable());
         assert!(!swarm(hyparview::Message::Join(None)).is_droppable());
+    }
+
+    type TestState = State<u64, rand::rngs::ChaCha12Rng>;
+
+    fn test_state() -> TestState {
+        State::new(
+            0,
+            PeerData::new(Vec::new()),
+            Config::default(),
+            rand::SeedableRng::seed_from_u64(0),
+        )
+    }
+
+    fn command(state: &mut TestState, topic: TopicId, command: Command<u64>) -> Vec<OutEvent<u64>> {
+        state
+            .handle(InEvent::Command(topic, command), Instant::now(), None)
+            .collect()
+    }
+
+    fn shuffle_reply(topic: TopicId) -> Message<u64> {
+        Message {
+            topic,
+            message: topic::Message::Swarm(hyparview::Message::ShuffleReply(
+                hyparview::ShuffleReply::empty(),
+            )),
+        }
+    }
+
+    // A closed connection leaves no topic on the peer. Topic B joined peer 7, the connection
+    // closed, and then peer 7 sends to topic A, where it is not active: the disconnect of A is the
+    // last one and must close the connection, not leave it to a stale entry of B.
+    #[test]
+    fn a_closed_connection_leaves_no_topic_on_the_peer() {
+        let (a, b) = (TopicId::from([1u8; 32]), TopicId::from([2u8; 32]));
+        let mut state = test_state();
+        command(&mut state, a, Command::Join(Vec::new()));
+        command(&mut state, b, Command::Join(vec![7]));
+        let _: Vec<_> = state
+            .handle(InEvent::PeerDisconnected(7), Instant::now(), None)
+            .collect();
+
+        let out: Vec<_> = state
+            .handle(
+                InEvent::RecvMessage(7, shuffle_reply(a)),
+                Instant::now(),
+                None,
+            )
+            .collect();
+
+        let full = out
+            .iter()
+            .filter(|e| matches!(e, OutEvent::DisconnectPeer(7)))
+            .count();
+        let partial = out
+            .iter()
+            .filter(|e| matches!(e, OutEvent::DisconnectPeerTopic(7, _)))
+            .count();
+        assert_eq!((full, partial), (1, 0), "the connection must close");
+    }
+
+    // The map of the topics that use each peer is empty once every topic quit.
+    #[test]
+    fn no_peer_keeps_a_topic_after_all_topics_quit() {
+        let (a, b) = (TopicId::from([1u8; 32]), TopicId::from([2u8; 32]));
+        let mut state = test_state();
+        command(&mut state, a, Command::Join(Vec::new()));
+        command(&mut state, b, Command::Join(vec![7]));
+        let _: Vec<_> = state
+            .handle(
+                InEvent::RecvMessage(8, shuffle_reply(a)),
+                Instant::now(),
+                None,
+            )
+            .collect();
+
+        command(&mut state, a, Command::Quit);
+        command(&mut state, b, Command::Quit);
+
+        assert!(state.peer_topics.is_empty(), "{:?}", state.peer_topics);
     }
 }

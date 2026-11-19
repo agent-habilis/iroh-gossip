@@ -197,6 +197,19 @@ pub enum Scope {
 }
 
 impl Gossip {
+    /// The message that a broadcast of `content` sends first.
+    pub(crate) fn first_round(content: Bytes, scope: Scope) -> Self {
+        let scope = match scope {
+            Scope::Neighbors => DeliveryScope::Neighbors,
+            Scope::Swarm => DeliveryScope::Swarm(Round(0)),
+        };
+        Gossip {
+            id: MessageId::from_content(&content),
+            content,
+            scope,
+        }
+    }
+
     /// Get a clone of this `Gossip` message and increase the delivery round by 1.
     pub fn next_round(&self) -> Option<Gossip> {
         match self.scope {
@@ -411,7 +424,7 @@ impl<PI: PeerIdentity> State<PI> {
         match event {
             InEvent::RecvMessage(from, message) => self.handle_message(from, message, now, io),
             InEvent::Broadcast(data, scope) => self.broadcast(data, scope, now, io),
-            InEvent::NeighborUp(peer) => self.on_neighbor_up(peer),
+            InEvent::NeighborUp(peer) => self.on_neighbor_up(peer, io),
             InEvent::NeighborDown(peer) => self.on_neighbor_down(peer),
             InEvent::TimerExpired(timer) => match timer {
                 Timer::DispatchLazyPush => self.on_dispatch_timer(io),
@@ -465,12 +478,8 @@ impl<PI: PeerIdentity> State<PI> {
     /// Will be pushed in full to eager peers.
     /// Pushing the message id to the lazy peers is delayed by a timer.
     fn broadcast(&mut self, content: Bytes, scope: Scope, now: Instant, io: &mut impl IO<PI>) {
-        let id = MessageId::from_content(&content);
-        let scope = match scope {
-            Scope::Neighbors => DeliveryScope::Neighbors,
-            Scope::Swarm => DeliveryScope::Swarm(Round(0)),
-        };
-        let message = Gossip { id, content, scope };
+        let message = Gossip::first_round(content, scope);
+        let (id, scope) = (message.id, message.scope);
         let me = self.me;
         if let DeliveryScope::Swarm(_) = scope {
             self.received_messages
@@ -661,8 +670,25 @@ impl<PI: PeerIdentity> State<PI> {
     }
 
     /// Handle a [`InEvent::NeighborUp`] when a peer joins the topic.
-    fn on_neighbor_up(&mut self, peer: PI) {
+    ///
+    /// The new neighbor also gets an `IHave` of each message in the cache, with the round of the
+    /// cached message. Plumtree pushes a message only to the neighbors that exist when a node first
+    /// holds it, so a neighbor that comes up later would never hear of it. The ids go through the
+    /// lazy push queue, so the dispatch timer sends them in as few frames as fit.
+    fn on_neighbor_up(&mut self, peer: PI, io: &mut impl IO<PI>) {
         self.add_eager(peer);
+        let offer: Vec<IHave> = self
+            .cache
+            .iter()
+            .filter_map(|(id, gossip, _expires)| {
+                gossip.round().map(|round| IHave { id: *id, round })
+            })
+            .collect();
+        if offer.is_empty() {
+            return;
+        }
+        self.lazy_push_queue.entry(peer).or_default().extend(offer);
+        self.schedule_dispatch(io);
     }
 
     /// Handle a [`InEvent::NeighborDown`] when a peer leaves the topic.
@@ -670,6 +696,7 @@ impl<PI: PeerIdentity> State<PI> {
     /// > membership. Furthermore, the record of IHAVE messages sent from failed members is deleted
     /// > from the missing history. (p9)
     fn on_neighbor_down(&mut self, peer: PI) {
+        self.lazy_push_queue.remove(&peer);
         self.missing_messages.retain(|_message_id, ihaves| {
             ihaves.retain(|(ihave_peer, _round)| *ihave_peer != peer);
             !ihaves.is_empty()
@@ -725,6 +752,11 @@ impl<PI: PeerIdentity> State<PI> {
                 round,
             });
         }
+        self.schedule_dispatch(io);
+    }
+
+    /// Schedules the [`Timer::DispatchLazyPush`] that sends the lazy push queue, once.
+    fn schedule_dispatch(&mut self, io: &mut impl IO<PI>) {
         if !self.dispatch_timer_scheduled {
             io.push(OutEvent::ScheduleTimer(
                 self.config.dispatch_timeout,
@@ -738,6 +770,7 @@ impl<PI: PeerIdentity> State<PI> {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::proto::topic;
     #[test]
     fn optimize_tree() {
         let mut io = VecDeque::new();
@@ -906,5 +939,215 @@ mod test {
         let now = now + config.message_cache_retention;
         state.handle(InEvent::TimerExpired(Timer::EvictCache), now, &mut io);
         assert_eq!(state.cache.len(), 0);
+    }
+
+    /// The `IHave` frames that `io` sends to `peer`.
+    fn ihaves_to(io: &Io, peer: u32) -> Vec<Vec<IHave>> {
+        io.iter()
+            .filter_map(|event| match event {
+                topic::OutEvent::SendMessage(
+                    to,
+                    topic::Message::Gossip(Message::IHave(ihaves)),
+                ) if *to == peer => Some(ihaves.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// What the plumtree of a topic emits, as the topic sees it.
+    type Io = VecDeque<topic::OutEvent<u32>>;
+
+    /// Node 1 with peer 2 as a neighbor broadcasts each of `contents`, then peer 3 comes up and the
+    /// dispatch timer fires. Returns the state, the time, and what the last two steps sent.
+    fn broadcast_then_neighbor_up(
+        config: &Config,
+        max_message_size: usize,
+        contents: &[Bytes],
+    ) -> (State<u32>, Instant, Io) {
+        let mut state = State::new(1, config.clone(), max_message_size);
+        let now = Instant::now();
+        let mut io = Io::new();
+        state.handle(InEvent::NeighborUp(2), now, &mut io);
+        for content in contents {
+            state.handle(
+                InEvent::Broadcast(content.clone(), Scope::Swarm),
+                now,
+                &mut io,
+            );
+        }
+        state.handle(InEvent::TimerExpired(Timer::DispatchLazyPush), now, &mut io);
+        io.clear();
+        state.handle(InEvent::NeighborUp(3), now, &mut io);
+        state.handle(InEvent::TimerExpired(Timer::DispatchLazyPush), now, &mut io);
+        (state, now, io)
+    }
+
+    /// A neighbor that comes up after a broadcast gets an `IHave` of it: plumtree pushes a message
+    /// only to the neighbors that exist when a node first holds it, so the late one would miss it.
+    #[test]
+    fn a_neighbor_that_comes_up_after_a_broadcast_gets_an_ihave_of_it() {
+        let config = Config::default();
+        let content = Bytes::from_static(b"before the neighbor came up");
+        let id = MessageId::from_content(&content);
+        let (_state, _now, io) = broadcast_then_neighbor_up(&config, 1024, &[content]);
+        let frames = ihaves_to(&io, 3);
+        assert_eq!(
+            frames.len(),
+            1,
+            "one IHave frame to the new neighbor: {io:?}"
+        );
+        assert_eq!(
+            frames[0],
+            vec![IHave {
+                id,
+                round: Round(0)
+            }],
+            "the IHave names the cached message with its round"
+        );
+    }
+
+    /// The new neighbor asks for the message of the `IHave` with a `Graft`, and node 1 answers it
+    /// from its cache.
+    #[test]
+    fn the_new_neighbor_grafts_the_message_and_gets_it_from_the_cache() {
+        let config = Config::default();
+        let content = Bytes::from_static(b"before the neighbor came up");
+        let id = MessageId::from_content(&content);
+        let (mut node1, now, io) =
+            broadcast_then_neighbor_up(&config, 1024, std::slice::from_ref(&content));
+        let ihaves = ihaves_to(&io, 3).concat();
+        assert!(!ihaves.is_empty(), "node 1 offers its cache to 3: {io:?}");
+
+        let mut node3 = State::new(3, config.clone(), 1024);
+        let mut io3 = Io::new();
+        node3.handle(InEvent::NeighborUp(1), now, &mut io3);
+        node3.handle(
+            InEvent::RecvMessage(1, Message::IHave(ihaves)),
+            now,
+            &mut io3,
+        );
+        assert!(
+            io3.contains(&topic::OutEvent::ScheduleTimer(
+                config.graft_timeout_1,
+                topic::Timer::Gossip(Timer::SendGraft(id))
+            )),
+            "3 waits for the message: {io3:?}"
+        );
+        io3.clear();
+        node3.handle(InEvent::TimerExpired(Timer::SendGraft(id)), now, &mut io3);
+        let graft = io3
+            .iter()
+            .find_map(|event| match event {
+                topic::OutEvent::SendMessage(
+                    1,
+                    topic::Message::Gossip(message @ Message::Graft(_)),
+                ) => Some(message.clone()),
+                _ => None,
+            })
+            .expect("3 grafts the message from 1");
+
+        let mut io1 = Io::new();
+        node1.handle(InEvent::RecvMessage(3, graft), now, &mut io1);
+        let answered = io1.iter().any(|event| {
+            matches!(
+                event,
+                topic::OutEvent::SendMessage(3, topic::Message::Gossip(Message::Gossip(gossip)))
+                    if gossip.id == id && gossip.content == content
+            )
+        });
+        assert!(answered, "1 answers the graft from its cache: {io1:?}");
+    }
+
+    /// A neighbor that already has the message hears the `IHave` and asks for nothing.
+    #[test]
+    fn an_ihave_of_a_message_the_neighbor_has_gives_no_graft() {
+        let config = Config::default();
+        let content = Bytes::from_static(b"the neighbor has it already");
+        let id = MessageId::from_content(&content);
+        let (_node1, now, io) =
+            broadcast_then_neighbor_up(&config, 1024, std::slice::from_ref(&content));
+        let ihaves = ihaves_to(&io, 3).concat();
+        assert!(!ihaves.is_empty(), "node 1 offers its cache to 3: {io:?}");
+
+        let mut node3 = State::new(3, config.clone(), 1024);
+        let mut io3 = Io::new();
+        node3.handle(
+            InEvent::RecvMessage(
+                2,
+                Message::Gossip(Gossip {
+                    id,
+                    content,
+                    scope: DeliveryScope::Swarm(Round(1)),
+                }),
+            ),
+            now,
+            &mut io3,
+        );
+        io3.clear();
+        node3.handle(
+            InEvent::RecvMessage(1, Message::IHave(ihaves)),
+            now,
+            &mut io3,
+        );
+        assert!(
+            !io3.iter().any(|event| matches!(
+                event,
+                topic::OutEvent::ScheduleTimer(_, topic::Timer::Gossip(Timer::SendGraft(_)))
+                    | topic::OutEvent::SendMessage(_, topic::Message::Gossip(Message::Graft(_)))
+            )),
+            "no graft for a message that 3 has: {io3:?}"
+        );
+    }
+
+    /// More cached ids than one frame holds go out in as many frames as the split of the dispatch
+    /// timer makes: ceil(n / ids per frame).
+    #[test]
+    fn the_offer_of_a_large_cache_is_split_into_frames() {
+        let config = Config::default();
+        let max_message_size = 1024;
+        let per_frame = (max_message_size - 1 - 2) / IHave::POSTCARD_MAX_SIZE;
+        let count = per_frame * 2 + 1;
+        let contents: Vec<Bytes> = (0..count)
+            .map(|i| Bytes::from(format!("message {i}")))
+            .collect();
+        let (_state, _now, io) = broadcast_then_neighbor_up(&config, max_message_size, &contents);
+        let frames = ihaves_to(&io, 3);
+        assert_eq!(
+            frames.len(),
+            count.div_ceil(per_frame),
+            "ceil({count} / {per_frame}) frames: {frames:?}"
+        );
+        assert!(frames.iter().all(|frame| frame.len() <= per_frame));
+        let offered: HashSet<MessageId> = frames.concat().iter().map(|ihave| ihave.id).collect();
+        let expected: HashSet<MessageId> = contents
+            .iter()
+            .map(|content| MessageId::from_content(content))
+            .collect();
+        assert_eq!(offered, expected, "every cached id is offered");
+        assert_eq!(
+            frames.concat().len(),
+            count,
+            "every cached id is offered once"
+        );
+    }
+
+    /// A neighbor that goes down before the dispatch timer fires gets none of the offers queued
+    /// for it. An offer to a peer outside the view invites a `Graft`, and `on_graft` takes the
+    /// sender into the eager set without a HyParView link.
+    #[test]
+    fn a_neighbor_that_goes_down_before_the_dispatch_gets_no_offer() {
+        let config = Config::default();
+        let content = Bytes::from_static(b"before the neighbor came up");
+        let mut state = State::new(1, config.clone(), 1024);
+        let now = Instant::now();
+        let mut io = Io::new();
+        state.handle(InEvent::NeighborUp(2), now, &mut io);
+        state.handle(InEvent::Broadcast(content, Scope::Swarm), now, &mut io);
+        state.handle(InEvent::TimerExpired(Timer::DispatchLazyPush), now, &mut io);
+        io.clear();
+        state.handle(InEvent::NeighborUp(3), now, &mut io);
+        state.handle(InEvent::NeighborDown(3), now, &mut io);
+        state.handle(InEvent::TimerExpired(Timer::DispatchLazyPush), now, &mut io);
+        assert_eq!(ihaves_to(&io, 3), Vec::<Vec<IHave>>::new(), "{io:?}");
     }
 }

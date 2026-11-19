@@ -120,7 +120,11 @@ jobs:
     name: Cross Test
     if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
     timeout-minutes: 30
-    runs-on: ubuntu-latest
+    # Runner workaround: on ubuntu-26.04 the i686 container gets ENOSYS from socketpair, so every
+    # tokio runtime with the signal driver panics at start ("failed to create UnixStream").
+    # Run 39972506714 (ubuntu-24.04) passed, run 39985714937 (ubuntu-26.04) failed. Go back to
+    # ubuntu-latest when the cross image runs green on ubuntu-26.04.
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
