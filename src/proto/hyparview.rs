@@ -347,6 +347,11 @@ pub struct State<PI, RG = ThreadRng> {
     /// pass the free slots. A request of the application or a `ForwardJoin` request has no timer
     /// of this kind, so it counts from `pending_neighbor_requests`.
     request_timers: HashMap<PI, usize>,
+    /// How many `NeighborRequestExpired` timers are scheduled for each peer. A refusal or an
+    /// answer takes a request out of `pending_neighbor_requests` and leaves its timer, so a
+    /// newer request to the same peer meets an older timer. Only the last timer of the peer,
+    /// which is the newest, ends the pending entry.
+    expiry_timers: HashMap<PI, usize>,
     /// The peers we answered with a `Neighbor` and that did not send us anything since. Oldest first.
     ///
     /// A `Neighbor` message does not say whether it is a request or an answer: a node reads it as an
@@ -409,6 +414,7 @@ where
             stats: Stats::default(),
             pending_neighbor_requests: Default::default(),
             request_timers: Default::default(),
+            expiry_timers: Default::default(),
             answered_neighbors: Default::default(),
             pending_joins: Default::default(),
             next_join_generation: 0,
@@ -580,10 +586,7 @@ where
                 continue;
             }
             self.send_neighbor(peer, Priority::Low, io);
-            io.push(OutEvent::ScheduleTimer(
-                NEIGHBOR_REQUEST_EXPIRY,
-                Timer::NeighborRequestExpired(peer),
-            ));
+            self.schedule_request_expiry(peer, io);
         }
     }
 
@@ -611,16 +614,29 @@ where
             return;
         }
         self.send_neighbor(peer, Priority::High, io);
+        self.schedule_request_expiry(peer, io);
+    }
+
+    fn schedule_request_expiry(&mut self, peer: PI, io: &mut impl IO<PI>) {
         io.push(OutEvent::ScheduleTimer(
             NEIGHBOR_REQUEST_EXPIRY,
             Timer::NeighborRequestExpired(peer),
         ));
+        *self.expiry_timers.entry(peer).or_default() += 1;
     }
 
     /// A request that nobody answered stops being pending, so that the application can ask again.
     /// Unlike [`Self::handle_pending_neighbor_timer`], it does not touch the passive view and
     /// does not refill the active view.
     fn handle_neighbor_request_expired(&mut self, peer: PI) {
+        // An older timer of the peer leaves a newer request alone: the newest timer is the last.
+        if let Some(timers) = self.expiry_timers.get_mut(&peer) {
+            *timers -= 1;
+            if *timers > 0 {
+                return;
+            }
+            self.expiry_timers.remove(&peer);
+        }
         self.pending_neighbor_requests.remove(&peer);
         self.answered_neighbors.shift_remove(&peer);
     }
@@ -2245,6 +2261,41 @@ mod tests {
         assert!(b.pending_neighbor_requests.is_empty());
     }
 
+    // A refused Low request leaves its expiry timer scheduled. A forced request to the same peer
+    // that follows it must not be cleared by that older timer: the new entry lives for the
+    // whole expiry of its own timer, or a refill takes the last slot before the High answer.
+    #[test]
+    fn the_expiry_of_an_old_request_does_not_clear_a_newer_forced_one() {
+        let mut a = state(0);
+        let mut io = Io::new();
+        a.handle(InEvent::RequestNeighbors(vec![10]), &mut io);
+        recv(&mut a, 10, disconnect(true, false), &mut io);
+        assert!(
+            a.pending_neighbor_requests.is_empty(),
+            "the refusal ends it"
+        );
+        io.clear();
+        a.handle(InEvent::ForceNeighbor(10), &mut io);
+        assert!(a.pending_neighbor_requests.contains(&10));
+
+        // The timer of the Low request is due first.
+        a.handle(
+            InEvent::TimerExpired(Timer::NeighborRequestExpired(10)),
+            &mut io,
+        );
+        assert!(
+            a.pending_neighbor_requests.contains(&10),
+            "the forced request is still pending"
+        );
+
+        // Its own timer ends it.
+        a.handle(
+            InEvent::TimerExpired(Timer::NeighborRequestExpired(10)),
+            &mut io,
+        );
+        assert!(a.pending_neighbor_requests.is_empty());
+    }
+
     // A dial that fails ends the wait at once. With no dial result, the wait ends at the expiry.
     #[test]
     fn a_forced_request_stays_pending_only_until_the_dial_fails_or_the_expiry() {
@@ -2258,6 +2309,13 @@ mod tests {
         io.clear();
         a.handle(InEvent::ForceNeighbor(10), &mut io);
         assert_eq!(high_neighbor_requests(&io), vec![10], "asked again");
+        assert!(a.pending_neighbor_requests.contains(&10));
+        // The failed dial left the timer of the first request. It is due first, and it leaves
+        // the second request alone; the timer of the second request ends it.
+        a.handle(
+            InEvent::TimerExpired(Timer::NeighborRequestExpired(10)),
+            &mut io,
+        );
         assert!(a.pending_neighbor_requests.contains(&10));
         a.handle(
             InEvent::TimerExpired(Timer::NeighborRequestExpired(10)),
