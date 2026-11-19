@@ -91,11 +91,14 @@ impl<PI> Message<PI> {
     #[cfg(feature = "net")]
     pub(crate) fn is_undone_by(&self, side: LinkSide) -> bool {
         use super::hyparview::Message as Swarm;
-        match (&self.message, side) {
-            (topic::Message::Swarm(Swarm::Disconnect(_)), LinkSide::Up) => true,
-            (topic::Message::Swarm(Swarm::Join(_) | Swarm::Neighbor(_)), LinkSide::Down) => true,
-            _ => false,
-        }
+        matches!(
+            (&self.message, side),
+            (topic::Message::Swarm(Swarm::Disconnect(_)), LinkSide::Up)
+                | (
+                    topic::Message::Swarm(Swarm::Join(_) | Swarm::Neighbor(_)),
+                    LinkSide::Down
+                )
+        )
     }
 
     /// Whether this is a `Join`, which the protocol sends once and never again.
