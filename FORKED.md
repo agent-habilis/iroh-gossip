@@ -190,7 +190,9 @@ the peer (`PendingJoin::peer_sent`), or a failed dial (`PendingJoin::dial_failed
 disconnect off to the expiry: at the expiry such a peer, if it is still outside the active view, is
 disconnected. A peer that did neither keeps its dial, which can take longer than the expiry on a
 relay path. A `Join` sent again while one waits keeps `peer_sent`, because the connection of that
-message is still there, but not `dial_failed`, because the new `Join` starts a new dial.
+message is still there, but not `dial_failed`, because the new `Join` starts a new dial. A failed dial
+clears `peer_sent`: the IO layer reports it only for a peer with no connection, so the connection of
+that message is closed.
 
 A failed dial whose queue holds a `Join` sends the new `InEvent::DialFailed`, not
 `PeerDisconnected` (`net.rs`, `handle_dial_failed`): the queue stays for a connection that the peer

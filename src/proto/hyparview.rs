@@ -534,6 +534,10 @@ where
                 // and the peer data go, as on `PeerDisconnected`); only the waiting `Join` is put
                 // back, because the IO layer still holds it for the peer.
                 self.handle_connection_closed(peer, io);
+                // The IO layer reports a failed dial only for a peer with no connection, so the
+                // connection of an earlier message of the peer is closed: that message no longer
+                // puts the disconnect off, the failed dial does.
+                join.peer_sent = false;
                 join.dial_failed = true;
                 self.pending_joins.insert(peer, join);
             }
@@ -1757,6 +1761,26 @@ mod tests {
         let mut a = state(0);
         let mut io = Io::new();
         a.handle(InEvent::RequestJoin(10), &mut io);
+        a.handle(InEvent::DialFailed(10), &mut io);
+        io.clear();
+        a.handle(InEvent::RequestJoin(10), &mut io);
+        let (_, newer) = join_timer(&io, 10);
+        io.clear();
+
+        expire(&mut a, newer, &mut io);
+
+        assert_eq!(disconnects(&io, 10), 0, "the dial of the new Join stays");
+    }
+
+    // A failed dial comes only for a peer that has no connection at the IO layer, so the
+    // connection of a message that the peer sent before is closed. A `Join` sent again after it
+    // starts a new dial, and the old message must not cut that dial at the expiry.
+    #[test]
+    fn a_failed_dial_ends_what_an_earlier_message_of_the_peer_put_off() {
+        let mut a = state(0);
+        let mut io = Io::new();
+        a.handle(InEvent::RequestJoin(10), &mut io);
+        recv(&mut a, 10, shuffle_reply(), &mut io);
         a.handle(InEvent::DialFailed(10), &mut io);
         io.clear();
         a.handle(InEvent::RequestJoin(10), &mut io);
