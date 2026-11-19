@@ -36,7 +36,7 @@ use self::{
 use crate::{
     api::{self, Command, Event, GossipApi, RpcMessage},
     metrics::Metrics,
-    proto::{self, HyparviewConfig, PeerData, PlumtreeConfig, Scope, TopicId},
+    proto::{self, state::LinkSide, HyparviewConfig, PeerData, PlumtreeConfig, Scope, TopicId},
 };
 
 mod address_lookup;
@@ -815,10 +815,11 @@ impl Actor {
     /// for the old one (a `Disconnect` among them would end the new link).
     ///
     /// A resent frame comes after the frames that went straight to the next connection. For a
-    /// HyParView frame that order changes the meaning: an old `Disconnect` after a newer `Neighbor`
-    /// ends the new link. So a HyParView frame is resent only if the last HyParView frame of its
-    /// topic went to `from`, which makes it the newest of its topic. Of a topic that quit, only the
-    /// `Disconnect` is resent.
+    /// HyParView frame that order can change the meaning: an old `Disconnect` after a newer
+    /// `Neighbor` ends the new link. `last_link` holds the last frame of each topic that moved the
+    /// link up or down. If that frame went to another connection, it is newer than every such frame
+    /// of `from`, and an unsent frame that it undoes is dropped (`ProtoMessage::is_undone_by`).
+    /// Every other frame is resent. Of a topic that quit, only the `Disconnect` is resent.
     fn resend_unsent(
         &mut self,
         peer_id: EndpointId,
@@ -829,7 +830,7 @@ impl Actor {
         if unsent.is_empty() {
             return;
         }
-        let Some(PeerState::Active { last_swarm, .. }) = self.peers.get(&peer_id) else {
+        let Some(PeerState::Active { last_link, .. }) = self.peers.get(&peer_id) else {
             debug!(
                 count = unsent.len(),
                 "drop the unsent messages of a closed connection: the peer is not active"
@@ -844,16 +845,14 @@ impl Actor {
             return;
         }
         let before = unsent.len();
-        unsent.retain(|message| {
-            !message.is_swarm()
-                || last_swarm
-                    .get(&message.topic)
-                    .is_none_or(|conn| *conn == from)
+        unsent.retain(|message| match last_link.get(&message.topic) {
+            Some((conn, side)) if *conn != from => !message.is_undone_by(*side),
+            _ => true,
         });
         if unsent.len() < before {
             debug!(
                 count = before - unsent.len(),
-                "drop unsent HyParView frames: a newer frame of their topic went to another connection"
+                "drop unsent HyParView frames: a newer frame of their topic on another connection undoes them"
             );
         }
         // As for the queue of a dial (`drop_queued_frames_of`): a frame of a topic that quit would
@@ -1098,17 +1097,17 @@ impl Actor {
         // A message that must not be lost leads to a disconnect, so that both sides
         // see the same state. See `ProtoMessage::is_droppable`.
         let state = self.peers.entry(peer_id).or_default();
-        let swarm_topic = message.is_swarm().then_some(message.topic);
+        let link = message.link_side().map(|side| (message.topic, side));
         match state {
             PeerState::Active {
                 conns,
                 refused_since,
-                last_swarm,
+                last_link,
             } => match send_on_live(conns, refused_since, message, now) {
                 Ok(conn_id) => {
                     *refused_since = None;
-                    if let Some(topic) = swarm_topic {
-                        last_swarm.insert(topic, conn_id);
+                    if let Some((topic, side)) = link {
+                        last_link.insert(topic, (conn_id, side));
                     }
                 }
                 Err(mpsc::error::TrySendError::Full(message)) => {
@@ -1290,9 +1289,9 @@ enum PeerState {
         conns: ConnSet<ConnHandle>,
         /// Since when the send queue refuses messages, with none accepted in between.
         refused_since: Option<Instant>,
-        /// The connection that took the last HyParView frame of each topic. See
-        /// [`Actor::resend_unsent`].
-        last_swarm: HashMap<TopicId, ConnId>,
+        /// The last frame of each topic that moved the link with the peer up or down, and the
+        /// connection that took it. See [`Actor::resend_unsent`].
+        last_link: HashMap<TopicId, (ConnId, LinkSide)>,
     },
 }
 
@@ -1507,20 +1506,22 @@ impl PeerState {
                 *self = PeerState::Active {
                     conns: ConnSet::default(),
                     refused_since: None,
-                    last_swarm: HashMap::new(),
+                    last_link: HashMap::new(),
                 };
                 queue
             }
             PeerState::Active { .. } => Vec::new(),
         };
         let PeerState::Active {
-            conns, last_swarm, ..
+            conns, last_link, ..
         } = self
         else {
             unreachable!("the state is active now");
         };
-        for message in queue.iter().filter(|message| message.is_swarm()) {
-            last_swarm.insert(message.topic, conn.id);
+        for message in &queue {
+            if let Some(side) = message.link_side() {
+                last_link.insert(message.topic, (conn.id, side));
+            }
         }
         (queue, conns.admit(conn, now))
     }
@@ -5054,6 +5055,65 @@ pub(crate) mod tests {
         assert!(
             !rig.actor.peers.contains_key(&remote_id),
             "the dropped peer does not come back"
+        );
+        Ok(())
+    }
+
+    /// A newer HyParView frame of the topic that does not undo the unsent one leaves it to be
+    /// resent: a `ShuffleReply` on the next connection does not replace a `Neighbor` that the
+    /// closed connection did not write, and a drop would leave the two views out of step.
+    #[tokio::test]
+    #[traced_test]
+    async fn an_unsent_neighbor_is_resent_after_a_newer_shuffle_reply_of_its_topic() -> Result {
+        let mut rig = Rig::new(23, 0).await?;
+        let peer_id = SecretKey::from_bytes(&[23; 32]).public();
+        let mut state = PeerState::default();
+        let mut receivers = HashMap::new();
+        for conn_id in [1, 2] {
+            let (tx, rx) = mpsc::channel(SEND_QUEUE_CAP);
+            let handle = ConnHandle {
+                send_tx: Some(tx),
+                conn: None,
+            };
+            state.admit(
+                Conn::new(conn_id, handle, true, RxClock::new()),
+                Instant::now(),
+            );
+            receivers.insert(conn_id, rx);
+        }
+        rig.actor.peers.insert(peer_id, state);
+        let Some(PeerState::Active { conns, .. }) = rig.actor.peers.get(&peer_id) else {
+            panic!("the peer is active");
+        };
+        let first = conns.chosen().expect("a chosen connection").id;
+        let swarm = |message| ProtoMessage {
+            topic: rig.topic,
+            message: proto::topic::Message::Swarm(message),
+        };
+        let neighbor = swarm(proto::hyparview::Message::Neighbor(
+            proto::hyparview::Neighbor::low(),
+        ));
+        let shuffle_reply = swarm(proto::hyparview::Message::ShuffleReply(
+            proto::hyparview::ShuffleReply::empty(),
+        ));
+
+        let now = Instant::now();
+        rig.actor.send_to_peer(peer_id, neighbor.clone(), now);
+        let mut first_rx = receivers.remove(&first).expect("the first receiver");
+        let unsent = vec![first_rx.try_recv().expect("the Neighbor")];
+        drop(first_rx);
+        rig.actor.send_to_peer(peer_id, shuffle_reply.clone(), now);
+        rig.actor.resend_unsent(peer_id, first, true, unsent);
+
+        let (_, second_rx) = receivers.iter_mut().next().expect("the second receiver");
+        let mut got = Vec::new();
+        while let Ok(message) = second_rx.try_recv() {
+            got.push(format!("{message:?}"));
+        }
+        assert_eq!(
+            got,
+            vec![format!("{shuffle_reply:?}"), format!("{neighbor:?}")],
+            "the Neighbor is resent after the ShuffleReply"
         );
         Ok(())
     }

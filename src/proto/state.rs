@@ -29,6 +29,16 @@ impl TopicId {
     }
 }
 
+/// Which way a HyParView frame moves the link of its topic between two peers.
+#[cfg(feature = "net")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LinkSide {
+    /// `Join`, `ForwardJoin` or `Neighbor`.
+    Up,
+    /// `Disconnect`.
+    Down,
+}
+
 /// Protocol wire message
 ///
 /// This is the wire frame of the `iroh-gossip` protocol.
@@ -60,11 +70,32 @@ impl<PI> Message<PI> {
         )
     }
 
-    /// Whether this is a HyParView frame, whose meaning depends on its order with the other
-    /// HyParView frames of its topic.
+    /// Which way this frame moves the link of its topic with the peer: `Join`, `ForwardJoin` and
+    /// `Neighbor` up, `Disconnect` down. `Shuffle`, `ShuffleReply` and plumtree frames move nothing.
     #[cfg(feature = "net")]
-    pub(crate) fn is_swarm(&self) -> bool {
-        matches!(self.message, topic::Message::Swarm(_))
+    pub(crate) fn link_side(&self) -> Option<LinkSide> {
+        use super::hyparview::Message as Swarm;
+        match self.message {
+            topic::Message::Swarm(Swarm::Join(_) | Swarm::ForwardJoin(_) | Swarm::Neighbor(_)) => {
+                Some(LinkSide::Up)
+            }
+            topic::Message::Swarm(Swarm::Disconnect(_)) => Some(LinkSide::Down),
+            _ => None,
+        }
+    }
+
+    /// Whether a newer frame of `side` to the same peer and topic undoes this one, so that this one
+    /// must not come after it: a `Disconnect` is undone by a frame that brings the link up, a `Join`
+    /// or a `Neighbor` by a `Disconnect`. A `ForwardJoin` introduces another peer, and a `Shuffle`
+    /// or a `ShuffleReply` moves nothing, so nothing undoes them.
+    #[cfg(feature = "net")]
+    pub(crate) fn is_undone_by(&self, side: LinkSide) -> bool {
+        use super::hyparview::Message as Swarm;
+        match (&self.message, side) {
+            (topic::Message::Swarm(Swarm::Disconnect(_)), LinkSide::Up) => true,
+            (topic::Message::Swarm(Swarm::Join(_) | Swarm::Neighbor(_)), LinkSide::Down) => true,
+            _ => false,
+        }
     }
 
     /// Whether this is a `Join`, which the protocol sends once and never again.

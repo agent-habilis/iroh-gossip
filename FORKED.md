@@ -94,10 +94,19 @@ them (`ConnSet::owns`, which also knows the connections that `ConnSet::retire` t
 the protocol dropped, or that came back after the drop, must not get a `Disconnect` that was meant
 for the old link. These messages can come after newer ones that went straight to the next
 connection, and a message that a stopped write had partly sent comes twice. Plumtree takes both.
-For HyParView the order changes the meaning: an old `Disconnect` after a newer `Neighbor` of the
-same topic ends the new link. So the actor notes the connection that took the last HyParView frame
-of each topic (`last_swarm` of the peer), and resends a HyParView frame only if that connection is
-the closed one or no frame of the topic was noted. Of a topic that quit, only the `Disconnect` is
+For HyParView the order can change the meaning: an old `Disconnect` after a newer `Neighbor` of the
+same topic ends the new link. The rule for the resend of an unsent frame of the closed connection:
+
+- The actor notes, per peer and topic, the last frame that moved the link up (`Join`, `ForwardJoin`,
+  `Neighbor`) or down (`Disconnect`), and the connection that took it (`last_link`). It notes it in
+  `send_to_peer` and at the flush of the pending queue. `Shuffle`, `ShuffleReply` and plumtree
+  frames are not noted.
+- If that frame went to another connection, it is newer than every such frame of the closed one.
+  An unsent frame that it undoes is dropped: a `Disconnect` after a frame up, a `Join` or a
+  `Neighbor` after a `Disconnect` (`ProtoMessage::is_undone_by`).
+- Every other frame is resent: a frame of the same side, a `ForwardJoin`, a `Shuffle`, a
+  `ShuffleReply`, a plumtree frame, and any frame of a topic with nothing noted on another
+  connection. Of a topic that quit, only the `Disconnect` is
 resent: a `Join` after the quit would put us back into the view of the peer for a topic that we left,
 as `drop_queued_frames_of` prevents for the queue of a dial. A frame that was written to a QUIC
 stream but not acknowledged is still lost with the connection.
