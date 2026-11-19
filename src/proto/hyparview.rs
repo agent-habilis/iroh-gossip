@@ -33,6 +33,9 @@ pub enum InEvent<PI> {
     RequestJoin(PI),
     /// Ask the given peers for a link with low priority, while the active view has a free slot.
     RequestNeighbors(Vec<PI>),
+    /// Ask the given peer for a link with high priority. A peer with a full active view accepts
+    /// and drops a random counted neighbor to make room.
+    ForceNeighbor(PI),
     /// Replace the set of peers that take no slot of the active view.
     UncountedPeers(Vec<PI>),
     /// Update the peer data that is transmitted on join requests.
@@ -433,6 +436,7 @@ where
             InEvent::DialFailed(peer) => self.handle_dial_failed(peer, io),
             InEvent::RequestJoin(peer) => self.handle_join(peer, io),
             InEvent::RequestNeighbors(peers) => self.handle_request_neighbors(peers, io),
+            InEvent::ForceNeighbor(peer) => self.handle_force_neighbor(peer, io),
             InEvent::UncountedPeers(peers) => {
                 self.uncounted = peers.into_iter().take(MAX_UNCOUNTED_PEERS).collect();
             }
@@ -580,6 +584,26 @@ where
                 Timer::NeighborRequestExpired(peer),
             ));
         }
+    }
+
+    /// Ask one peer for a link with high priority, whether or not our own view is full.
+    ///
+    /// The peer accepts, and drops one random counted neighbor if its view is full. It is the one
+    /// way for the application to take a slot from a full peer without a `Join`, and no
+    /// `ForwardJoin` goes out. It skips the same peers as [`Self::handle_request_neighbors`].
+    fn handle_force_neighbor(&mut self, peer: PI, io: &mut impl IO<PI>) {
+        if peer == self.me
+            || self.left.contains(&peer)
+            || self.active_view.contains(&peer)
+            || self.pending_neighbor_requests.contains(&peer)
+        {
+            return;
+        }
+        self.send_neighbor(peer, Priority::High, io);
+        io.push(OutEvent::ScheduleTimer(
+            NEIGHBOR_REQUEST_EXPIRY,
+            Timer::NeighborRequestExpired(peer),
+        ));
     }
 
     /// A request that nobody answered stops being pending, so that the application can ask again.
@@ -2121,6 +2145,119 @@ mod tests {
         assert!(!a.active_view.contains(&1));
         assert!(sent(&io).contains(&(1, disconnect(false, true))));
         assert_eq!(neighbor_ups(&io), 0);
+    }
+
+    fn high_neighbor_requests(io: &Io) -> Vec<u64> {
+        sent(io)
+            .into_iter()
+            .filter(|(_, message)| {
+                matches!(
+                    message,
+                    Message::Neighbor(Neighbor {
+                        priority: Priority::High,
+                        ..
+                    })
+                )
+            })
+            .map(|(to, _)| to)
+            .collect()
+    }
+
+    #[test]
+    fn force_neighbor_asks_one_peer_with_high_priority_even_when_the_view_is_full() {
+        let mut a = with_active(0, &[1, 2, 3, 4, 5]);
+        let mut io = Io::new();
+        a.handle(InEvent::ForceNeighbor(10), &mut io);
+
+        assert_eq!(high_neighbor_requests(&io), vec![10]);
+        assert_eq!(sent(&io).len(), 1, "no Join and no other message");
+        assert!(a.pending_neighbor_requests.contains(&10));
+        assert_eq!(a.active_view.len(), 5, "a request does not add a neighbor");
+    }
+
+    #[test]
+    fn force_neighbor_expires_like_a_request() {
+        let mut a = state(0);
+        let mut io = Io::new();
+        a.handle(InEvent::ForceNeighbor(10), &mut io);
+        assert!(io.iter().any(|event| matches!(
+            event,
+            topic::OutEvent::ScheduleTimer(
+                NEIGHBOR_REQUEST_EXPIRY,
+                topic::Timer::Swarm(Timer::NeighborRequestExpired(10))
+            )
+        )));
+        a.handle(
+            InEvent::TimerExpired(Timer::NeighborRequestExpired(10)),
+            &mut io,
+        );
+        io.clear();
+        a.handle(InEvent::ForceNeighbor(10), &mut io);
+        assert_eq!(high_neighbor_requests(&io), vec![10]);
+    }
+
+    #[test]
+    fn force_neighbor_skips_self_neighbors_pending_requests_and_left_peers() {
+        let mut a = with_active(0, &[1]);
+        a.left.insert(2);
+        let mut io = Io::new();
+        for peer in [0, 1, 2] {
+            a.handle(InEvent::ForceNeighbor(peer), &mut io);
+        }
+        assert!(sent(&io).is_empty());
+
+        a.handle(InEvent::ForceNeighbor(3), &mut io);
+        a.handle(InEvent::ForceNeighbor(3), &mut io);
+        assert_eq!(high_neighbor_requests(&io), vec![3], "3 is pending");
+    }
+
+    #[test]
+    fn a_full_peer_accepts_a_high_request_and_drops_one_counted_neighbor() {
+        let mut full = with_active(1, &[2, 3, 4, 5, 6]);
+        let mut asker = state(0);
+        let (mut io_asker, mut io_full) = (Io::new(), Io::new());
+        asker.handle(InEvent::ForceNeighbor(1), &mut io_asker);
+        let request = sent(&io_asker).remove(0).1;
+
+        recv(&mut full, 0, request, &mut io_full);
+
+        assert!(full.active_view.contains(&0));
+        assert_eq!(full.active_view.len(), 5);
+        let dropped: Vec<u64> = (2..=6).filter(|p| !full.active_view.contains(p)).collect();
+        assert_eq!(dropped.len(), 1, "exactly one neighbor is dropped");
+        assert!(sent(&io_full).contains(&(dropped[0], disconnect(true, false))));
+        assert!(!sent(&io_full)
+            .iter()
+            .any(|(_, message)| matches!(message, Message::ForwardJoin(_))));
+    }
+
+    #[test]
+    fn a_high_request_never_drops_an_uncounted_neighbor() {
+        for me in 100..140 {
+            let mut full = with_active(me, &[1, 2, 3, 4, 5, 6, 7]);
+            full.uncounted.extend([1, 2]);
+            let mut io = Io::new();
+            recv(&mut full, 10, neighbor(Priority::High), &mut io);
+            assert!(full.active_view.contains(&1) && full.active_view.contains(&2));
+            assert!(full.active_view.contains(&10));
+            assert_eq!(full.counted_active_len(), 5);
+        }
+    }
+
+    #[test]
+    fn a_peer_that_left_refuses_a_forced_request() {
+        let mut asker = state(0);
+        let mut left = with_active(1, &[2, 3]);
+        left.left.insert(0);
+        let (mut io_asker, mut io_left) = (Io::new(), Io::new());
+        asker.handle(InEvent::ForceNeighbor(1), &mut io_asker);
+        let request = sent(&io_asker).remove(0).1;
+
+        recv(&mut left, 0, request, &mut io_left);
+
+        assert!(!left.active_view.contains(&0));
+        assert!(sent(&io_left).contains(&(0, disconnect(false, true))));
+        assert_eq!(left.active_view.len(), 2, "nobody is dropped");
     }
 
     #[test]
