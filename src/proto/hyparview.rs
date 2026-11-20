@@ -352,6 +352,11 @@ pub struct State<PI, RG = ThreadRng> {
     /// newer request to the same peer meets an older timer. Only the last timer of the peer,
     /// which is the newest, ends the pending entry.
     expiry_timers: HashMap<PI, usize>,
+    /// The peers that the application asked with [`InEvent::ForceNeighbor`]. An entry counts only
+    /// while the peer is in `pending_neighbor_requests`; `handle_force_neighbor` drops the others.
+    /// The answer of such a peer is a `High` message that evicts a neighbor when the view is full,
+    /// so a pending forced request holds a slot (see [`State::forced_requests_hold_the_slots`]).
+    forced_requests: HashSet<PI>,
     /// The peers we answered with a `Neighbor` and that did not send us anything since. Oldest first.
     ///
     /// A `Neighbor` message does not say whether it is a request or an answer: a node reads it as an
@@ -415,6 +420,7 @@ where
             pending_neighbor_requests: Default::default(),
             request_timers: Default::default(),
             expiry_timers: Default::default(),
+            forced_requests: Default::default(),
             answered_neighbors: Default::default(),
             pending_joins: Default::default(),
             next_join_generation: 0,
@@ -598,7 +604,8 @@ where
     ///
     /// It sends nothing when the counted neighbors and the pending requests fill the view: the
     /// answer of the peer is a high priority `Neighbor` message, and it would evict a second
-    /// neighbor of ours to make room for the peer.
+    /// neighbor of ours to make room for the peer. While the request waits, it holds a slot: a
+    /// `Low` request of another peer that would take the last free slot is refused.
     fn handle_force_neighbor(&mut self, peer: PI, io: &mut impl IO<PI>) {
         if self.counted_active_len() + self.pending_neighbor_requests.len()
             >= self.config.active_view_capacity
@@ -613,7 +620,10 @@ where
         {
             return;
         }
+        self.forced_requests
+            .retain(|pending| self.pending_neighbor_requests.contains(pending));
         self.send_neighbor(peer, Priority::High, io);
+        self.forced_requests.insert(peer);
         self.schedule_request_expiry(peer, io);
     }
 
@@ -1232,12 +1242,36 @@ where
                 self.add_active_unchecked(peer, Priority::High, reply, io);
                 true
             }
+            (Priority::Low, false) if self.forced_requests_hold_the_slots(&peer) => false,
             (Priority::Low, false) => {
                 self.add_active_unchecked(peer, Priority::Low, reply, io);
                 true
             }
             (Priority::Low, true) => false,
         }
+    }
+
+    /// Whether the counted neighbors and the pending forced requests fill the active view, so
+    /// that a `Low` request of `peer` is refused.
+    ///
+    /// The answer to a forced request is a `High` message, and it evicts a random neighbor when
+    /// the view is full by then. A `Low` request that took the slot in the meantime would make it
+    /// evict. A request of `peer` itself is the answer of a crossing pair: `on_neighbor` took it
+    /// out of the pending set before it comes here, so it is not counted. An uncounted peer takes
+    /// no slot and holds none.
+    fn forced_requests_hold_the_slots(&self, peer: &PI) -> bool {
+        if self.uncounted.contains(peer) {
+            return false;
+        }
+        let held = self
+            .forced_requests
+            .iter()
+            .filter(|forced| {
+                self.pending_neighbor_requests.contains(*forced)
+                    && !self.uncounted.contains(*forced)
+            })
+            .count();
+        self.counted_active_len() + held >= self.config.active_view_capacity
     }
 
     fn add_active_unchecked(
@@ -1259,6 +1293,7 @@ where
 
     fn send_neighbor(&mut self, peer: PI, priority: Priority, io: &mut impl IO<PI>) {
         if self.pending_neighbor_requests.insert(peer) {
+            self.forced_requests.remove(&peer);
             let message = Message::Neighbor(Neighbor {
                 priority,
                 data: self.me_data.clone(),
@@ -2234,6 +2269,80 @@ mod tests {
 
         assert!(sent(&io).is_empty());
         assert_eq!(a.pending_neighbor_requests.len(), 1);
+    }
+
+    // The forced request waits for its High answer, and that answer evicts a neighbor when the
+    // view is full. A Low request of another peer that takes the last slot in the meantime would
+    // make it evict: the wait holds the slot.
+    #[test]
+    fn a_low_request_cannot_take_the_slot_that_a_forced_request_waits_for() {
+        let mut a = with_active(0, &[1, 2, 3, 4]);
+        let mut io = Io::new();
+        a.handle(InEvent::ForceNeighbor(10), &mut io);
+        io.clear();
+
+        recv(&mut a, 20, neighbor(Priority::Low), &mut io);
+        assert!(!a.active_view.contains(&20), "the held slot is not free");
+        assert!(sent(&io).contains(&(20, disconnect(true, false))));
+        assert_eq!(neighbor_ups(&io), 0);
+        io.clear();
+
+        recv(&mut a, 10, neighbor(Priority::High), &mut io);
+        assert!(a.active_view.contains(&10));
+        for peer in [1, 2, 3, 4] {
+            assert!(a.active_view.contains(&peer), "{peer} is not evicted");
+        }
+        assert_eq!(a.active_view.len(), 5);
+        assert!(!io
+            .iter()
+            .any(|event| matches!(event, topic::OutEvent::DisconnectPeer(_))));
+    }
+
+    // A Low request of the very peer that the forced request waits on is the answer of a crossing
+    // pair, and it takes the slot that was held for it.
+    #[test]
+    fn a_low_request_from_the_forced_peer_takes_its_own_held_slot() {
+        let mut a = with_active(0, &[1, 2, 3, 4]);
+        let mut io = Io::new();
+        a.handle(InEvent::ForceNeighbor(10), &mut io);
+        io.clear();
+
+        recv(&mut a, 10, neighbor(Priority::Low), &mut io);
+
+        assert!(a.active_view.contains(&10));
+        assert_eq!(a.active_view.len(), 5);
+        assert!(a.pending_neighbor_requests.is_empty());
+    }
+
+    // Once the forced request ends, with a refusal, a failed dial or its expiry, nothing holds
+    // the slot and a Low request is accepted again.
+    #[test]
+    fn a_forced_request_that_ended_holds_no_slot() {
+        let mut a = with_active(0, &[1, 2, 3, 4]);
+        let mut io = Io::new();
+        a.handle(InEvent::ForceNeighbor(10), &mut io);
+        a.handle(
+            InEvent::TimerExpired(Timer::NeighborRequestExpired(10)),
+            &mut io,
+        );
+        io.clear();
+
+        recv(&mut a, 20, neighbor(Priority::Low), &mut io);
+
+        assert!(a.active_view.contains(&20));
+    }
+
+    // A Low request that waits is no risk: its answer is Low, and a full view refuses it.
+    #[test]
+    fn a_low_request_still_takes_a_slot_that_a_low_request_waits_for() {
+        let mut a = with_active(0, &[1, 2, 3, 4]);
+        let mut io = Io::new();
+        a.handle(InEvent::RequestNeighbors(vec![10]), &mut io);
+        io.clear();
+
+        recv(&mut a, 20, neighbor(Priority::Low), &mut io);
+
+        assert!(a.active_view.contains(&20));
     }
 
     // The two requests of a crossing pair read as the answer of each other, as with two Low
