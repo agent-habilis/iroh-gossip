@@ -35,7 +35,7 @@ pub enum InEvent<PI> {
     RequestNeighbors(Vec<PI>),
     /// Ask the given peer for a link with high priority, while our own active view has a free
     /// slot. A peer with a full active view accepts and drops a random counted neighbor to make
-    /// room. Nothing is sent when our view is full.
+    /// room. Nothing is sent when our view is full, unless the peer is uncounted.
     ForceNeighbor(PI),
     /// Replace the set of peers that take no slot of the active view.
     UncountedPeers(Vec<PI>),
@@ -605,10 +605,14 @@ where
     /// It sends nothing when the counted neighbors and the pending requests fill the view: the
     /// answer of the peer is a high priority `Neighbor` message, and it would evict a second
     /// neighbor of ours to make room for the peer. While the request waits, it holds a slot: a
-    /// `Low` request of another peer that would take the last free slot is refused.
+    /// `Low` request of another peer that would take the last free slot is refused. An uncounted
+    /// peer takes no slot: the request goes out from a full view and holds nothing.
     fn handle_force_neighbor(&mut self, peer: PI, io: &mut impl IO<PI>) {
-        if self.counted_active_len() + self.pending_neighbor_requests.len()
-            >= self.config.active_view_capacity
+        // An uncounted peer takes no slot, so a full view has room for it, and its answer evicts
+        // nobody.
+        if !self.uncounted.contains(&peer)
+            && self.counted_active_len() + self.pending_neighbor_requests.len()
+                >= self.config.active_view_capacity
         {
             debug!(other = ?peer, "no forced neighbor request: the active view is full");
             return;
@@ -2338,6 +2342,40 @@ mod tests {
         let mut a = with_active(0, &[1, 2, 3, 4]);
         let mut io = Io::new();
         a.handle(InEvent::RequestNeighbors(vec![10]), &mut io);
+        io.clear();
+
+        recv(&mut a, 20, neighbor(Priority::Low), &mut io);
+
+        assert!(a.active_view.contains(&20));
+    }
+
+    // An uncounted peer takes no slot, so a full view has room for it, and its answer evicts
+    // nobody.
+    #[test]
+    fn a_full_asker_forces_a_neighbor_to_an_uncounted_peer() {
+        let mut a = with_active(0, &[1, 2, 3, 4, 5]);
+        a.uncounted.insert(10);
+        let mut io = Io::new();
+        a.handle(InEvent::ForceNeighbor(10), &mut io);
+        assert_eq!(high_neighbor_requests(&io), vec![10]);
+        io.clear();
+
+        recv(&mut a, 10, neighbor(Priority::High), &mut io);
+
+        assert!(a.active_view.contains(&10));
+        assert_eq!(a.active_view.len(), 6);
+        assert!(!io
+            .iter()
+            .any(|event| matches!(event, topic::OutEvent::DisconnectPeer(_))));
+    }
+
+    // The forced request to an uncounted peer holds no slot: its answer takes none.
+    #[test]
+    fn a_forced_request_to_an_uncounted_peer_holds_no_slot() {
+        let mut a = with_active(0, &[1, 2, 3, 4]);
+        a.uncounted.insert(10);
+        let mut io = Io::new();
+        a.handle(InEvent::ForceNeighbor(10), &mut io);
         io.clear();
 
         recv(&mut a, 20, neighbor(Priority::Low), &mut io);

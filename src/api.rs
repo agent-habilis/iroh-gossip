@@ -227,7 +227,10 @@ impl GossipSender {
     ///
     /// This node sends the request only while its own active view has a free slot, counting the
     /// requests that wait for an answer. With a full view it sends nothing: the answer of the
-    /// peer would evict a second neighbor of this node. Call it at most once for each window of
+    /// peer would evict a second neighbor of this node. The request holds a slot while it waits,
+    /// so a low priority request of another peer cannot take the last free slot. A peer named by
+    /// [`uncounted_peers`](Self::uncounted_peers) takes no slot: the request goes out from
+    /// a full view and holds nothing. Call it at most once for each window of
     /// time, because each call can cost a neighbor of the peer. Use
     /// [`neighbor_peers`](Self::neighbor_peers) first, and this request only when a low priority
     /// request cannot link the pair.
