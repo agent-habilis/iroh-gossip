@@ -47,12 +47,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "allocator-api2"
-version = "0.2.21"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
-
-[[package]]
 name = "android_system_properties"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1279,8 +1273,6 @@ version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 dependencies = [
- "allocator-api2",
- "equivalent",
  "foldhash 0.2.0",
 ]
 
@@ -1687,7 +1679,7 @@ dependencies = [
 [[package]]
 name = "iroh"
 version = "1.0.3"
-source = "git+https://github.com/agent-habilis/iroh?rev=59ce32952fe36506541f7d891a16eb1a5fda734f#59ce32952fe36506541f7d891a16eb1a5fda734f"
+source = "git+https://github.com/agent-habilis/iroh?rev=86ff046f4c4937d3629582e3885232c094cd6b07#86ff046f4c4937d3629582e3885232c094cd6b07"
 dependencies = [
  "axum",
  "backon",
@@ -1737,7 +1729,7 @@ dependencies = [
 [[package]]
 name = "iroh-base"
 version = "1.0.3"
-source = "git+https://github.com/agent-habilis/iroh?rev=59ce32952fe36506541f7d891a16eb1a5fda734f#59ce32952fe36506541f7d891a16eb1a5fda734f"
+source = "git+https://github.com/agent-habilis/iroh?rev=86ff046f4c4937d3629582e3885232c094cd6b07#86ff046f4c4937d3629582e3885232c094cd6b07"
 dependencies = [
  "curve25519-dalek",
  "data-encoding",
@@ -1755,7 +1747,7 @@ dependencies = [
 [[package]]
 name = "iroh-dns"
 version = "1.0.3"
-source = "git+https://github.com/agent-habilis/iroh?rev=59ce32952fe36506541f7d891a16eb1a5fda734f#59ce32952fe36506541f7d891a16eb1a5fda734f"
+source = "git+https://github.com/agent-habilis/iroh?rev=86ff046f4c4937d3629582e3885232c094cd6b07#86ff046f4c4937d3629582e3885232c094cd6b07"
 dependencies = [
  "arc-swap",
  "cfg_aliases",
@@ -1850,7 +1842,7 @@ dependencies = [
 [[package]]
 name = "iroh-relay"
 version = "1.0.3"
-source = "git+https://github.com/agent-habilis/iroh?rev=59ce32952fe36506541f7d891a16eb1a5fda734f#59ce32952fe36506541f7d891a16eb1a5fda734f"
+source = "git+https://github.com/agent-habilis/iroh?rev=86ff046f4c4937d3629582e3885232c094cd6b07#86ff046f4c4937d3629582e3885232c094cd6b07"
 dependencies = [
  "blake3",
  "bytes",
@@ -2110,9 +2102,9 @@ dependencies = [
 
 [[package]]
 name = "lru"
-version = "0.18.0"
+version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a860605968fce16869fd239cf4237a82f3ac470723415db603b0e8b6c8d4fb9"
+checksum = "4a9f71e3591c7ec44d3e563e87bf14ddc2bada8519dca046e5b0e560cd004e2d"
 dependencies = [
  "hashbrown 0.17.1",
 ]
