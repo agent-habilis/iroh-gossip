@@ -2347,6 +2347,49 @@ mod tests {
         );
     }
 
+    // The mark of a forced request that ended must not make a later High request of the same peer
+    // forced. A `ForwardJoin` at ttl 0 asks with High priority too, and its answer keeps the rule
+    // of the paper: it evicts a neighbor when the view is full.
+    #[test]
+    fn the_mark_of_an_ended_forced_request_does_not_make_a_later_request_forced() {
+        let mut a = with_active(0, &[1, 2, 3, 4]);
+        let mut io = Io::new();
+        a.handle(InEvent::ForceNeighbor(10), &mut io);
+        a.handle(
+            InEvent::TimerExpired(Timer::NeighborRequestExpired(10)),
+            &mut io,
+        );
+        recv(&mut a, 20, Message::Join(None), &mut io);
+        assert_eq!(a.active_view.len(), 5, "the Join took the last slot");
+        io.clear();
+
+        recv(&mut a, 1, forward_join(10, 0), &mut io);
+        assert!(high_neighbor_requests(&io).contains(&10));
+        io.clear();
+        recv(&mut a, 10, neighbor(Priority::High), &mut io);
+
+        assert!(a.active_view.contains(&10));
+        assert_eq!(a.active_view.len(), 5, "one neighbor made room");
+    }
+
+    // The set of the forced requests is pruned at each call, so it holds the pending requests and
+    // one more, whatever the number of peers that were asked.
+    #[test]
+    fn the_forced_requests_do_not_grow_with_the_peers_that_were_asked() {
+        let mut a = with_active(0, &[1, 2]);
+        let mut io = Io::new();
+        for peer in 100..1100 {
+            a.handle(InEvent::ForceNeighbor(peer), &mut io);
+            a.handle(
+                InEvent::TimerExpired(Timer::NeighborRequestExpired(peer)),
+                &mut io,
+            );
+            io.clear();
+        }
+
+        assert!(a.forced_requests.len() <= a.pending_neighbor_requests.len() + 1);
+    }
+
     // Only the answer to our own forced request is refused. A High answer to another request,
     // for example the request that a `ForwardJoin` at ttl 0 sends, keeps the rule of the paper.
     #[test]

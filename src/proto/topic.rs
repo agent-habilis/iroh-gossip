@@ -230,8 +230,9 @@ pub enum Command<PI> {
     /// the active view of this node is full, counting the pending requests, unless the peer is
     /// uncounted. The request holds a slot while it waits: a [`Command::NeighborPeers`] request
     /// of another peer cannot take the last free slot. If a [`Command::Join`] request fills the
-    /// view in the meantime, this node refuses the answer of the peer and drops no neighbor. On a
-    /// topic that was not joined, the command is dropped.
+    /// view in the meantime, this node refuses the answer of the peer and drops no neighbor, but
+    /// the peer has dropped one of its own by then. Send it at most once for each window of time.
+    /// On a topic that was not joined, the command is dropped.
     ForceNeighborPeer(PI),
     /// Name the peers that take no slot of the active view. The set replaces the last one.
     ///

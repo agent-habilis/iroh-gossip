@@ -231,7 +231,8 @@ impl GossipSender {
     /// so a low priority request of another peer cannot take the last free slot. A
     /// [`join_peers`](Self::join_peers) request is always accepted, and it can still fill the view
     /// in the meantime: then this node refuses the answer of the peer, and no neighbor of this
-    /// node is dropped. A peer named by
+    /// node is dropped. The peer has dropped one of its own neighbors by then, so a refused call
+    /// can still cost the peer a neighbor. A peer named by
     /// [`uncounted_peers`](Self::uncounted_peers) takes no slot: the request goes out from
     /// a full view and holds nothing. Call it at most once for each window of
     /// time, because each call can cost a neighbor of the peer. Use
