@@ -443,10 +443,12 @@ pub enum Command {
     LeavePeers(Vec<EndpointId>),
     /// Asks a set of peers for a link with low priority.
     NeighborPeers(Vec<EndpointId>),
-    /// Asks one peer for a link with high priority.
-    ForceNeighborPeer(EndpointId),
     /// Names the peers that take no slot of the active view.
     UncountedPeers(Vec<EndpointId>),
+    /// Asks one peer for a link with high priority.
+    ///
+    /// It stays the last variant: the enum crosses the RPC link, and postcard writes the index.
+    ForceNeighborPeer(EndpointId),
 }
 
 /// Options for joining a gossip topic.
@@ -478,6 +480,22 @@ impl JoinOptions {
 #[cfg(test)]
 mod tests {
     use crate::api::GossipTopic;
+
+    // `Command` crosses the RPC link, and postcard writes the index of a variant. A variant added
+    // in the middle gives every variant after it a new index, so a peer of an older build reads a
+    // command as another one. New variants go at the end.
+    #[test]
+    fn a_command_variant_keeps_its_postcard_index() {
+        use iroh_base::SecretKey;
+
+        use crate::api::Command;
+
+        let id = SecretKey::from_bytes(&[1; 32]).public();
+        let index = |command: Command| postcard::to_allocvec(&command).unwrap()[0];
+
+        assert_eq!(index(Command::UncountedPeers(vec![id])), 5);
+        assert_eq!(index(Command::ForceNeighborPeer(id)), 6);
+    }
 
     #[cfg(all(feature = "rpc", feature = "net"))]
     #[tokio::test]
