@@ -1679,7 +1679,7 @@ dependencies = [
 [[package]]
 name = "iroh"
 version = "1.0.3"
-source = "git+https://github.com/agent-habilis/iroh?rev=86ff046f4c4937d3629582e3885232c094cd6b07#86ff046f4c4937d3629582e3885232c094cd6b07"
+source = "git+https://github.com/agent-habilis/iroh?rev=aa9814fb0f3e9a31cef3be5622ef5731c4db61fd#aa9814fb0f3e9a31cef3be5622ef5731c4db61fd"
 dependencies = [
  "axum",
  "backon",
@@ -1705,7 +1705,7 @@ dependencies = [
  "netwatch",
  "noq 1.1.0",
  "noq-proto 1.1.0",
- "noq-udp 1.1.0",
+ "noq-udp",
  "papaya",
  "pin-project",
  "portable-atomic",
@@ -1729,7 +1729,7 @@ dependencies = [
 [[package]]
 name = "iroh-base"
 version = "1.0.3"
-source = "git+https://github.com/agent-habilis/iroh?rev=86ff046f4c4937d3629582e3885232c094cd6b07#86ff046f4c4937d3629582e3885232c094cd6b07"
+source = "git+https://github.com/agent-habilis/iroh?rev=aa9814fb0f3e9a31cef3be5622ef5731c4db61fd#aa9814fb0f3e9a31cef3be5622ef5731c4db61fd"
 dependencies = [
  "curve25519-dalek",
  "data-encoding",
@@ -1747,7 +1747,7 @@ dependencies = [
 [[package]]
 name = "iroh-dns"
 version = "1.0.3"
-source = "git+https://github.com/agent-habilis/iroh?rev=86ff046f4c4937d3629582e3885232c094cd6b07#86ff046f4c4937d3629582e3885232c094cd6b07"
+source = "git+https://github.com/agent-habilis/iroh?rev=aa9814fb0f3e9a31cef3be5622ef5731c4db61fd#aa9814fb0f3e9a31cef3be5622ef5731c4db61fd"
 dependencies = [
  "arc-swap",
  "cfg_aliases",
@@ -1842,7 +1842,7 @@ dependencies = [
 [[package]]
 name = "iroh-relay"
 version = "1.0.3"
-source = "git+https://github.com/agent-habilis/iroh?rev=86ff046f4c4937d3629582e3885232c094cd6b07#86ff046f4c4937d3629582e3885232c094cd6b07"
+source = "git+https://github.com/agent-habilis/iroh?rev=aa9814fb0f3e9a31cef3be5622ef5731c4db61fd#aa9814fb0f3e9a31cef3be5622ef5731c4db61fd"
 dependencies = [
  "blake3",
  "bytes",
@@ -2341,7 +2341,7 @@ dependencies = [
 [[package]]
 name = "netwatch"
 version = "0.19.1"
-source = "git+https://github.com/agent-habilis/net-tools?rev=055e406c2fb54840940fc1c04b30af771a571448#055e406c2fb54840940fc1c04b30af771a571448"
+source = "git+https://github.com/agent-habilis/net-tools?rev=9241a12a8273f092a4cb1a0d28a1244a3c148341#9241a12a8273f092a4cb1a0d28a1244a3c148341"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -2358,7 +2358,7 @@ dependencies = [
  "netlink-packet-route",
  "netlink-proto",
  "netlink-sys",
- "noq-udp 1.1.0",
+ "noq-udp",
  "objc2-core-foundation",
  "objc2-system-configuration",
  "pin-project-lite",
@@ -2387,13 +2387,13 @@ dependencies = [
 [[package]]
 name = "noq"
 version = "1.1.0"
-source = "git+https://github.com/agent-habilis/noq?rev=a3597b1f9fd4390b04c4915e8a4ded6c08331b28#a3597b1f9fd4390b04c4915e8a4ded6c08331b28"
+source = "git+https://github.com/agent-habilis/noq?rev=95c4a2edea4d93783b94fe4d83ed1e9e084472ee#95c4a2edea4d93783b94fe4d83ed1e9e084472ee"
 dependencies = [
  "bytes",
  "cfg_aliases",
  "derive_more",
  "noq-proto 1.1.0",
- "noq-udp 1.1.0",
+ "noq-udp",
  "pin-project-lite",
  "rustc-hash",
  "rustls",
@@ -2415,7 +2415,7 @@ dependencies = [
  "cfg_aliases",
  "derive_more",
  "noq-proto 1.1.1",
- "noq-udp 1.1.1",
+ "noq-udp",
  "pin-project-lite",
  "rustc-hash",
  "rustls",
@@ -2430,7 +2430,7 @@ dependencies = [
 [[package]]
 name = "noq-proto"
 version = "1.1.0"
-source = "git+https://github.com/agent-habilis/noq?rev=a3597b1f9fd4390b04c4915e8a4ded6c08331b28#a3597b1f9fd4390b04c4915e8a4ded6c08331b28"
+source = "git+https://github.com/agent-habilis/noq?rev=95c4a2edea4d93783b94fe4d83ed1e9e084472ee#95c4a2edea4d93783b94fe4d83ed1e9e084472ee"
 dependencies = [
  "aes-gcm",
  "bytes",
@@ -2484,21 +2484,9 @@ dependencies = [
 
 [[package]]
 name = "noq-udp"
-version = "1.1.0"
-source = "git+https://github.com/agent-habilis/noq?rev=a3597b1f9fd4390b04c4915e8a4ded6c08331b28#a3597b1f9fd4390b04c4915e8a4ded6c08331b28"
-dependencies = [
- "cfg_aliases",
- "libc",
- "socket2",
- "tracing",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "noq-udp"
-version = "1.1.1"
+version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02bba20e097a5a16cd0ad14ec882fae1e80a092a124e9422fc4dddd92e96a647"
+checksum = "716df6621d528211d75608903c0dd54bee78745444cdcbb791bcfbc55717a29f"
 dependencies = [
  "cfg_aliases",
  "libc",
