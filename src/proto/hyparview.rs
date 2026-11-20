@@ -605,7 +605,8 @@ where
     /// It sends nothing when the counted neighbors and the pending requests fill the view: the
     /// answer of the peer is a high priority `Neighbor` message, and it would evict a second
     /// neighbor of ours to make room for the peer. While the request waits, it holds a slot: a
-    /// `Low` request of another peer that would take the last free slot is refused. An uncounted
+    /// `Low` request of another peer that would take the last free slot is refused. A `Join` is
+    /// always accepted and can still fill the view: `on_neighbor` then refuses the answer. An uncounted
     /// peer takes no slot: the request goes out from a full view and holds nothing.
     fn handle_force_neighbor(&mut self, peer: PI, io: &mut impl IO<PI>) {
         // An uncounted peer takes no slot, so a full view has room for it, and its answer evicts
@@ -900,11 +901,26 @@ where
         let was_asked = self.pending_neighbor_requests.remove(&from);
         let was_answered = self.answered_neighbors.shift_remove(&from);
         let is_reply = was_asked || was_answered;
+        let was_forced = was_asked && self.forced_requests.remove(&from);
         // This refuses a `High` priority request on purpose, against the HyParView paper: after a
         // leave, only a `Join` links the pair again. The refusal tells the far side to tombstone
         // us too, which ends a joint dial.
         if self.left.contains(&from) {
             self.send_disconnect(from, false, true, io);
+            return;
+        }
+        // The answer to our own forced request is `High`, and a full view would evict a neighbor
+        // of ours for it. A `Join` is always accepted, so it can take the last slot while the
+        // request waits, and a held slot does not stop it. The application asked for a link
+        // that costs no neighbor of ours, so we refuse the answer and keep all of them. Every
+        // other `High` message keeps the rule of the paper.
+        if was_forced
+            && details.priority == Priority::High
+            && self.active_is_full()
+            && !self.uncounted.contains(&from)
+            && !self.active_view.contains(&from)
+        {
+            self.send_disconnect(from, true, false, io);
             return;
         }
         let do_reply = !is_reply;
@@ -2300,6 +2316,49 @@ mod tests {
         assert!(!io
             .iter()
             .any(|event| matches!(event, topic::OutEvent::DisconnectPeer(_))));
+    }
+
+    // A `Join` is always accepted, so it can take the last slot while the forced request waits.
+    // The High answer of the forced peer then meets a full view. It does not evict a neighbor of
+    // ours: we refuse it, as we refuse a Low request.
+    #[test]
+    fn a_forced_peer_that_answers_into_a_full_view_is_refused_and_evicts_nobody() {
+        let mut a = with_active(0, &[1, 2, 3, 4]);
+        let mut io = Io::new();
+        a.handle(InEvent::ForceNeighbor(10), &mut io);
+        recv(&mut a, 20, Message::Join(None), &mut io);
+        assert_eq!(a.active_view.len(), 5, "the Join took the last slot");
+        io.clear();
+
+        recv(&mut a, 10, neighbor(Priority::High), &mut io);
+
+        assert!(!a.active_view.contains(&10));
+        for peer in [1, 2, 3, 4, 20] {
+            assert!(a.active_view.contains(&peer), "{peer} is not evicted");
+        }
+        assert!(sent(&io).contains(&(10, disconnect(true, false))));
+        assert_eq!(neighbor_ups(&io), 0);
+        assert!(!io
+            .iter()
+            .any(|event| matches!(event, topic::OutEvent::DisconnectPeer(peer) if *peer != 10)));
+        assert!(
+            !a.pending_neighbor_requests.contains(&10),
+            "the answer ended the request"
+        );
+    }
+
+    // Only the answer to our own forced request is refused. A High answer to another request,
+    // for example the request that a `ForwardJoin` at ttl 0 sends, keeps the rule of the paper.
+    #[test]
+    fn a_high_answer_to_a_request_that_was_not_forced_still_evicts() {
+        let mut a = with_active(0, &[1, 2, 3, 4, 5]);
+        a.pending_neighbor_requests.insert(10);
+        let mut io = Io::new();
+
+        recv(&mut a, 10, neighbor(Priority::High), &mut io);
+
+        assert!(a.active_view.contains(&10));
+        assert_eq!(a.active_view.len(), 5, "one neighbor made room");
     }
 
     // A Low request of the very peer that the forced request waits on is the answer of a crossing
