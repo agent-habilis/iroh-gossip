@@ -727,7 +727,27 @@ where
         // a “time to live” field that is initially set to ARWL and decreased at every hop. (7)"
         let ttl = self.config.active_random_walk_length;
         let peer_info = PeerInfo { id: peer, data };
+        // One counted member gets a walk that is at its end already, so that it adopts the joiner at
+        // once. A walk of the full length can end at this node, which holds the joiner and adopts
+        // nobody, and in a small mesh every walk can do so. The pick is among the counted peers: an
+        // uncounted peer is no member, and a walk that ends there gives the joiner no member.
+        // A member that holds the joiner already, or holds its tombstone, still spends this walk.
+        // The candidates are in the order of the active view, so the pick is a function of the seed
+        // and of nothing else. Filter by the uncounted set, and never iterate it: it has no order.
+        let counted: Vec<PI> = self
+            .active_view
+            .iter_without(&peer)
+            .filter(|node| !self.uncounted.contains(node))
+            .copied()
+            .collect();
+        let introduced = counted.choose(&mut self.rng).copied();
         for node in self.active_view.iter_without(&peer) {
+            let ttl = if introduced == Some(*node) {
+                // The value that `Ttl::expired` reads as the end of a walk.
+                Ttl(0)
+            } else {
+                ttl
+            };
             let message = Message::ForwardJoin(ForwardJoin {
                 peer: peer_info.clone(),
                 ttl,
@@ -1567,21 +1587,18 @@ mod tests {
             "the exchange did not end: {} messages left",
             queue.len()
         );
-        // A guard against a storm, and a count that is exact on purpose. The exchange has 13 Neighbor
-        // messages that name the joiner, in this order (the walk is forced in a clique of three):
+        // A guard against a storm, and a count that is exact on purpose. The exchange has 4 Neighbor
+        // messages that name the joiner, in this order. The contact node gives the walk at its end to
+        // `a`, and the walk of the full length goes to the creator:
         //  1-2   the handshake: the request of the contact node and the answer of the joiner;
-        //  3-4   two renews of the contact node (ttl 4): #3 is absorbed by the answered_neighbors
-        //        entry that #2 left, #4 is answered by the joiner (5);
-        //  5-6   the joiner's answer and the answer of the contact node to that answer (6);
-        //  7-8   two renews (ttl 1): #7 is answered by the joiner (9), #8 is absorbed;
-        //  9     the joiner's answer to #7, absorbed by the entry that #6 left at the contact node;
-        //  10-11 the Neighbor requests of the two walk ends (ttl 0) to the joiner;
-        //  12-13 the answers of the joiner.
-        // #6 is the price of the untracked renew of 709b650: a renew is not in the pending set of
-        // its sender, so the answer to it reads as a request. A change of that cost shows here as
-        // 12 or 14, and the table must be updated with it.
+        //  3-4   the Neighbor request of `a`, the end of the short walk (ttl 0), and the answer of the
+        //        joiner.
+        // The walk of the creator (ttl 5 at `a`) adds none: `a` has a request to the joiner pending,
+        // so it does not forward the walk. Before the contact node introduced the joiner the exchange
+        // had 13 Neighbor messages: the walks went round the clique and made renews, and a change of
+        // that cost shows here, and the table must be updated with it.
         assert_eq!(
-            joiner_neighbors, 13,
+            joiner_neighbors, 4,
             "{joiner_neighbors} Neighbor messages named the joiner"
         );
     }
@@ -2619,5 +2636,192 @@ mod tests {
         assert!(sent(&b_io)
             .iter()
             .all(|(_, m)| !matches!(m, Message::Neighbor(_))));
+    }
+
+    /// How the joins of one kind of mesh ended, over all the seeds.
+    struct JoinCount {
+        /// The seeds in which no counted member held the joiner when the messages were all delivered.
+        lost: u64,
+        /// The most messages that one join sent.
+        worst_messages: usize,
+        /// The `Disconnect` messages that the joins sent, all seeds together. A node that makes room
+        /// for a new link sends one, so this counts the evictions.
+        disconnects: u64,
+    }
+
+    /// What `deliver_all` delivered.
+    struct Delivered {
+        /// All the messages.
+        messages: usize,
+        /// The `Disconnect` messages among them.
+        disconnects: usize,
+    }
+
+    /// How the views of a mesh are made before the joiner asks.
+    #[derive(Clone, Copy)]
+    enum Mesh {
+        /// Every view is set by hand: the contact node (0) holds all the members, and each member
+        /// holds the other members and the contact node.
+        Clique,
+        /// The views come from the protocol: each member sends a `Join` to the contact node in turn,
+        /// and every message is delivered, so the capacity of the views and its evictions apply.
+        Built,
+    }
+
+    /// Delivers, in order, every message that `io` holds from `from` and every message that they cause,
+    /// until none is left. It returns how many messages it delivered. A peer that no state answers for
+    /// (an id above the last state) takes its message and says nothing.
+    fn deliver_all(states: &mut [TestState], from: u64, io: &mut Io) -> Delivered {
+        let collect = |origin: u64, io: &mut Io, queue: &mut VecDeque<(u64, u64, Message<u64>)>| {
+            for event in io.drain(..) {
+                if let topic::OutEvent::SendMessage(to, topic::Message::Swarm(message)) = event {
+                    queue.push_back((origin, to, message));
+                }
+            }
+        };
+        let mut queue = VecDeque::new();
+        let mut delivered = Delivered {
+            messages: 0,
+            disconnects: 0,
+        };
+        collect(from, io, &mut queue);
+        while let Some((sender, to, message)) = queue.pop_front() {
+            delivered.messages += 1;
+            delivered.disconnects += usize::from(matches!(message, Message::Disconnect(_)));
+            assert!(delivered.messages < 100_000, "a walk that never ends");
+            if let Some(state) = states.get_mut(usize::try_from(to).expect("a small id")) {
+                state.handle(InEvent::RecvMessage(sender, message), io);
+                collect(to, io, &mut queue);
+            }
+        }
+        delivered
+    }
+
+    /// A joiner (`members + 1`) asks the contact node (0) of a mesh of `members` members (`1..=members`).
+    /// With `uncounted_contact`, the node 0 is a member and not the rendezvous: it also holds an uncounted
+    /// peer (100) that no state answers for, as a member holds the rendezvous. Every message is delivered
+    /// in order until none is left. Each state is seeded with `seed * 64 + id`.
+    ///
+    /// The uncounted peer answers nothing here. A real one, the rendezvous, passes a walk on, so the
+    /// old-rule count of that case is an upper bound and not a rate of the product.
+    fn count_lost_joins(
+        members: u64,
+        mesh: Mesh,
+        uncounted_contact: bool,
+        seeds: u64,
+    ) -> JoinCount {
+        const UNCOUNTED: u64 = 100;
+        let joiner = members + 1;
+        let index = |id: u64| usize::try_from(id).expect("a small id");
+        let mut count = JoinCount {
+            lost: 0,
+            worst_messages: 0,
+            disconnects: 0,
+        };
+        for seed in 0..seeds {
+            let mut states: Vec<TestState> = (0..=joiner)
+                .map(|id| {
+                    State::new(
+                        id,
+                        None,
+                        Config::default(),
+                        ChaCha12Rng::seed_from_u64(seed * 64 + id),
+                    )
+                })
+                .collect();
+            let mut io = Io::new();
+            match mesh {
+                Mesh::Clique => {
+                    for id in 0..=members {
+                        for peer in (0..=members).filter(|peer| *peer != id) {
+                            states[index(id)].active_view.insert(peer);
+                        }
+                    }
+                }
+                Mesh::Built => {
+                    for member in 1..=members {
+                        states[index(member)].handle(InEvent::RequestJoin(0), &mut io);
+                        let _ = deliver_all(&mut states, member, &mut io);
+                    }
+                }
+            }
+            if uncounted_contact {
+                states[0].active_view.insert(UNCOUNTED);
+                states[0].uncounted.insert(UNCOUNTED);
+            }
+            states[index(joiner)].handle(InEvent::RequestJoin(0), &mut io);
+            let delivered = deliver_all(&mut states, joiner, &mut io);
+            count.worst_messages = count.worst_messages.max(delivered.messages);
+            count.disconnects += delivered.disconnects as u64;
+            let adopted =
+                (1..=members).any(|member| states[index(member)].active_view.contains(&joiner));
+            if !adopted {
+                count.lost += 1;
+            }
+        }
+        count
+    }
+
+    /// Before the contact node introduced the joiner, a walk that ended at the contact node adopted
+    /// nobody: the contact holds the joiner already, and `on_forward_join` does nothing there at the
+    /// end of a walk. In a mesh of the contact node and 3 members the 3 walks of 6 hops ended there
+    /// in 228 of 10 000 seeds (2.3 percent), on the commit before this rule. The other sizes lost
+    /// 0 of 10 000 at 2 members, 4 at 5 and 0 at 8 when the views are set by hand, and 0, 6 and 2
+    /// when the protocol builds them.
+    ///
+    /// A join may not cost more than it did. The messages of the worst join, and the evictions of
+    /// all the joins (a node that makes room for a new link sends one `Disconnect`), stay at or
+    /// under the old counts below, for 2, 3, 5 and 8 members. A view is never full below 5 members.
+    /// The fix evicts less at 5 and 8 members: 33 680 and 54 617 times in the clique, 11 729 and
+    /// 36 214 times in the built mesh, against the 42 307, 62 880, 19 188 and 39 169 below.
+    #[test]
+    fn a_joiner_that_asks_a_contact_node_gets_a_member_neighbor() {
+        const SEEDS: u64 = 10_000;
+        // (members, the most messages of one join, the `Disconnect` messages of all the joins).
+        const OLD_CLIQUE: [(u64, usize, u64); 4] =
+            [(2, 28, 0), (3, 42, 0), (5, 74, 42_307), (8, 105, 62_880)];
+        const OLD_BUILT: [(u64, usize, u64); 4] =
+            [(2, 28, 0), (3, 42, 0), (5, 72, 19_188), (8, 73, 39_169)];
+        for (mesh, name, old) in [
+            (Mesh::Clique, "clique", OLD_CLIQUE),
+            (Mesh::Built, "built", OLD_BUILT),
+        ] {
+            for (members, old_worst, old_disconnects) in old {
+                let count = count_lost_joins(members, mesh, false, SEEDS);
+                assert_eq!(
+                    count.lost, 0,
+                    "{name} mesh of {members} members: {} of {SEEDS} joins left no member holding the joiner",
+                    count.lost
+                );
+                assert!(
+                    count.worst_messages <= old_worst,
+                    "{name} mesh of {members} members: one join sent {} messages, the old rule sent {old_worst} at most",
+                    count.worst_messages
+                );
+                assert!(
+                    count.disconnects <= old_disconnects,
+                    "{name} mesh of {members} members: the joins evicted {} times, the old rule {old_disconnects}",
+                    count.disconnects
+                );
+            }
+        }
+    }
+
+    /// A member that is the contact node holds the rendezvous too, an uncounted peer that is no
+    /// member. The walk that ends at it adopts nobody, so the introduction must go to a counted peer:
+    /// with the pick among all the active peers, 1 walk in 3 went to the rendezvous.
+    #[test]
+    fn a_contact_node_that_holds_an_uncounted_peer_introduces_the_joiner_to_a_member() {
+        const SEEDS: u64 = 10_000;
+        for (mesh, name) in [(Mesh::Clique, "clique"), (Mesh::Built, "built")] {
+            for members in [2, 3] {
+                let count = count_lost_joins(members, mesh, true, SEEDS);
+                assert_eq!(
+                    count.lost, 0,
+                    "{name} mesh of {members} members and an uncounted peer: {} of {SEEDS} joins left no member holding the joiner",
+                    count.lost
+                );
+            }
+        }
     }
 }
