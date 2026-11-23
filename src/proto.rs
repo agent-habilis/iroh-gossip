@@ -268,7 +268,22 @@ mod test {
         let _ = network.events();
 
         network.command(3, t, Command::Join(vec![0]));
-        network.run_trips(4);
+        // The introduction of the joiner can make a member evict the contact node, which then asks
+        // another member for a link. The test waits for the end state, a view that is full again.
+        // The 20 trips are a timeout and not an expected count: the test passes at any count below.
+        const TIMEOUT_TRIPS: usize = 20;
+        let mut trips = 0;
+        while {
+            let view = network.neighbors(&0, &t).unwrap();
+            !(view.contains(&3) && view.len() == 2)
+        } {
+            assert!(
+                trips < TIMEOUT_TRIPS,
+                "the view of node 0 is not full with the joiner after {TIMEOUT_TRIPS} trips"
+            );
+            network.run_trips(1);
+            trips += 1;
+        }
 
         let after = network.neighbors(&0, &t).unwrap();
         assert!(after.contains(&3));
