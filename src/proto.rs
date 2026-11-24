@@ -427,6 +427,33 @@ mod test {
 
     #[test]
     #[traced_test]
+    fn force_neighbor_peer_to_a_full_view_evicts_one_neighbor() {
+        // The rule that `NeighborPeers` does not have, without the walk of a `Join`.
+        let (mut network, t) = small_view_network(4, 2);
+        network.command(0, t, Command::Join(vec![]));
+        network.command(1, t, Command::Join(vec![0]));
+        network.command(2, t, Command::Join(vec![0]));
+        network.command(3, t, Command::Join(vec![]));
+        network.run_trips(4);
+        let _ = network.events();
+
+        network.command(3, t, Command::ForceNeighborPeer(0));
+        network.run_trips(4);
+
+        let after = network.neighbors(&0, &t).unwrap();
+        assert!(after.contains(&3));
+        assert_eq!(after.len(), 2);
+        assert!(network.neighbors(&3, &t).unwrap().contains(&0));
+        let downs = network
+            .events()
+            .filter(|(_, _, event)| matches!(event, Event::NeighborDown(_)))
+            .count();
+        assert_eq!(downs, 2, "the dropped neighbor and node 0 see 1 down each");
+        assert!(network.check_synchronicity());
+    }
+
+    #[test]
+    #[traced_test]
     fn leave_peers_is_not_undone_by_refill() {
         let rng = ChaCha12Rng::seed_from_u64(read_var("SEED", 0));
         let mut network = Network::new(Config::default().into(), rng);

@@ -219,6 +219,30 @@ impl GossipSender {
         Ok(())
     }
 
+    /// Asks one peer for a link with high priority, even if the active view of the peer is full.
+    ///
+    /// The peer always accepts, and drops one random neighbor to make room. The dropped
+    /// neighbor gets a notice, and no `ForwardJoin` goes out. A peer that left this node
+    /// refuses it. Unlike [`join_peers`](Self::join_peers), it starts no walk through the swarm.
+    ///
+    /// This node sends the request only while its own active view has a free slot, counting the
+    /// requests that wait for an answer. With a full view it sends nothing: the answer of the
+    /// peer would evict a second neighbor of this node. The request holds a slot while it waits,
+    /// so a low priority request of another peer cannot take the last free slot. A
+    /// [`join_peers`](Self::join_peers) request is always accepted, and it can still fill the view
+    /// in the meantime: then this node refuses the answer of the peer, and no neighbor of this
+    /// node is dropped. The peer has dropped one of its own neighbors by then, so a refused call
+    /// can still cost the peer a neighbor. A peer named by
+    /// [`uncounted_peers`](Self::uncounted_peers) takes no slot: the request goes out from
+    /// a full view and holds nothing. Call it at most once for each window of
+    /// time, because each call can cost a neighbor of the peer. Use
+    /// [`neighbor_peers`](Self::neighbor_peers) first, and this request only when a low priority
+    /// request cannot link the pair.
+    pub async fn force_neighbor_peer(&self, peer: EndpointId) -> Result<(), ApiError> {
+        self.send(Command::ForceNeighborPeer(peer)).await?;
+        Ok(())
+    }
+
     /// Names the peers that take no slot of the active view. The set replaces the last one.
     ///
     /// The view holds them beside its capacity. They do not count for it, they do not stop a
@@ -428,6 +452,10 @@ pub enum Command {
     NeighborPeers(Vec<EndpointId>),
     /// Names the peers that take no slot of the active view.
     UncountedPeers(Vec<EndpointId>),
+    /// Asks one peer for a link with high priority.
+    ///
+    /// It stays the last variant: the enum crosses the RPC link, and postcard writes the index.
+    ForceNeighborPeer(EndpointId),
 }
 
 /// Options for joining a gossip topic.
@@ -459,6 +487,22 @@ impl JoinOptions {
 #[cfg(test)]
 mod tests {
     use crate::api::GossipTopic;
+
+    // `Command` crosses the RPC link, and postcard writes the index of a variant. A variant added
+    // in the middle gives every variant after it a new index, so a peer of an older build reads a
+    // command as another one. New variants go at the end.
+    #[test]
+    fn a_command_variant_keeps_its_postcard_index() {
+        use iroh_base::SecretKey;
+
+        use crate::api::Command;
+
+        let id = SecretKey::from_bytes(&[1; 32]).public();
+        let index = |command: Command| postcard::to_allocvec(&command).unwrap()[0];
+
+        assert_eq!(index(Command::UncountedPeers(vec![id])), 5);
+        assert_eq!(index(Command::ForceNeighborPeer(id)), 6);
+    }
 
     #[cfg(all(feature = "rpc", feature = "net"))]
     #[tokio::test]
