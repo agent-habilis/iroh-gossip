@@ -2824,4 +2824,140 @@ mod tests {
             }
         }
     }
+
+    fn shuffle_of(origin: u64, nodes: &[u64], ttl: u16) -> Message<u64> {
+        let nodes = nodes.iter().map(|id| PeerInfo {
+            id: *id,
+            data: None,
+        });
+        Message::Shuffle(Shuffle {
+            origin,
+            nodes: nodes.collect(),
+            ttl: Ttl(ttl),
+        })
+    }
+
+    fn high_neighbors(io: &Io) -> Vec<u64> {
+        sent(io)
+            .into_iter()
+            .filter_map(|(to, message)| match message {
+                Message::Neighbor(Neighbor {
+                    priority: Priority::High,
+                    ..
+                }) => Some(to),
+                _ => None,
+            })
+            .collect()
+    }
+
+    // A node with no active peer and an empty passive view asks nobody. A shuffle then teaches it
+    // a peer. The rule of the protocol is that a node with an empty active view asks a passive
+    // peer with high priority, which cannot be refused, and the node must not wait for the next
+    // loss of a link to ask.
+    #[test]
+    fn a_node_with_no_active_peer_asks_a_peer_that_a_shuffle_teaches_it_with_high_priority() {
+        let mut a = state(0);
+        let mut io = Io::new();
+
+        recv(&mut a, 1, shuffle_of(1, &[2], 0), &mut io);
+
+        assert_eq!(
+            high_neighbors(&io),
+            vec![2],
+            "the node learned a passive peer and has no active one: it asks that peer at once"
+        );
+    }
+
+    // The reply to a shuffle comes from a peer that the node asked with low priority and that has
+    // not answered. The node has no active peer: the reply teaches it a peer, and it asks that
+    // peer with high priority at once. A high priority request is never refused, so no loop of
+    // refusals follows.
+    #[test]
+    fn a_shuffle_reply_from_a_peer_with_a_pending_request_still_starts_the_ask_of_a_lone_node() {
+        let mut a = state(0);
+        let mut io = Io::new();
+        a.handle(InEvent::RequestNeighbors(vec![5]), &mut io);
+        io.clear();
+
+        recv(
+            &mut a,
+            5,
+            Message::ShuffleReply(ShuffleReply {
+                nodes: vec![PeerInfo { id: 6, data: None }],
+            }),
+            &mut io,
+        );
+
+        assert_eq!(
+            high_neighbors(&io),
+            vec![6],
+            "the node has no active peer: the peer that the reply names is asked with high priority"
+        );
+    }
+
+    // Control: a node that holds an active peer asks nobody when a shuffle teaches it a peer.
+    #[test]
+    fn a_node_with_an_active_peer_asks_nobody_when_a_shuffle_teaches_it_a_peer() {
+        let mut a = with_active(0, &[9]);
+        let mut io = Io::new();
+
+        recv(&mut a, 1, shuffle_of(1, &[2], 0), &mut io);
+
+        assert!(
+            high_neighbors(&io).is_empty(),
+            "the node has an active peer: no ask"
+        );
+    }
+
+    // One shuffle teaches a lone node 3 peers. It asks 1 of them, not each: every high priority ask
+    // makes a full peer drop a link, and the timer asks the next peer if the first does not answer.
+    #[test]
+    fn a_lone_node_that_learns_a_batch_of_peers_asks_one_of_them() {
+        let mut a = state(0);
+        let mut io = Io::new();
+
+        recv(&mut a, 1, shuffle_of(1, &[2, 3, 4], 0), &mut io);
+
+        let asked = high_neighbors(&io);
+        assert_eq!(asked.len(), 1, "one ask for one batch: {asked:?}");
+        assert!(
+            [2, 3, 4].contains(&asked[0]),
+            "the peer that is asked is one that the shuffle taught: {asked:?}"
+        );
+    }
+
+    // A lone node has an ask in flight. Another shuffle teaches it a peer, and it asks nobody
+    // new: the first ask holds until its timer runs out.
+    #[test]
+    fn a_lone_node_with_an_ask_in_flight_asks_no_second_peer() {
+        let mut a = state(0);
+        let mut io = Io::new();
+        recv(&mut a, 1, shuffle_of(1, &[2], 0), &mut io);
+        assert_eq!(high_neighbors(&io), vec![2], "the first ask");
+        io.clear();
+
+        recv(&mut a, 1, shuffle_of(1, &[3], 0), &mut io);
+
+        assert!(
+            high_neighbors(&io).is_empty(),
+            "the first ask is in flight: no second ask"
+        );
+    }
+
+    // Control: a lone node that gets a ForwardJoin adopts the joiner at once, since it holds 1 or
+    // fewer active peers. It never adds the joiner to the passive view, so the rule needs no call
+    // site there.
+    #[test]
+    fn a_lone_node_that_gets_a_forward_join_asks_the_joiner_and_adds_no_passive_peer() {
+        let mut a = state(0);
+        let mut io = Io::new();
+
+        recv(&mut a, 1, forward_join(7, 3), &mut io);
+
+        assert_eq!(high_neighbors(&io), vec![7], "the joiner is asked at once");
+        assert!(
+            a.passive_view.is_empty(),
+            "the joiner is not added to the passive view"
+        );
+    }
 }
