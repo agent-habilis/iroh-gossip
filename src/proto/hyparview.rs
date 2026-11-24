@@ -931,6 +931,7 @@ where
                 self.add_passive(node.id, node.data, io);
             }
             self.send_shuffle_reply(shuffle.origin, len, io);
+            self.refill_when_alone(io);
         } else if let Some(node) = self
             .active_view
             .pick_random_without(&[&shuffle.origin, &from], &mut self.rng)
@@ -965,6 +966,12 @@ where
         for node in message.nodes {
             self.add_passive(node.id, node.data, io);
         }
+        // A node with no counted active peer asks with high priority, which no peer refuses, so no
+        // loop of refusals follows, and it does not wait for the timer of a request that it made.
+        if self.counted_active_len() == 0 {
+            self.refill_when_alone(io);
+            return;
+        }
         // A peer that refuses our `Neighbor` request sends this reply before its `Disconnect`. The
         // next request waits for the timer of the refused one: when every passive peer is full,
         // a request at once makes a loop of refusals, one round trip each.
@@ -972,6 +979,19 @@ where
             return;
         }
         self.refill_active_from_passive(&[], io);
+    }
+
+    /// A node with no counted active peer asks a passive peer at once, with high priority, which
+    /// cannot be refused. The refill runs when the node loses its last active peer, and then the
+    /// passive view can be empty: nothing else asks again, and the node waits for a link that never
+    /// comes while shuffles fill its passive view. Call this after the passive view learns a peer.
+    /// One ask is in flight at a time: while the timer of an ask runs, a node that learns another
+    /// peer does not ask it, since each high priority ask makes a full peer drop a link. The timer
+    /// asks the next peer when the first does not answer.
+    fn refill_when_alone(&mut self, io: &mut impl IO<PI>) {
+        if self.counted_active_len() == 0 && self.request_timers.is_empty() {
+            self.refill_active_from_passive(&[], io);
+        }
     }
 
     fn handle_shuffle_timer(&mut self, io: &mut impl IO<PI>) {
