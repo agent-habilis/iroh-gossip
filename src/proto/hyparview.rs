@@ -2980,4 +2980,79 @@ mod tests {
             "the joiner is not added to the passive view"
         );
     }
+
+    fn neighbors_to(io: &Io, peer: u64) -> usize {
+        sent(io)
+            .into_iter()
+            .filter(|(to, message)| *to == peer && matches!(message, Message::Neighbor(_)))
+            .count()
+    }
+
+    fn full_node(me: u64) -> TestState {
+        let capacity = u64::try_from(state(me).config.active_view_capacity).unwrap();
+        let peers: Vec<u64> = (100..100 + capacity).collect();
+        with_active(me, &peers)
+    }
+
+    // A full node refuses a low priority request: it sends a Disconnect and keeps no link. The
+    // refusal is no answer of ours to remember. The peer asks again with high priority, which a
+    // full node must accept, and this is a new request: the node answers it with a Neighbor. If
+    // it reads the new request as the answer to the refused one, it adds the peer and sends
+    // nothing, and the peer never learns that the link is up.
+    #[test]
+    fn a_high_priority_request_after_a_refused_low_one_is_answered() {
+        let mut a = full_node(0);
+        let mut io = Io::new();
+
+        recv(&mut a, 7, neighbor(Priority::Low), &mut io);
+        assert!(
+            !a.active_view.contains(&7),
+            "the full node refuses the low request"
+        );
+        assert_eq!(
+            neighbors_to(&io, 7),
+            0,
+            "a refusal is a Disconnect, no Neighbor"
+        );
+        assert!(
+            sent(&io).into_iter().any(|(to, message)| to == 7
+                && matches!(
+                    message,
+                    Message::Disconnect(Disconnect {
+                        alive: true,
+                        left: false
+                    })
+                )),
+            "the refusal is a Disconnect with alive set: {:?}",
+            sent(&io)
+        );
+        io.clear();
+
+        recv(&mut a, 7, neighbor(Priority::High), &mut io);
+
+        assert!(
+            a.active_view.contains(&7),
+            "a high priority request is accepted"
+        );
+        assert_eq!(
+            neighbors_to(&io, 7),
+            1,
+            "the request is new: the node answers it, or the peer waits for a link that is up"
+        );
+    }
+
+    // Control: the first request of a peer, with high priority, is answered by a full node.
+    #[test]
+    fn a_high_priority_request_of_an_unknown_peer_is_answered() {
+        let mut a = full_node(0);
+        let mut io = Io::new();
+
+        recv(&mut a, 7, neighbor(Priority::High), &mut io);
+
+        assert!(
+            a.active_view.contains(&7),
+            "a high priority request is accepted"
+        );
+        assert_eq!(neighbors_to(&io, 7), 1, "the node answers the request");
+    }
 }
