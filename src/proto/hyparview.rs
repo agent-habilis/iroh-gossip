@@ -868,13 +868,15 @@ where
         // receive a Disconnect notification). If a node q receives a low priority Neighbor request, it will
         // only accept the request if it has a free slot in its active view, otherwise it will refuse the request."
         if !self.add_active(from, details.data, details.priority, do_reply, io) {
+            // A refusal sends a `Disconnect` and no `Neighbor`: there is no answer to remember. If
+            // it were remembered, a new request of this peer would be read as the answer to the
+            // refused one, and a high priority request would be accepted with no reply.
             self.send_disconnect(from, true, false, io);
-        }
-        // When `do_reply` is set, the Neighbor message that `add_active` just sent answers the
-        // request we received. It is not a request in flight, so it must not wait in the pending
-        // set; the answer is remembered in its own set, so that the next `Neighbor` from this peer
-        // is read as an answer (and not answered again).
-        if do_reply {
+        } else if do_reply {
+            // The Neighbor message that `add_active` just sent answers the request we received. It
+            // is not a request in flight, so it must not wait in the pending set; the answer is
+            // remembered in its own set, so that the next `Neighbor` from this peer is read as an
+            // answer (and not answered again).
             self.pending_neighbor_requests.remove(&from);
             self.remember_answer(from, io);
         }
