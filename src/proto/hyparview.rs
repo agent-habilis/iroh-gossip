@@ -343,6 +343,12 @@ pub struct State<PI, RG = ThreadRng> {
     /// pass the free slots. A request of the application or a `ForwardJoin` request has no timer
     /// of this kind, so it counts from `pending_neighbor_requests`.
     request_timers: HashMap<PI, usize>,
+    /// The peers that a refill asked with high priority, until the timer of the ask runs out. A
+    /// node has at most 1 such ask in flight: each one makes a full peer drop a link, and 1 link
+    /// is enough. An ask that the peer answered is not in flight, though its timer still runs. A
+    /// peer that refused stays here until its timer ends, so for up to that time (500 ms) a new
+    /// ask of the same peer by the application reads as in flight: the bound is the timer.
+    high_asks: HashSet<PI>,
     /// The peers we answered with a `Neighbor` and that did not send us anything since. Oldest first.
     ///
     /// A `Neighbor` message does not say whether it is a request or an answer: a node reads it as an
@@ -405,6 +411,7 @@ where
             stats: Stats::default(),
             pending_neighbor_requests: Default::default(),
             request_timers: Default::default(),
+            high_asks: Default::default(),
             answered_neighbors: Default::default(),
             pending_joins: Default::default(),
             next_join_generation: 0,
@@ -421,7 +428,9 @@ where
             InEvent::TimerExpired(timer) => match timer {
                 Timer::DoShuffle => self.handle_shuffle_timer(io),
                 Timer::PendingNeighborRequest(peer) => self.handle_pending_neighbor_timer(peer, io),
-                Timer::NeighborRequestExpired(peer) => self.handle_neighbor_request_expired(peer),
+                Timer::NeighborRequestExpired(peer) => {
+                    self.handle_neighbor_request_expired(peer, io)
+                }
                 Timer::AnsweredNeighborExpired(peer) => {
                     self.answered_neighbors.shift_remove(&peer);
                 }
@@ -558,8 +567,8 @@ where
     /// where a `Join` always gets in and evicts one. No `ForwardJoin` goes out. There is no refill
     /// timer: a dial that fails clears the pending request through `PeerDisconnected`, and the
     /// application decides when to ask again. A request that nobody answers stops being pending
-    /// after [`NEIGHBOR_REQUEST_EXPIRY`] (`Timer::NeighborRequestExpired`), which only clears the
-    /// pending entry.
+    /// after [`NEIGHBOR_REQUEST_EXPIRY`] (`Timer::NeighborRequestExpired`), which clears the pending
+    /// entry and, for a node with no counted active peer, runs the refill.
     fn handle_request_neighbors(&mut self, peers: Vec<PI>, io: &mut impl IO<PI>) {
         for peer in peers {
             if self.counted_active_len() + self.pending_neighbor_requests.len()
@@ -583,11 +592,14 @@ where
     }
 
     /// A request that nobody answered stops being pending, so that the application can ask again.
-    /// Unlike [`Self::handle_pending_neighbor_timer`], it does not touch the passive view and
-    /// does not refill the active view.
-    fn handle_neighbor_request_expired(&mut self, peer: PI) {
+    /// Unlike [`Self::handle_pending_neighbor_timer`], it does not touch the passive view. A node
+    /// with no counted active peer runs the refill: the pending request held a slot of the budget,
+    /// and a lone node must not wait for the application to use the slot. A node with an active
+    /// peer does not refill: the application decides when to ask again.
+    fn handle_neighbor_request_expired(&mut self, peer: PI, io: &mut impl IO<PI>) {
         self.pending_neighbor_requests.remove(&peer);
         self.answered_neighbors.shift_remove(&peer);
+        self.refill_when_alone(io);
     }
 
     /// We received a disconnect message.
@@ -987,11 +999,11 @@ where
     /// cannot be refused. The refill runs when the node loses its last active peer, and then the
     /// passive view can be empty: nothing else asks again, and the node waits for a link that never
     /// comes while shuffles fill its passive view. Call this after the passive view learns a peer.
-    /// One ask is in flight at a time: while the timer of an ask runs, a node that learns another
-    /// peer does not ask it, since each high priority ask makes a full peer drop a link. The timer
-    /// asks the next peer when the first does not answer.
+    /// One high priority ask is in flight at a time (the refill step keeps that rule for every
+    /// caller): while it is, a node that learns another peer does not ask it, since each such ask
+    /// makes a full peer drop a link. The timer asks the next peer when the first does not answer.
     fn refill_when_alone(&mut self, io: &mut impl IO<PI>) {
-        if self.counted_active_len() == 0 && self.request_timers.is_empty() {
+        if self.counted_active_len() == 0 {
             self.refill_active_from_passive(&[], io);
         }
     }
@@ -1036,6 +1048,13 @@ where
 
     fn active_is_full(&self) -> bool {
         self.counted_active_len() >= self.config.active_view_capacity
+    }
+
+    /// A refill ask with high priority that its peer has not answered, and whose timer still runs.
+    fn high_ask_in_flight(&self) -> bool {
+        self.high_asks
+            .iter()
+            .any(|peer| self.pending_neighbor_requests.contains(peer))
     }
 
     /// How many peers of the active view take a slot: all but the uncounted ones.
@@ -1095,18 +1114,24 @@ where
         let mut skip_peers = skip_peers.to_vec();
         skip_peers.extend(self.pending_neighbor_requests.iter());
 
+        // An uncounted peer takes no slot, so a node with only such peers has no neighbor. It asks
+        // with high priority, which a full peer must accept: with low priority every full peer
+        // refuses, and the node stays alone.
+        let priority = match self.counted_active_len() == 0 {
+            true => Priority::High,
+            false => Priority::Low,
+        };
+        if priority == Priority::High && self.high_ask_in_flight() {
+            return;
+        }
         if let Some(node) = self
             .passive_view
             .pick_random_without(&skip_peers, &mut self.rng)
             .copied()
         {
-            // An uncounted peer takes no slot, so a node with only such peers has no neighbor. It asks
-            // with high priority, which a full peer must accept: with low priority every full peer
-            // refuses, and the node stays alone.
-            let priority = match self.counted_active_len() == 0 {
-                true => Priority::High,
-                false => Priority::Low,
-            };
+            if priority == Priority::High {
+                self.high_asks.insert(node);
+            }
             self.send_neighbor(node, priority, io);
             // schedule a timer that checks if the node replied with a neighbor message,
             // otherwise try again with another passive node.
@@ -1123,6 +1148,7 @@ where
             *timers -= 1;
             if *timers == 0 {
                 self.request_timers.remove(&peer);
+                self.high_asks.remove(&peer);
             }
         }
         if self.pending_neighbor_requests.remove(&peer) {
