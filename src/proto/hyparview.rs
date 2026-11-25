@@ -1939,6 +1939,74 @@ mod tests {
         assert!(a.pending_neighbor_requests.is_empty());
     }
 
+    // A lone node holds only an uncounted peer (the rendezvous). A shuffle from it teaches the node
+    // 2 peers and starts 1 high priority ask. The uncounted peer then disconnects, and the removal
+    // runs the refill. One ask is in flight, so the refill asks no second peer: each high priority
+    // ask makes a full peer drop a link, and 1 link is enough.
+    #[test]
+    fn a_lone_node_with_an_ask_in_flight_asks_no_second_peer_when_its_uncounted_peer_leaves() {
+        let rendezvous = 100;
+        let mut a = with_active(0, &[rendezvous]);
+        let mut io = Io::new();
+        a.handle(InEvent::UncountedPeers(vec![rendezvous]), &mut io);
+        recv(
+            &mut a,
+            rendezvous,
+            shuffle_of(rendezvous, &[2, 3], 0),
+            &mut io,
+        );
+        assert_eq!(high_neighbors(&io).len(), 1, "the shuffle starts 1 ask");
+        io.clear();
+
+        recv(&mut a, rendezvous, disconnect(true, false), &mut io);
+
+        let second = high_neighbors(&io);
+        assert_eq!(
+            second.len(),
+            0,
+            "an ask is in flight: the removal of the uncounted peer asks no second peer, got 1 or more: {second:?}"
+        );
+    }
+
+    // A lone node holds as many unanswered low priority requests as its active view has slots. A
+    // reply of one of them teaches it a passive peer, and the budget is full, so no ask goes out.
+    // When a request expires with no link, the node runs the refill step again and asks that peer
+    // with high priority. Without it, the node waits for the application.
+    #[test]
+    fn a_lone_node_asks_a_passive_peer_when_a_request_expires_with_no_link() {
+        let mut a = state(0);
+        let mut io = Io::new();
+        let cap = a.config.active_view_capacity;
+        let asked: Vec<u64> = (1..=cap as u64).collect();
+        a.handle(InEvent::RequestNeighbors(asked.clone()), &mut io);
+        assert_eq!(low_neighbor_requests(&io), asked, "the budget is full");
+        io.clear();
+        recv(
+            &mut a,
+            1,
+            Message::ShuffleReply(ShuffleReply {
+                nodes: vec![PeerInfo { id: 99, data: None }],
+            }),
+            &mut io,
+        );
+        assert!(
+            high_neighbors(&io).is_empty(),
+            "the budget is full: no ask yet"
+        );
+        io.clear();
+
+        a.handle(
+            InEvent::TimerExpired(Timer::NeighborRequestExpired(1)),
+            &mut io,
+        );
+
+        assert_eq!(
+            high_neighbors(&io),
+            vec![99],
+            "the request ended with no link: the lone node asks the passive peer"
+        );
+    }
+
     #[test]
     fn an_expired_request_stops_being_pending_and_changes_nothing_else() {
         let mut a = with_active(0, &[1]);
