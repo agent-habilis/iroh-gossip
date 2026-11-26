@@ -343,6 +343,12 @@ pub struct State<PI, RG = ThreadRng> {
     /// pass the free slots. A request of the application or a `ForwardJoin` request has no timer
     /// of this kind, so it counts from `pending_neighbor_requests`.
     request_timers: HashMap<PI, usize>,
+    /// The peers that a refill asked with high priority, until the timer of the ask runs out. A
+    /// node has at most 1 such ask in flight: each one makes a full peer drop a link, and 1 link
+    /// is enough. An ask that the peer answered is not in flight, though its timer still runs. A
+    /// peer that refused stays here until its timer ends, so for up to that time (500 ms) a new
+    /// ask of the same peer by the application reads as in flight: the bound is the timer.
+    high_asks: HashSet<PI>,
     /// The peers we answered with a `Neighbor` and that did not send us anything since. Oldest first.
     ///
     /// A `Neighbor` message does not say whether it is a request or an answer: a node reads it as an
@@ -405,6 +411,7 @@ where
             stats: Stats::default(),
             pending_neighbor_requests: Default::default(),
             request_timers: Default::default(),
+            high_asks: Default::default(),
             answered_neighbors: Default::default(),
             pending_joins: Default::default(),
             next_join_generation: 0,
@@ -421,7 +428,9 @@ where
             InEvent::TimerExpired(timer) => match timer {
                 Timer::DoShuffle => self.handle_shuffle_timer(io),
                 Timer::PendingNeighborRequest(peer) => self.handle_pending_neighbor_timer(peer, io),
-                Timer::NeighborRequestExpired(peer) => self.handle_neighbor_request_expired(peer),
+                Timer::NeighborRequestExpired(peer) => {
+                    self.handle_neighbor_request_expired(peer, io)
+                }
                 Timer::AnsweredNeighborExpired(peer) => {
                     self.answered_neighbors.shift_remove(&peer);
                 }
@@ -558,8 +567,8 @@ where
     /// where a `Join` always gets in and evicts one. No `ForwardJoin` goes out. There is no refill
     /// timer: a dial that fails clears the pending request through `PeerDisconnected`, and the
     /// application decides when to ask again. A request that nobody answers stops being pending
-    /// after [`NEIGHBOR_REQUEST_EXPIRY`] (`Timer::NeighborRequestExpired`), which only clears the
-    /// pending entry.
+    /// after [`NEIGHBOR_REQUEST_EXPIRY`] (`Timer::NeighborRequestExpired`), which clears the pending
+    /// entry and, for a node with no counted active peer, runs the refill.
     fn handle_request_neighbors(&mut self, peers: Vec<PI>, io: &mut impl IO<PI>) {
         for peer in peers {
             if self.counted_active_len() + self.pending_neighbor_requests.len()
@@ -583,11 +592,14 @@ where
     }
 
     /// A request that nobody answered stops being pending, so that the application can ask again.
-    /// Unlike [`Self::handle_pending_neighbor_timer`], it does not touch the passive view and
-    /// does not refill the active view.
-    fn handle_neighbor_request_expired(&mut self, peer: PI) {
+    /// Unlike [`Self::handle_pending_neighbor_timer`], it does not touch the passive view. A node
+    /// with no counted active peer runs the refill: the pending request held a slot of the budget,
+    /// and a lone node must not wait for the application to use the slot. A node with an active
+    /// peer does not refill: the application decides when to ask again.
+    fn handle_neighbor_request_expired(&mut self, peer: PI, io: &mut impl IO<PI>) {
         self.pending_neighbor_requests.remove(&peer);
         self.answered_neighbors.shift_remove(&peer);
+        self.refill_when_alone(io);
     }
 
     /// We received a disconnect message.
@@ -868,13 +880,15 @@ where
         // receive a Disconnect notification). If a node q receives a low priority Neighbor request, it will
         // only accept the request if it has a free slot in its active view, otherwise it will refuse the request."
         if !self.add_active(from, details.data, details.priority, do_reply, io) {
+            // A refusal sends a `Disconnect` and no `Neighbor`: there is no answer to remember. If
+            // it were remembered, a new request of this peer would be read as the answer to the
+            // refused one, and a high priority request would be accepted with no reply.
             self.send_disconnect(from, true, false, io);
-        }
-        // When `do_reply` is set, the Neighbor message that `add_active` just sent answers the
-        // request we received. It is not a request in flight, so it must not wait in the pending
-        // set; the answer is remembered in its own set, so that the next `Neighbor` from this peer
-        // is read as an answer (and not answered again).
-        if do_reply {
+        } else if do_reply {
+            // The Neighbor message that `add_active` just sent answers the request we received. It
+            // is not a request in flight, so it must not wait in the pending set; the answer is
+            // remembered in its own set, so that the next `Neighbor` from this peer is read as an
+            // answer (and not answered again).
             self.pending_neighbor_requests.remove(&from);
             self.remember_answer(from, io);
         }
@@ -931,6 +945,7 @@ where
                 self.add_passive(node.id, node.data, io);
             }
             self.send_shuffle_reply(shuffle.origin, len, io);
+            self.refill_when_alone(io);
         } else if let Some(node) = self
             .active_view
             .pick_random_without(&[&shuffle.origin, &from], &mut self.rng)
@@ -965,6 +980,12 @@ where
         for node in message.nodes {
             self.add_passive(node.id, node.data, io);
         }
+        // A node with no counted active peer asks with high priority, which no peer refuses, so no
+        // loop of refusals follows, and it does not wait for the timer of a request that it made.
+        if self.counted_active_len() == 0 {
+            self.refill_when_alone(io);
+            return;
+        }
         // A peer that refuses our `Neighbor` request sends this reply before its `Disconnect`. The
         // next request waits for the timer of the refused one: when every passive peer is full,
         // a request at once makes a loop of refusals, one round trip each.
@@ -972,6 +993,19 @@ where
             return;
         }
         self.refill_active_from_passive(&[], io);
+    }
+
+    /// A node with no counted active peer asks a passive peer at once, with high priority, which
+    /// cannot be refused. The refill runs when the node loses its last active peer, and then the
+    /// passive view can be empty: nothing else asks again, and the node waits for a link that never
+    /// comes while shuffles fill its passive view. Call this after the passive view learns a peer.
+    /// One high priority ask is in flight at a time (the refill step keeps that rule for every
+    /// caller): while it is, a node that learns another peer does not ask it, since each such ask
+    /// makes a full peer drop a link. The timer asks the next peer when the first does not answer.
+    fn refill_when_alone(&mut self, io: &mut impl IO<PI>) {
+        if self.counted_active_len() == 0 {
+            self.refill_active_from_passive(&[], io);
+        }
     }
 
     fn handle_shuffle_timer(&mut self, io: &mut impl IO<PI>) {
@@ -1014,6 +1048,13 @@ where
 
     fn active_is_full(&self) -> bool {
         self.counted_active_len() >= self.config.active_view_capacity
+    }
+
+    /// A refill ask with high priority that its peer has not answered, and whose timer still runs.
+    fn high_ask_in_flight(&self) -> bool {
+        self.high_asks
+            .iter()
+            .any(|peer| self.pending_neighbor_requests.contains(peer))
     }
 
     /// How many peers of the active view take a slot: all but the uncounted ones.
@@ -1073,18 +1114,24 @@ where
         let mut skip_peers = skip_peers.to_vec();
         skip_peers.extend(self.pending_neighbor_requests.iter());
 
+        // An uncounted peer takes no slot, so a node with only such peers has no neighbor. It asks
+        // with high priority, which a full peer must accept: with low priority every full peer
+        // refuses, and the node stays alone.
+        let priority = match self.counted_active_len() == 0 {
+            true => Priority::High,
+            false => Priority::Low,
+        };
+        if priority == Priority::High && self.high_ask_in_flight() {
+            return;
+        }
         if let Some(node) = self
             .passive_view
             .pick_random_without(&skip_peers, &mut self.rng)
             .copied()
         {
-            // An uncounted peer takes no slot, so a node with only such peers has no neighbor. It asks
-            // with high priority, which a full peer must accept: with low priority every full peer
-            // refuses, and the node stays alone.
-            let priority = match self.counted_active_len() == 0 {
-                true => Priority::High,
-                false => Priority::Low,
-            };
+            if priority == Priority::High {
+                self.high_asks.insert(node);
+            }
             self.send_neighbor(node, priority, io);
             // schedule a timer that checks if the node replied with a neighbor message,
             // otherwise try again with another passive node.
@@ -1101,6 +1148,7 @@ where
             *timers -= 1;
             if *timers == 0 {
                 self.request_timers.remove(&peer);
+                self.high_asks.remove(&peer);
             }
         }
         if self.pending_neighbor_requests.remove(&peer) {
@@ -1915,6 +1963,74 @@ mod tests {
         assert_eq!(expiries, vec![(NEIGHBOR_REQUEST_EXPIRY, 10)]);
         a.handle(InEvent::PeerDisconnected(10), &mut io);
         assert!(a.pending_neighbor_requests.is_empty());
+    }
+
+    // A lone node holds only an uncounted peer (the rendezvous). A shuffle from it teaches the node
+    // 2 peers and starts 1 high priority ask. The uncounted peer then disconnects, and the removal
+    // runs the refill. One ask is in flight, so the refill asks no second peer: each high priority
+    // ask makes a full peer drop a link, and 1 link is enough.
+    #[test]
+    fn a_lone_node_with_an_ask_in_flight_asks_no_second_peer_when_its_uncounted_peer_leaves() {
+        let rendezvous = 100;
+        let mut a = with_active(0, &[rendezvous]);
+        let mut io = Io::new();
+        a.handle(InEvent::UncountedPeers(vec![rendezvous]), &mut io);
+        recv(
+            &mut a,
+            rendezvous,
+            shuffle_of(rendezvous, &[2, 3], 0),
+            &mut io,
+        );
+        assert_eq!(high_neighbors(&io).len(), 1, "the shuffle starts 1 ask");
+        io.clear();
+
+        recv(&mut a, rendezvous, disconnect(true, false), &mut io);
+
+        let second = high_neighbors(&io);
+        assert_eq!(
+            second.len(),
+            0,
+            "an ask is in flight: the removal of the uncounted peer asks no second peer, got 1 or more: {second:?}"
+        );
+    }
+
+    // A lone node holds as many unanswered low priority requests as its active view has slots. A
+    // reply of one of them teaches it a passive peer, and the budget is full, so no ask goes out.
+    // When a request expires with no link, the node runs the refill step again and asks that peer
+    // with high priority. Without it, the node waits for the application.
+    #[test]
+    fn a_lone_node_asks_a_passive_peer_when_a_request_expires_with_no_link() {
+        let mut a = state(0);
+        let mut io = Io::new();
+        let cap = a.config.active_view_capacity;
+        let asked: Vec<u64> = (1..=cap as u64).collect();
+        a.handle(InEvent::RequestNeighbors(asked.clone()), &mut io);
+        assert_eq!(low_neighbor_requests(&io), asked, "the budget is full");
+        io.clear();
+        recv(
+            &mut a,
+            1,
+            Message::ShuffleReply(ShuffleReply {
+                nodes: vec![PeerInfo { id: 99, data: None }],
+            }),
+            &mut io,
+        );
+        assert!(
+            high_neighbors(&io).is_empty(),
+            "the budget is full: no ask yet"
+        );
+        io.clear();
+
+        a.handle(
+            InEvent::TimerExpired(Timer::NeighborRequestExpired(1)),
+            &mut io,
+        );
+
+        assert_eq!(
+            high_neighbors(&io),
+            vec![99],
+            "the request ended with no link: the lone node asks the passive peer"
+        );
     }
 
     #[test]
@@ -2823,5 +2939,216 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn shuffle_of(origin: u64, nodes: &[u64], ttl: u16) -> Message<u64> {
+        let nodes = nodes.iter().map(|id| PeerInfo {
+            id: *id,
+            data: None,
+        });
+        Message::Shuffle(Shuffle {
+            origin,
+            nodes: nodes.collect(),
+            ttl: Ttl(ttl),
+        })
+    }
+
+    fn high_neighbors(io: &Io) -> Vec<u64> {
+        sent(io)
+            .into_iter()
+            .filter_map(|(to, message)| match message {
+                Message::Neighbor(Neighbor {
+                    priority: Priority::High,
+                    ..
+                }) => Some(to),
+                _ => None,
+            })
+            .collect()
+    }
+
+    // A node with no active peer and an empty passive view asks nobody. A shuffle then teaches it
+    // a peer. The rule of the protocol is that a node with an empty active view asks a passive
+    // peer with high priority, which cannot be refused, and the node must not wait for the next
+    // loss of a link to ask.
+    #[test]
+    fn a_node_with_no_active_peer_asks_a_peer_that_a_shuffle_teaches_it_with_high_priority() {
+        let mut a = state(0);
+        let mut io = Io::new();
+
+        recv(&mut a, 1, shuffle_of(1, &[2], 0), &mut io);
+
+        assert_eq!(
+            high_neighbors(&io),
+            vec![2],
+            "the node learned a passive peer and has no active one: it asks that peer at once"
+        );
+    }
+
+    // The reply to a shuffle comes from a peer that the node asked with low priority and that has
+    // not answered. The node has no active peer: the reply teaches it a peer, and it asks that
+    // peer with high priority at once. A high priority request is never refused, so no loop of
+    // refusals follows.
+    #[test]
+    fn a_shuffle_reply_from_a_peer_with_a_pending_request_still_starts_the_ask_of_a_lone_node() {
+        let mut a = state(0);
+        let mut io = Io::new();
+        a.handle(InEvent::RequestNeighbors(vec![5]), &mut io);
+        io.clear();
+
+        recv(
+            &mut a,
+            5,
+            Message::ShuffleReply(ShuffleReply {
+                nodes: vec![PeerInfo { id: 6, data: None }],
+            }),
+            &mut io,
+        );
+
+        assert_eq!(
+            high_neighbors(&io),
+            vec![6],
+            "the node has no active peer: the peer that the reply names is asked with high priority"
+        );
+    }
+
+    // Control: a node that holds an active peer asks nobody when a shuffle teaches it a peer.
+    #[test]
+    fn a_node_with_an_active_peer_asks_nobody_when_a_shuffle_teaches_it_a_peer() {
+        let mut a = with_active(0, &[9]);
+        let mut io = Io::new();
+
+        recv(&mut a, 1, shuffle_of(1, &[2], 0), &mut io);
+
+        assert!(
+            high_neighbors(&io).is_empty(),
+            "the node has an active peer: no ask"
+        );
+    }
+
+    // One shuffle teaches a lone node 3 peers. It asks 1 of them, not each: every high priority ask
+    // makes a full peer drop a link, and the timer asks the next peer if the first does not answer.
+    #[test]
+    fn a_lone_node_that_learns_a_batch_of_peers_asks_one_of_them() {
+        let mut a = state(0);
+        let mut io = Io::new();
+
+        recv(&mut a, 1, shuffle_of(1, &[2, 3, 4], 0), &mut io);
+
+        let asked = high_neighbors(&io);
+        assert_eq!(asked.len(), 1, "one ask for one batch: {asked:?}");
+        assert!(
+            [2, 3, 4].contains(&asked[0]),
+            "the peer that is asked is one that the shuffle taught: {asked:?}"
+        );
+    }
+
+    // A lone node has an ask in flight. Another shuffle teaches it a peer, and it asks nobody
+    // new: the first ask holds until its timer runs out.
+    #[test]
+    fn a_lone_node_with_an_ask_in_flight_asks_no_second_peer() {
+        let mut a = state(0);
+        let mut io = Io::new();
+        recv(&mut a, 1, shuffle_of(1, &[2], 0), &mut io);
+        assert_eq!(high_neighbors(&io), vec![2], "the first ask");
+        io.clear();
+
+        recv(&mut a, 1, shuffle_of(1, &[3], 0), &mut io);
+
+        assert!(
+            high_neighbors(&io).is_empty(),
+            "the first ask is in flight: no second ask"
+        );
+    }
+
+    // Control: a lone node that gets a ForwardJoin adopts the joiner at once, since it holds 1 or
+    // fewer active peers. It never adds the joiner to the passive view, so the rule needs no call
+    // site there.
+    #[test]
+    fn a_lone_node_that_gets_a_forward_join_asks_the_joiner_and_adds_no_passive_peer() {
+        let mut a = state(0);
+        let mut io = Io::new();
+
+        recv(&mut a, 1, forward_join(7, 3), &mut io);
+
+        assert_eq!(high_neighbors(&io), vec![7], "the joiner is asked at once");
+        assert!(
+            a.passive_view.is_empty(),
+            "the joiner is not added to the passive view"
+        );
+    }
+
+    fn neighbors_to(io: &Io, peer: u64) -> usize {
+        sent(io)
+            .into_iter()
+            .filter(|(to, message)| *to == peer && matches!(message, Message::Neighbor(_)))
+            .count()
+    }
+
+    fn full_node(me: u64) -> TestState {
+        let capacity = u64::try_from(state(me).config.active_view_capacity).unwrap();
+        let peers: Vec<u64> = (100..100 + capacity).collect();
+        with_active(me, &peers)
+    }
+
+    // A full node refuses a low priority request: it sends a Disconnect and keeps no link. The
+    // refusal is no answer of ours to remember. The peer asks again with high priority, which a
+    // full node must accept, and this is a new request: the node answers it with a Neighbor. If
+    // it reads the new request as the answer to the refused one, it adds the peer and sends
+    // nothing, and the peer never learns that the link is up.
+    #[test]
+    fn a_high_priority_request_after_a_refused_low_one_is_answered() {
+        let mut a = full_node(0);
+        let mut io = Io::new();
+
+        recv(&mut a, 7, neighbor(Priority::Low), &mut io);
+        assert!(
+            !a.active_view.contains(&7),
+            "the full node refuses the low request"
+        );
+        assert_eq!(
+            neighbors_to(&io, 7),
+            0,
+            "a refusal is a Disconnect, no Neighbor"
+        );
+        assert!(
+            sent(&io).into_iter().any(|(to, message)| to == 7
+                && matches!(
+                    message,
+                    Message::Disconnect(Disconnect {
+                        alive: true,
+                        left: false
+                    })
+                )),
+            "the refusal is a Disconnect with alive set: {:?}",
+            sent(&io)
+        );
+        io.clear();
+
+        recv(&mut a, 7, neighbor(Priority::High), &mut io);
+
+        assert!(
+            a.active_view.contains(&7),
+            "a high priority request is accepted"
+        );
+        assert_eq!(
+            neighbors_to(&io, 7),
+            1,
+            "the request is new: the node answers it, or the peer waits for a link that is up"
+        );
+    }
+
+    // Control: the first request of a peer, with high priority, is answered by a full node.
+    #[test]
+    fn a_high_priority_request_of_an_unknown_peer_is_answered() {
+        let mut a = full_node(0);
+        let mut io = Io::new();
+
+        recv(&mut a, 7, neighbor(Priority::High), &mut io);
+
+        assert!(
+            a.active_view.contains(&7),
+            "a high priority request is accepted"
+        );
+        assert_eq!(neighbors_to(&io, 7), 1, "the node answers the request");
     }
 }
