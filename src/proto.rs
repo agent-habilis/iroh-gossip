@@ -343,7 +343,20 @@ mod test {
     #[test]
     #[traced_test]
     fn a_join_to_a_full_view_never_evicts_an_uncounted_peer() {
-        let (mut network, t) = small_view_network(5, 2);
+        // Only node 0 has a small view. The other nodes have a view that no join can fill, so
+        // node 3 never drops node 0 by its own choice. Each of the 12 joiners comes to the full
+        // view of node 0 and evicts a counted peer.
+        let rng = ChaCha12Rng::seed_from_u64(read_var("SEED", 0));
+        let mut small = Config::default();
+        small.membership.active_view_capacity = 2;
+        let mut roomy = Config::default();
+        roomy.membership.active_view_capacity = 32;
+        let mut network = Network::new(small.clone().into(), rng);
+        network.insert_with_config(0, small);
+        for i in 1..16 {
+            network.insert_with_config(i, roomy.clone());
+        }
+        let t: TopicId = [0u8; 32].into();
         network.command(0, t, Command::Join(vec![]));
         network.command(0, t, Command::UncountedPeers(vec![3]));
         network.command(3, t, Command::Join(vec![0]));
@@ -352,7 +365,7 @@ mod test {
         network.run_trips(4);
         let _ = network.events();
 
-        for joiner in [4, 4, 4] {
+        for joiner in 4..16 {
             network.command(joiner, t, Command::Join(vec![0]));
             network.run_trips(4);
             assert!(
